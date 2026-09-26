@@ -178,8 +178,8 @@ pub async fn perform_quic_auth_handshake(
         .recv_text()
         .await
         .context("QUIC: failed to read client hello")?;
-    let hello: ClientHello = serde_json::from_str(hello_line.trim_end())
-        .context("QUIC: invalid client hello JSON")?;
+    let hello: ClientHello =
+        serde_json::from_str(hello_line.trim_end()).context("QUIC: invalid client hello JSON")?;
 
     if !authorized_keys.is_authorized(&hello.public_key_b64) {
         let redeemed = if hello.invite_token.trim().is_empty() {
@@ -193,11 +193,8 @@ pub async fn perform_quic_auth_handshake(
         };
 
         if redeemed {
-            let _added = authorize_device_key(
-                authorized_keys.path(),
-                &hello.public_key_b64,
-            )
-            .context("QUIC: failed to persist authorized key")?;
+            let _added = authorize_device_key(authorized_keys.path(), &hello.public_key_b64)
+                .context("QUIC: failed to persist authorized key")?;
             authorized_keys
                 .reload()
                 .context("QUIC: failed to reload authorized keys")?;
@@ -222,8 +219,8 @@ pub async fn perform_quic_auth_handshake(
         .recv_text()
         .await
         .context("QUIC: failed to read client proof")?;
-    let proof: ClientProof = serde_json::from_str(proof_line.trim_end())
-        .context("QUIC: invalid client proof JSON")?;
+    let proof: ClientProof =
+        serde_json::from_str(proof_line.trim_end()).context("QUIC: invalid client proof JSON")?;
 
     verify_auth_challenge(&hello.public_key_b64, &challenge, &proof.signature_b64)
         .context("QUIC: challenge signature verification failed")?;

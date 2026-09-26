@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use bonded_core::auth::{sign_auth_challenge, DeviceKeypair};
 use bonded_core::config::ClientConfig;
 #[cfg(target_os = "linux")]
-use bonded_core::session::SessionState;
+use bonded_core::session::{SessionFrame, SessionHeader, SessionState, FLAG_PING, FLAG_PONG};
 use bonded_core::transport::{
     NaiveTcpTransport, QuicTransport, Transport, WebSocketTlsTransport, WireGuardTransport,
 };
@@ -285,13 +285,14 @@ where
                         .and_then(|result| result)
                         .map(|transport| ClientTransport::WebSocket(Box::new(transport)))
                 }
-                ("h3" | "quic", Some(bind)) => {
-                    timeout(PATH_ESTABLISH_TIMEOUT, establish_quic_session_with_bind(config, bind))
-                        .await
-                        .map_err(anyhow::Error::from)
-                        .and_then(|result| result)
-                        .map(|transport| ClientTransport::Quic(Box::new(transport)))
-                }
+                ("h3" | "quic", Some(bind)) => timeout(
+                    PATH_ESTABLISH_TIMEOUT,
+                    establish_quic_session_with_bind(config, bind),
+                )
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|result| result)
+                .map(|transport| ClientTransport::Quic(Box::new(transport))),
                 ("h3" | "quic", None) => {
                     timeout(PATH_ESTABLISH_TIMEOUT, establish_quic_session(config))
                         .await
@@ -299,16 +300,14 @@ where
                         .and_then(|result| result)
                         .map(|transport| ClientTransport::Quic(Box::new(transport)))
                 }
-                ("wireguard" | "wg", Some(bind)) => {
-                    timeout(
-                        PATH_ESTABLISH_TIMEOUT,
-                        establish_wireguard_session_with_bind(config, bind),
-                    )
-                    .await
-                    .map_err(anyhow::Error::from)
-                    .and_then(|result| result)
-                    .map(|transport| ClientTransport::WireGuard(Box::new(transport)))
-                }
+                ("wireguard" | "wg", Some(bind)) => timeout(
+                    PATH_ESTABLISH_TIMEOUT,
+                    establish_wireguard_session_with_bind(config, bind),
+                )
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|result| result)
+                .map(|transport| ClientTransport::WireGuard(Box::new(transport))),
                 ("wireguard" | "wg", None) => {
                     timeout(PATH_ESTABLISH_TIMEOUT, establish_wireguard_session(config))
                         .await
@@ -665,7 +664,9 @@ async fn establish_websocket_session(
                 config.socket_network_bind.as_ref(),
             )
             .await
-            .with_context(|| format!("failed to reconnect websocket TCP socket to {server_addr}"))?;
+            .with_context(|| {
+                format!("failed to reconnect websocket TCP socket to {server_addr}")
+            })?;
             let retry_request = websocket_url.as_str().into_client_request()?;
             client_async_tls_with_config(
                 retry_request,
@@ -1619,8 +1620,7 @@ pub(crate) async fn connect_quic_client(
     alpn: &[u8],
     socket_protect: Option<&bonded_core::config::SocketProtectFn>,
 ) -> anyhow::Result<(quinn::Endpoint, quinn::Connection)> {
-    connect_quic_client_with_bind(host, port, rustls_config, alpn, socket_protect, None, None)
-        .await
+    connect_quic_client_with_bind(host, port, rustls_config, alpn, socket_protect, None, None).await
 }
 
 pub(crate) async fn connect_quic_client_with_bind(
@@ -2121,13 +2121,57 @@ async fn run_linux_packet_loop(
     let device = tun::create_as_async(&config)?;
     let mut transports = transports;
     let mut active_index = 0_usize;
-    let mut state = SessionState::new(1);
+    // Complete server-side session binding on every path with an initial
+    // heartbeat ping. The server's pong carries the authoritative session id,
+    // which this session's frame state adopts (the server assigns session ids
+    // starting from 0; the client cannot know its id before this exchange).
+    let mut session_id: u32 = 0;
+    let mut path_index = 0_usize;
+    while path_index < transports.len() {
+        let ping = SessionFrame {
+            header: SessionHeader {
+                connection_id: 0,
+                sequence: 0,
+                flags: FLAG_PING,
+            },
+            payload: Bytes::new(),
+        };
+        if let Err(err) = transports[path_index].send(ping).await {
+            info!(path = path_index, error = %err, "path failed during session discovery, dropping it");
+            transports.remove(path_index);
+            if transports.is_empty() {
+                return Err(err);
+            }
+            continue;
+        }
+        match transports[path_index].recv().await {
+            Ok(frame) if frame.header.flags & FLAG_PONG != 0 => {
+                session_id = frame.header.connection_id;
+                info!(path = path_index, session_id, "path bound to session");
+                path_index += 1;
+            }
+            Ok(_) => {
+                anyhow::bail!(
+                    "expected session announcement pong on path {path_index}, got a data frame"
+                );
+            }
+            Err(err) => {
+                info!(path = path_index, error = %err, "path failed during session discovery, dropping it");
+                transports.remove(path_index);
+                if transports.is_empty() {
+                    return Err(err);
+                }
+            }
+        }
+    }
+    let mut state = SessionState::new(session_id);
     let mut tun_buf = vec![0_u8; 8192];
 
     loop {
         select! {
             tun_result = device.recv(&mut tun_buf) => {
                 let read = tun_result?;
+                debug!("TUN read: {} bytes", read);
                 if read == 0 {
                     continue;
                 }
@@ -2158,6 +2202,11 @@ async fn run_linux_packet_loop(
             frame_result = transports[active_index].recv() => {
                 match frame_result {
                     Ok(frame) => {
+                        // Heartbeat pongs are liveness replies, not TUN data: keep them
+                        // out of the session reorder buffer and off the TUN device.
+                        if frame.header.flags & FLAG_PONG != 0 {
+                            continue;
+                        }
                         let ready = state.ingest_inbound(frame)?;
                         for packet in ready {
                             let _ = device.send(&packet.payload).await?;

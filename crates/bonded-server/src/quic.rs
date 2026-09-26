@@ -20,12 +20,13 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, RwLock};
 
 use anyhow::Context as _;
-use bytes::{Buf, Bytes};
 use bonded_core::session::{SessionFrame, SessionHeader, FLAG_PING, FLAG_PONG};
 use bonded_core::transport::{QuicTransport, Transport as _};
+use bytes::{Buf, Bytes};
 use h3::server;
 use quinn::{Endpoint, ServerConfig};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -39,14 +40,14 @@ use crate::bootstrap::{
 };
 use crate::peer_relay::resolve_session_binding;
 use crate::session_registry::SessionRegistry;
-use crate::smoltcp_forwarder::SmoltcpForwarder;
+use crate::smoltcp_forwarder::{SessionContext, SessionOutboundRouter, SmoltcpForwarder};
 
 /// Maximum frames to drain from the forwarder response queue per scheduler turn.
 const MAX_DRAIN: usize = 256;
 const RAW_QUIC_ALPN: &[u8] = b"bonded-quic";
 const H3_ALPN: &[u8] = b"h3";
 
-type ForwarderRegistry = Arc<RwLock<HashMap<u64, Arc<SmoltcpForwarder>>>>;
+type ForwarderRegistry = Arc<RwLock<HashMap<u64, Arc<SessionContext>>>>;
 
 /// Build a QUIC `ServerConfig` from DER-encoded certificate and private key
 /// bytes (both in DER / PKCS#8 format).  Called by `main.rs` when it has
@@ -182,7 +183,10 @@ async fn handle_h3_connection(
             .unwrap_or_else(|| request.uri().path());
         let advertised_endpoints = advertised_endpoints_for_request(
             bootstrap_ctx.as_ref(),
-            request.uri().authority().map(|authority| authority.as_str()),
+            request
+                .uri()
+                .authority()
+                .map(|authority| authority.as_str()),
         );
 
         let mut body = Vec::new();
@@ -215,7 +219,10 @@ async fn handle_h3_connection(
             .send_data(Bytes::from(response_body))
             .await
             .context("failed to send HTTP/3 response body")?;
-        stream.finish().await.context("failed to finish HTTP/3 response")?;
+        stream
+            .finish()
+            .await
+            .context("failed to finish HTTP/3 response")?;
     }
 
     Ok(())
@@ -234,19 +241,16 @@ async fn handle_quic_connection(
 
     let mut transport = QuicTransport::from_server_connection(connection).await?;
 
-    let public_key = match perform_quic_auth_handshake(
-        &mut transport,
-        invite_tokens_file,
-        &authorized_keys,
-    )
-    .await
-    {
-        Ok(pk) => pk,
-        Err(err) => {
-            warn!(peer = %peer, error = %err, "QUIC client authentication failed");
-            return Ok(());
-        }
-    };
+    let public_key =
+        match perform_quic_auth_handshake(&mut transport, invite_tokens_file, &authorized_keys)
+            .await
+        {
+            Ok(pk) => pk,
+            Err(err) => {
+                warn!(peer = %peer, error = %err, "QUIC client authentication failed");
+                return Ok(());
+            }
+        };
 
     let binding = match resolve_session_binding(
         &mut transport,
@@ -273,12 +277,30 @@ async fn handle_quic_connection(
     );
 
     let (forward_tx, mut forward_rx) = mpsc::unbounded_channel::<SessionFrame>();
-    let forwarder = Arc::new(SmoltcpForwarder::new(handle.session_id, forward_tx));
-
-    forwarders
-        .write()
-        .expect("forwarder registry lock should not be poisoned")
-        .insert(handle.session_id, forwarder.clone());
+    let transport_id = crate::smoltcp_forwarder::alloc_transport_id();
+    // Exactly one forwarding context per session, shared by every path: the
+    // flow state and outbound sequence space must survive the death of any
+    // single path for failover to work.
+    let session_ctx: Arc<SessionContext> = {
+        let mut guard = forwarders
+            .write()
+            .expect("forwarder registry lock should not be poisoned");
+        if let Some(existing) = guard.get(&handle.session_id) {
+            existing.clone()
+        } else {
+            let (router, fwd_tx) = SessionOutboundRouter::new();
+            let forwarder = Arc::new(SmoltcpForwarder::new(
+                handle.session_id,
+                fwd_tx,
+                Arc::new(AtomicU64::new(0)),
+            ));
+            let ctx = Arc::new(SessionContext { forwarder, router });
+            guard.insert(handle.session_id, ctx.clone());
+            ctx
+        }
+    };
+    session_ctx.router.add_transport(transport_id, forward_tx);
+    let forwarder: Arc<SmoltcpForwarder> = session_ctx.forwarder.clone();
 
     let mut pending_frame = binding.initial_frame;
     'session: loop {
@@ -299,7 +321,7 @@ async fn handle_quic_connection(
             if frame.header.flags & FLAG_PING != 0 && frame.payload.is_empty() {
                 let pong = SessionFrame {
                     header: SessionHeader {
-                        connection_id: frame.header.connection_id,
+                        connection_id: handle.session_id as u32,
                         sequence: frame.header.sequence,
                         flags: FLAG_PONG,
                     },
@@ -311,6 +333,7 @@ async fn handle_quic_connection(
                     break 'session;
                 }
             } else {
+                session_ctx.router.mark_active(transport_id);
                 forwarder.ingest_packet(frame);
             }
             continue;
@@ -348,6 +371,7 @@ async fn handle_quic_connection(
                             }
                             continue;
                         }
+                        session_ctx.router.mark_active(transport_id);
                         forwarder.ingest_packet(frame);
                     }
                     Err(err) => {
@@ -361,11 +385,16 @@ async fn handle_quic_connection(
         }
     }
 
-    forwarder.clear_session();
-    forwarders
-        .write()
-        .expect("forwarder registry lock should not be poisoned")
-        .remove(&handle.session_id);
-    sessions.unregister_client(&binding.client_public_key);
+    session_ctx.router.remove_transport(transport_id);
+    // Only tear down the session when its last path disconnects; otherwise
+    // the surviving path keeps the flow state and sequence space alive.
+    if session_ctx.router.transport_count() == 0 {
+        forwarder.clear_session();
+        forwarders
+            .write()
+            .expect("forwarder registry lock should not be poisoned")
+            .remove(&handle.session_id);
+        sessions.unregister_client(&binding.client_public_key);
+    }
     Ok(())
 }

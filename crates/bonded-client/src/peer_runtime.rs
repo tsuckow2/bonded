@@ -196,7 +196,8 @@ pub async fn start_peer_share_runtime(
                 }
             };
 
-            if !should_accept_discovered_peer(&advertisement, &browse_server_key, &browse_self_key) {
+            if !should_accept_discovered_peer(&advertisement, &browse_server_key, &browse_self_key)
+            {
                 continue;
             }
 
@@ -209,7 +210,10 @@ pub async fn start_peer_share_runtime(
             }
             emit_peer_share_event(
                 browse_logger.as_ref(),
-                format!("discovered peer={peer_id} endpoint={}", advertisement.endpoint),
+                format!(
+                    "discovered peer={peer_id} endpoint={}",
+                    advertisement.endpoint
+                ),
             );
 
             let introduction = match request_peer_share_introduction(
@@ -261,7 +265,11 @@ pub async fn start_peer_share_runtime(
             );
 
             if peer_transport_tx
-                .send(ClientTransport::peer_relay(transport, peer_id.clone(), closed_peer_tx.clone()))
+                .send(ClientTransport::peer_relay(
+                    transport,
+                    peer_id.clone(),
+                    closed_peer_tx.clone(),
+                ))
                 .is_err()
             {
                 break;
@@ -276,7 +284,9 @@ pub async fn start_peer_share_runtime(
     })
 }
 
-async fn establish_peer_upstream_paths(config: &ClientConfig) -> anyhow::Result<Vec<ClientTransport>> {
+async fn establish_peer_upstream_paths(
+    config: &ClientConfig,
+) -> anyhow::Result<Vec<ClientTransport>> {
     let mut peer_config = config.clone();
     let filtered: Vec<String> = peer_config
         .client
@@ -301,22 +311,27 @@ async fn establish_peer_upstream_paths(config: &ClientConfig) -> anyhow::Result<
 fn build_listener_runtime(
     config: &ClientConfig,
     device_keypair: &DeviceKeypair,
-) -> anyhow::Result<(quinn::Endpoint, PeerListenerIdentity, PeerShareAdvertisement)> {
+) -> anyhow::Result<(
+    quinn::Endpoint,
+    PeerListenerIdentity,
+    PeerShareAdvertisement,
+)> {
     let cert = generate_simple_self_signed(vec!["127.0.0.1".to_owned()])
         .context("failed to generate peer-share listener certificate")?;
     let cert_der = cert.cert.der().to_vec();
     let key_der = cert.key_pair.serialize_der();
     let fingerprint = cert_proof::compute_fingerprint(&cert_der);
-    let bind_addr: SocketAddr = config
-        .client
-        .peer_share_bind_address
-        .parse()
-        .with_context(|| {
-            format!(
-                "invalid peer_share_bind_address: {}",
-                config.client.peer_share_bind_address
-            )
-        })?;
+    let bind_addr: SocketAddr =
+        config
+            .client
+            .peer_share_bind_address
+            .parse()
+            .with_context(|| {
+                format!(
+                    "invalid peer_share_bind_address: {}",
+                    config.client.peer_share_bind_address
+                )
+            })?;
     let advertise_ip = resolve_advertise_ip(config, &enumerate_interfaces(), bind_addr)?;
     let listener_bind_addr = match bind_addr.ip() {
         IpAddr::V4(ip) if ip.is_unspecified() => SocketAddr::new(advertise_ip, bind_addr.port()),
@@ -329,7 +344,9 @@ fn build_listener_runtime(
         bind_peer_listener_socket(listener_bind_addr, config.socket_protect.as_ref())?,
         Arc::new(quinn::TokioRuntime),
     )
-    .map_err(|err| anyhow::anyhow!("failed to bind peer-share listener on {listener_bind_addr}: {err}"))?;
+    .map_err(|err| {
+        anyhow::anyhow!("failed to bind peer-share listener on {listener_bind_addr}: {err}")
+    })?;
     let listen_addr = endpoint.local_addr()?;
     let endpoint_str = SocketAddr::new(advertise_ip, listen_addr.port()).to_string();
     let instance_nonce = create_auth_challenge();
@@ -376,12 +393,15 @@ fn peer_relay_bind_ip(config: &ClientConfig) -> anyhow::Result<Option<IpAddr>> {
         return Ok(None);
     }
 
-    bind_ip.parse().with_context(|| {
-        format!(
-            "invalid peer_share_advertise_ip for peer relay dial: {}",
-            config.client.peer_share_advertise_ip
-        )
-    }).map(Some)
+    bind_ip
+        .parse()
+        .with_context(|| {
+            format!(
+                "invalid peer_share_advertise_ip for peer relay dial: {}",
+                config.client.peer_share_advertise_ip
+            )
+        })
+        .map(Some)
 }
 
 fn emit_peer_share_event(logger: Option<&PeerShareEventLogger>, message: String) {
@@ -499,7 +519,9 @@ fn resolve_advertise_ip(
         .flat_map(|interface| interface.ips.iter())
         .map(|network| network.ip())
         .find(|ip| !ip.is_loopback() && !ip.is_unspecified())
-        .ok_or_else(|| anyhow::anyhow!("failed to determine a non-loopback peer-share advertise IP"))
+        .ok_or_else(|| {
+            anyhow::anyhow!("failed to determine a non-loopback peer-share advertise IP")
+        })
 }
 
 fn build_peer_server_config(cert_der: Vec<u8>, key_der: Vec<u8>) -> quinn::ServerConfig {
@@ -545,9 +567,21 @@ mod tests {
             listener_cert_fingerprint: "sha256:abcd".to_owned(),
             capabilities: vec!["relay".to_owned(), "quic".to_owned()],
         };
-        assert!(should_accept_discovered_peer(&advertisement, "server-a", "self"));
-        assert!(!should_accept_discovered_peer(&advertisement, "server-b", "self"));
-        assert!(!should_accept_discovered_peer(&advertisement, "server-a", "peer-a"));
+        assert!(should_accept_discovered_peer(
+            &advertisement,
+            "server-a",
+            "self"
+        ));
+        assert!(!should_accept_discovered_peer(
+            &advertisement,
+            "server-b",
+            "self"
+        ));
+        assert!(!should_accept_discovered_peer(
+            &advertisement,
+            "server-a",
+            "peer-a"
+        ));
     }
 
     #[test]
@@ -567,7 +601,9 @@ mod tests {
             .expect("request should build");
         verify_signature(
             &consumer.public_key_b64,
-            &request.signed_payload().expect("request payload should serialize"),
+            &request
+                .signed_payload()
+                .expect("request payload should serialize"),
             &request.consumer_signature,
         )
         .expect("request signature should verify");

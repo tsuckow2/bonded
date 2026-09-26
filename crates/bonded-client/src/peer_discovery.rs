@@ -132,7 +132,10 @@ fn advertisement_from_resolved_service(
             .next()
             .map(|address| address.to_string())
             .context("resolved peer-share service did not include an address")?;
-        records.insert("endpoint".to_owned(), format!("{address}:{}", resolved.get_port()));
+        records.insert(
+            "endpoint".to_owned(),
+            format!("{address}:{}", resolved.get_port()),
+        );
     }
 
     PeerShareAdvertisement::from_txt_record_map(&records)

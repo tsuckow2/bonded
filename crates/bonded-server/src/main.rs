@@ -61,20 +61,22 @@ use pairing_qr::emit_pairing_qr;
 use peer_relay::resolve_session_binding;
 use rcgen;
 use session_registry::SessionRegistry;
-use smoltcp_forwarder::SmoltcpForwarder;
+use smoltcp_forwarder::{SessionContext, SmoltcpForwarder};
 use status::run_status_server;
 use std::io::BufReader;
 use std::path::Path;
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, RwLock};
 use tokio::net::TcpListener;
 use tokio::signal;
 use tokio::sync::mpsc;
 use tokio_rustls::TlsAcceptor;
-use tracing::{error, info, warn, Level};
+use tracing::{debug, error, info, warn, Level};
 use tun_bridge::TunBridge;
 use tunnel_pcap::TunnelPcapLogger;
 
-type ForwarderRegistry = Arc<RwLock<HashMap<u64, Arc<SmoltcpForwarder>>>>;
+type ForwarderRegistry = Arc<RwLock<HashMap<u64, Arc<SessionContext>>>>;
+
 const MAX_RESPONSE_DRAIN_PER_CYCLE: usize = 256;
 const TUNNEL_PCAP_MAX_MB_ENV: &str = "BONDED_TUNNEL_PCAP_MAX_MB";
 
@@ -613,16 +615,37 @@ async fn run_server(
                     );
                     let use_tun_bridge = tun_bridge.is_some();
                     let (forward_tx, mut forward_rx) = mpsc::unbounded_channel();
-                    let forwarder = if use_tun_bridge {
+                    let transport_id = smoltcp_forwarder::alloc_transport_id();
+                    // Exactly one forwarding context per session, shared by every
+                    // path: the flow state and outbound sequence space must survive
+                    // the death of any single path for failover to work.
+                    let session_ctx: Option<Arc<SessionContext>> = if use_tun_bridge {
                         None
                     } else {
-                        let value = Arc::new(SmoltcpForwarder::new(handle.session_id, forward_tx));
-                        forwarders
-                            .write()
-                            .expect("forwarder registry lock should not be poisoned")
-                            .insert(handle.session_id, value.clone());
-                        Some(value)
+                        let ctx = {
+                            let mut guard = forwarders
+                                .write()
+                                .expect("forwarder registry lock should not be poisoned");
+                            if let Some(existing) = guard.get(&handle.session_id) {
+                                existing.clone()
+                            } else {
+                                let (router, fwd_tx) =
+                                    smoltcp_forwarder::SessionOutboundRouter::new();
+                                let forwarder = Arc::new(SmoltcpForwarder::new(
+                                    handle.session_id,
+                                    fwd_tx,
+                                    Arc::new(AtomicU64::new(0)),
+                                ));
+                                let ctx = Arc::new(SessionContext { forwarder, router });
+                                guard.insert(handle.session_id, ctx.clone());
+                                ctx
+                            }
+                        };
+                        ctx.router.add_transport(transport_id, forward_tx);
+                        Some(ctx)
                     };
+                    let forwarder: Option<Arc<SmoltcpForwarder>> =
+                        session_ctx.as_ref().map(|ctx| ctx.forwarder.clone());
 
                     let (tun_tx, mut tun_rx) = mpsc::unbounded_channel::<SessionFrame>();
                     if let Some(bridge) = &tun_bridge {
@@ -697,7 +720,7 @@ async fn run_server(
                                 );
                                 let pong = SessionFrame {
                                     header: SessionHeader {
-                                        connection_id: frame.header.connection_id,
+                                        connection_id: handle.session_id as u32,
                                         sequence: frame.header.sequence,
                                         flags: FLAG_PONG,
                                     },
@@ -731,6 +754,9 @@ async fn run_server(
                                         break;
                                     }
                                 } else if let Some(f) = &forwarder {
+                                    if let Some(ctx) = &session_ctx {
+                                        ctx.router.mark_active(transport_id);
+                                    }
                                     f.ingest_packet(frame);
                                 }
                             }
@@ -784,6 +810,14 @@ async fn run_server(
                             recv_result = transport.recv() => {
                                 match recv_result {
                                     Ok(frame) => {
+                                        info!(
+                                            peer = %peer,
+                                            session_id = handle.session_id,
+                                            flags = frame.header.flags,
+                                            seq = frame.header.sequence,
+                                            payload_len = frame.payload.len(),
+                                            "FRAME RECEIVED"
+                                        );
                                         maybe_log_tunnel_packet(&tunnel_pcap, &frame.payload);
                                         // Respond to heartbeat pings without forwarding them.
                                         // Only treat ping-bit frames as control heartbeats when
@@ -840,6 +874,19 @@ async fn run_server(
                                             continue;
                                         }
                                         if let Some(f) = &forwarder {
+                                            // Track the last transport that delivered inbound
+                                            // traffic so the outbound router sends replies on
+                                            // the currently-live path (failover).
+                                            if let Some(ctx) = &session_ctx {
+                                                ctx.router.mark_active(transport_id);
+                                            }
+                                            debug!(
+                                                peer = %peer,
+                                                session_id = handle.session_id,
+                                                payload_len = frame.payload.len(),
+                                                sequence = frame.header.sequence,
+                                                "ingesting data frame into forwarder"
+                                            );
                                             f.ingest_packet(frame);
                                         }
                                     }
@@ -859,15 +906,22 @@ async fn run_server(
                     }
                     if let Some(bridge) = &tun_bridge {
                         bridge.unregister_session(handle.session_id).await;
+                        sessions.unregister_client(&binding.client_public_key);
                     }
-                    if let Some(f) = forwarder {
-                        f.clear_session();
-                        forwarders
-                            .write()
-                            .expect("forwarder registry lock should not be poisoned")
-                            .remove(&handle.session_id);
+                    if let Some(ctx) = session_ctx {
+                        ctx.router.remove_transport(transport_id);
+                        // Only tear down the session when its last path
+                        // disconnects; otherwise the surviving path keeps the
+                        // flow state and sequence space alive for failover.
+                        if ctx.router.transport_count() == 0 {
+                            ctx.forwarder.clear_session();
+                            forwarders
+                                .write()
+                                .expect("forwarder registry lock should not be poisoned")
+                                .remove(&handle.session_id);
+                            sessions.unregister_client(&binding.client_public_key);
+                        }
                     }
-                    sessions.unregister_client(&binding.client_public_key);
                 }
                 Err(err) => {
                     warn!(peer = %peer, error = %err, "client authentication failed");

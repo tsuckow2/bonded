@@ -89,10 +89,8 @@ pub async fn connect_peer_relay(
     }
 
     let endpoint = parse_peer_endpoint(&claims.provider_endpoint)?;
-    let rustls_config = (*cert_proof::make_pinned_tls_config(
-        &claims.listener_cert_fingerprint,
-    ))
-    .clone();
+    let rustls_config =
+        (*cert_proof::make_pinned_tls_config(&claims.listener_cert_fingerprint)).clone();
     let (_endpoint, connection) = connect_quic_client_with_bind(
         &endpoint.ip().to_string(),
         endpoint.port(),
@@ -342,15 +340,17 @@ mod tests {
                 .accept()
                 .await
                 .expect("incoming peer relay connection");
-            let connection = incoming.await.expect("peer relay connection should complete");
-            let AcceptedPeerRelay { mut transport, .. } = accept_peer_relay(
-                &server_public_key,
-                &listener_identity,
-                connection,
-            )
-            .await
-            .expect("provider should accept peer relay introduction");
-            let frame = transport.recv().await.expect("provider should receive frame");
+            let connection = incoming
+                .await
+                .expect("peer relay connection should complete");
+            let AcceptedPeerRelay { mut transport, .. } =
+                accept_peer_relay(&server_public_key, &listener_identity, connection)
+                    .await
+                    .expect("provider should accept peer relay introduction");
+            let frame = transport
+                .recv()
+                .await
+                .expect("provider should receive frame");
             assert_eq!(frame.payload, Bytes::from_static(b"hello-peer"));
 
             transport
@@ -448,7 +448,9 @@ mod tests {
                 .accept()
                 .await
                 .expect("incoming peer relay connection");
-            let connection = incoming.await.expect("peer relay connection should complete");
+            let connection = incoming
+                .await
+                .expect("peer relay connection should complete");
             let AcceptedPeerRelay {
                 transport: mut peer,
                 ..
@@ -456,9 +458,12 @@ mod tests {
                 .await
                 .expect("provider should accept peer relay introduction");
             let mut upstream = provider_upstream;
-            let relay_result = timeout(Duration::from_secs(5), relay_peer_frames(&mut peer, &mut upstream))
-                .await
-                .expect("relay loop should stay active during exchange");
+            let relay_result = timeout(
+                Duration::from_secs(5),
+                relay_peer_frames(&mut peer, &mut upstream),
+            )
+            .await
+            .expect("relay loop should stay active during exchange");
             relay_result.expect_err("relay loop should stop once test channels close");
         });
 
@@ -487,7 +492,10 @@ mod tests {
             .await
             .expect("upstream recv should not time out")
             .expect("upstream should receive forwarded frame");
-        assert_eq!(forwarded.payload, Bytes::from_static(b"forward-to-upstream"));
+        assert_eq!(
+            forwarded.payload,
+            Bytes::from_static(b"forward-to-upstream")
+        );
 
         upstream_control
             .send_inbound(SessionFrame {
@@ -508,7 +516,9 @@ mod tests {
 
         drop(consumer);
         drop(upstream_control);
-        provider_task.await.expect("provider relay task should join");
+        provider_task
+            .await
+            .expect("provider relay task should join");
     }
 
     #[tokio::test]

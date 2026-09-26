@@ -6,9 +6,9 @@ use bonded_client::{
 #[cfg(any(target_os = "android", test))]
 use bonded_core::config::ClientConfig;
 #[cfg(target_os = "android")]
-use bonded_core::config::SocketProtectFn;
-#[cfg(target_os = "android")]
 use bonded_core::config::SocketNetworkBindFn;
+#[cfg(target_os = "android")]
+use bonded_core::config::SocketProtectFn;
 use bonded_core::session::SessionFrame;
 #[cfg(any(target_os = "android", test))]
 use bonded_core::session::{SessionState, FLAG_PING, FLAG_PONG};
@@ -215,7 +215,12 @@ fn bind_socket_to_network(fd: i32, bind_address: &str) -> bool {
     ];
 
     let result = guard
-        .call_method(&service, "bindSocketToNetworkForNative", "(ILjava/lang/String;)Z", &call_args)
+        .call_method(
+            &service,
+            "bindSocketToNetworkForNative",
+            "(ILjava/lang/String;)Z",
+            &call_args,
+        )
         .ok()
         .and_then(|v| v.z().ok())
         .unwrap_or(false);

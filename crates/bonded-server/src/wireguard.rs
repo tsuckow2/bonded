@@ -14,12 +14,13 @@ use std::fs;
 use std::net::Ipv4Addr;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
-use bonded_core::config::DEFAULT_WIREGUARD_PEER_LEASE_SECS;
 use base64::Engine as _;
+use bonded_core::config::DEFAULT_WIREGUARD_PEER_LEASE_SECS;
 use bonded_core::session::{SessionFrame, SessionHeader, FLAG_PING, FLAG_PONG};
 use bonded_core::transport::WireGuardKeypair;
 use boringtun::noise::{Tunn, TunnResult};
@@ -29,11 +30,11 @@ use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use tracing::{debug, info, warn};
 
 use crate::session_registry::SessionRegistry;
-use crate::smoltcp_forwarder::SmoltcpForwarder;
+use crate::smoltcp_forwarder::{SessionContext, SessionOutboundRouter, SmoltcpForwarder};
 use crate::tun_bridge::TunBridge;
 use crate::tunnel_pcap::TunnelPcapLogger;
 
-type ForwarderRegistry = Arc<RwLock<HashMap<u64, Arc<SmoltcpForwarder>>>>;
+type ForwarderRegistry = Arc<RwLock<HashMap<u64, Arc<SessionContext>>>>;
 
 const WG_MAX_DATAGRAM: usize = 1500;
 const WG_HS_BUF: usize = 148;
@@ -197,7 +198,10 @@ impl WireGuardPeerRegistry {
         let mut peers = self.peers.lock().expect("wg peer registry lock");
         self.prune_expired_locked(&mut peers)
             .expect("pruning expired WireGuard peers should succeed");
-        peers.values().find(|p| p.wg_public_key == wg_public_key).cloned()
+        peers
+            .values()
+            .find(|p| p.wg_public_key == wg_public_key)
+            .cloned()
     }
 
     /// Return all registered peers (for kernel WG configuration helpers).
@@ -215,7 +219,10 @@ impl WireGuardPeerRegistry {
         persist_peers_file(path, peers)
     }
 
-    fn prune_expired_locked(&self, peers: &mut HashMap<String, WireGuardPeer>) -> anyhow::Result<()> {
+    fn prune_expired_locked(
+        &self,
+        peers: &mut HashMap<String, WireGuardPeer>,
+    ) -> anyhow::Result<()> {
         let now = unix_timestamp_now()?;
         let before = peers.len();
         peers.retain(|_, peer| peer.lease_expires_at == 0 || peer.lease_expires_at > now);
@@ -253,7 +260,11 @@ fn load_peers_file(
         max_octet = max_octet.max(peer.peer_ip.octets()[3]);
         peers.insert(peer.device_public_key.clone(), peer);
     }
-    Ok((peers, normalize_octet(max_octet.saturating_add(1)), normalized))
+    Ok((
+        peers,
+        normalize_octet(max_octet.saturating_add(1)),
+        normalized,
+    ))
 }
 
 fn persist_peers_file(path: &Path, peers: &HashMap<String, WireGuardPeer>) -> anyhow::Result<()> {
@@ -268,7 +279,10 @@ fn persist_peers_file(path: &Path, peers: &HashMap<String, WireGuardPeer>) -> an
     Ok(())
 }
 
-fn allocate_peer_ip(peers: &HashMap<String, WireGuardPeer>, next_octet: &mut u8) -> anyhow::Result<Ipv4Addr> {
+fn allocate_peer_ip(
+    peers: &HashMap<String, WireGuardPeer>,
+    next_octet: &mut u8,
+) -> anyhow::Result<Ipv4Addr> {
     let start = normalize_octet(*next_octet);
     for offset in 0..254u16 {
         let candidate = (((start as u16 - 1 + offset) % 254) + 1) as u8;
@@ -356,6 +370,8 @@ struct WireGuardServerPeer {
     session_id: u64,
     runtime: Arc<WireGuardPeerRuntime>,
     forwarder: Option<Arc<SmoltcpForwarder>>,
+    session_ctx: Option<Arc<SessionContext>>,
+    transport_id: u64,
     tun_bridge: Option<TunBridge>,
 }
 
@@ -588,16 +604,34 @@ async fn ensure_peer_runtime(
     );
 
     let (forward_tx, mut forward_rx) = mpsc::unbounded_channel::<SessionFrame>();
-    let forwarder = if tun_bridge.is_some() {
+    let transport_id = crate::smoltcp_forwarder::alloc_transport_id();
+    // Exactly one forwarding context per session, shared by every path.
+    let session_ctx: Option<Arc<SessionContext>> = if tun_bridge.is_some() {
         None
     } else {
-        let value = Arc::new(SmoltcpForwarder::new(handle.session_id, forward_tx));
-        forwarders
-            .write()
-            .expect("forwarder registry lock should not be poisoned")
-            .insert(handle.session_id, value.clone());
-        Some(value)
+        let ctx = {
+            let mut guard = forwarders
+                .write()
+                .expect("forwarder registry lock should not be poisoned");
+            if let Some(existing) = guard.get(&handle.session_id) {
+                existing.clone()
+            } else {
+                let (router, fwd_tx) = SessionOutboundRouter::new();
+                let forwarder = Arc::new(SmoltcpForwarder::new(
+                    handle.session_id,
+                    fwd_tx,
+                    Arc::new(AtomicU64::new(0)),
+                ));
+                let ctx = Arc::new(SessionContext { forwarder, router });
+                guard.insert(handle.session_id, ctx.clone());
+                ctx
+            }
+        };
+        ctx.router.add_transport(transport_id, forward_tx);
+        Some(ctx)
     };
+    let forwarder: Option<Arc<SmoltcpForwarder>> =
+        session_ctx.as_ref().map(|ctx| ctx.forwarder.clone());
 
     let mut tun_rx = if let Some(bridge) = &tun_bridge {
         let (tun_tx, tun_rx) = mpsc::unbounded_channel::<SessionFrame>();
@@ -612,6 +646,8 @@ async fn ensure_peer_runtime(
         session_id: handle.session_id,
         runtime: runtime.clone(),
         forwarder: forwarder.clone(),
+        session_ctx: session_ctx.clone(),
+        transport_id,
         tun_bridge: tun_bridge.clone(),
     });
 
@@ -741,19 +777,33 @@ async fn ensure_peer_runtime(
                         public_key = %peer_context_for_task.public_key,
                         "wireguard peer task ending because forward response queue closed"
                     );
-                    cleanup_wireguard_peer(&peer_context_for_task, &forwarders_for_task, &sessions_for_task).await;
+                    cleanup_wireguard_peer(
+                        &peer_context_for_task,
+                        &forwarders_for_task,
+                        &sessions_for_task,
+                    )
+                    .await;
                     return;
                 };
 
                 maybe_log_tunnel_packet(&tunnel_pcap, &forwarded_frame.payload);
-                if let Err(err) = peer_context_for_task.runtime.send_frame(forwarded_frame).await {
+                if let Err(err) = peer_context_for_task
+                    .runtime
+                    .send_frame(forwarded_frame)
+                    .await
+                {
                     warn!(
                         session_id = peer_context_for_task.session_id,
                         public_key = %peer_context_for_task.public_key,
                         error = %err,
                         "failed to return forwarded WireGuard frame"
                     );
-                    cleanup_wireguard_peer(&peer_context_for_task, &forwarders_for_task, &sessions_for_task).await;
+                    cleanup_wireguard_peer(
+                        &peer_context_for_task,
+                        &forwarders_for_task,
+                        &sessions_for_task,
+                    )
+                    .await;
                     return;
                 }
             }
@@ -822,6 +872,9 @@ async fn handle_decoded_frames(
         }
 
         if let Some(forwarder) = &peer.forwarder {
+            if let Some(ctx) = &peer.session_ctx {
+                ctx.router.mark_active(peer.transport_id);
+            }
             forwarder.ingest_packet(frame);
         }
     }
@@ -841,15 +894,21 @@ async fn cleanup_wireguard_peer(
     );
     if let Some(bridge) = &peer.tun_bridge {
         bridge.unregister_session(peer.session_id).await;
+        sessions.unregister_client(&peer.public_key);
     }
-    if let Some(forwarder) = &peer.forwarder {
-        forwarder.clear_session();
-        forwarders
-            .write()
-            .expect("forwarder registry lock should not be poisoned")
-            .remove(&peer.session_id);
+    if let Some(ctx) = &peer.session_ctx {
+        ctx.router.remove_transport(peer.transport_id);
+        if ctx.router.transport_count() == 0 {
+            if let Some(forwarder) = &peer.forwarder {
+                forwarder.clear_session();
+            }
+            forwarders
+                .write()
+                .expect("forwarder registry lock should not be poisoned")
+                .remove(&peer.session_id);
+            sessions.unregister_client(&peer.public_key);
+        }
     }
-    sessions.unregister_client(&peer.public_key);
 }
 
 fn process_datagram(
@@ -1255,6 +1314,7 @@ mod tests {
                 ..ClientSection::default()
             },
             socket_protect: None,
+            socket_network_bind: None,
         };
 
         let mut paths = establish_transport_paths(&cfg, 1)
@@ -1382,8 +1442,8 @@ mod tests {
     #[test]
     fn persisted_registry_keeps_same_ip_and_updates_wg_key() {
         let path = temp_test_file("wg-peer-registry");
-        let registry = WireGuardPeerRegistry::load(&path)
-            .expect("registry should load from missing path");
+        let registry =
+            WireGuardPeerRegistry::load(&path).expect("registry should load from missing path");
 
         let first_key = WireGuardKeypair::generate().public_key_b64();
         let second_key = WireGuardKeypair::generate().public_key_b64();
@@ -1421,7 +1481,10 @@ lease_expires_at = 1
             .expect("registry should load and prune expired peers");
         assert!(registry.all_peers().is_empty());
 
-        let assigned = registry.register_peer("fresh-device", &WireGuardKeypair::generate().public_key_b64());
+        let assigned = registry.register_peer(
+            "fresh-device",
+            &WireGuardKeypair::generate().public_key_b64(),
+        );
         assert_eq!(assigned, "100.64.1.1/32");
 
         let _ = fs::remove_file(path);

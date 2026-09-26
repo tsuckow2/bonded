@@ -1,6 +1,6 @@
 use crate::session_registry::SessionRegistry;
 use crate::smoltcp_forwarder::{
-    IcmpProbeSnapshot, SmoltcpForwarder, TcpFlowSnapshot, UdpFlowSnapshot,
+    IcmpProbeSnapshot, SessionContext, TcpFlowSnapshot, UdpFlowSnapshot,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -12,7 +12,7 @@ use tracing::{error, info};
 pub async fn run_status_server(
     bind: &str,
     sessions: SessionRegistry,
-    forwarders: Arc<RwLock<HashMap<u64, Arc<SmoltcpForwarder>>>>,
+    forwarders: Arc<RwLock<HashMap<u64, Arc<SessionContext>>>>,
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind(bind).await?;
     info!(bind = %bind, "status listener bound");
@@ -55,8 +55,8 @@ pub async fn run_status_server(
                     .read()
                     .expect("forwarder registry lock should not be poisoned");
 
-                for forwarder in guard.values() {
-                    let snapshot = forwarder.snapshot();
+                for ctx in guard.values() {
+                    let snapshot = ctx.forwarder.snapshot();
                     udp_flows.extend(snapshot.udp_flows);
                     tcp_flows.extend(snapshot.tcp_flows);
                     icmp_probes.extend(snapshot.icmp_probes);

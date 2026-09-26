@@ -41,7 +41,10 @@ where
     )?;
 
     Ok(SessionBinding {
-        client_public_key: registration.introduction.introduction.consumer_device_public_key,
+        client_public_key: registration
+            .introduction
+            .introduction
+            .consumer_device_public_key,
         initial_frame: None,
         relayed_via_provider: true,
     })
@@ -112,19 +115,14 @@ mod tests {
                 .expect("server should sign claims"),
             },
         };
-        let mut transport = MockTransport::with_frames(vec![
-            registration
-                .into_control_frame()
-                .expect("control frame should serialize"),
-        ]);
+        let mut transport = MockTransport::with_frames(vec![registration
+            .into_control_frame()
+            .expect("control frame should serialize")]);
 
-        let binding = resolve_session_binding(
-            &mut transport,
-            "provider".to_owned(),
-            &server_identity,
-        )
-        .await
-        .expect("relay registration should bind to the consumer session");
+        let binding =
+            resolve_session_binding(&mut transport, "provider".to_owned(), &server_identity)
+                .await
+                .expect("relay registration should bind to the consumer session");
 
         assert_eq!(binding.client_public_key, "consumer");
         assert!(binding.initial_frame.is_none());
@@ -144,13 +142,10 @@ mod tests {
         };
         let mut transport = MockTransport::with_frames(vec![first_frame.clone()]);
 
-        let binding = resolve_session_binding(
-            &mut transport,
-            "provider".to_owned(),
-            &server_identity,
-        )
-        .await
-        .expect("non-relay frame should keep authenticated binding");
+        let binding =
+            resolve_session_binding(&mut transport, "provider".to_owned(), &server_identity)
+                .await
+                .expect("non-relay frame should keep authenticated binding");
 
         assert_eq!(binding.client_public_key, "provider");
         assert_eq!(binding.initial_frame, Some(first_frame));

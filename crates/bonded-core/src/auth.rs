@@ -213,16 +213,12 @@ pub fn load_or_create_keypair(path: &Path) -> anyhow::Result<DeviceKeypair> {
     } else {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
-                anyhow::anyhow!(
-                    "failed to create key directory {}: {e}",
-                    parent.display()
-                )
+                anyhow::anyhow!("failed to create key directory {}: {e}", parent.display())
             })?;
         }
         let keypair = DeviceKeypair::generate();
-        std::fs::write(path, format!("{}\n", keypair.private_key_b64)).map_err(|e| {
-            anyhow::anyhow!("failed to write keypair to {}: {e}", path.display())
-        })?;
+        std::fs::write(path, format!("{}\n", keypair.private_key_b64))
+            .map_err(|e| anyhow::anyhow!("failed to write keypair to {}: {e}", path.display()))?;
         Ok(keypair)
     }
 }
@@ -381,8 +377,7 @@ mod tests {
     fn verify_signature_wrong_key_fails() {
         let signer = DeviceKeypair::generate();
         let other = DeviceKeypair::generate();
-        let sig =
-            super::sign_bytes(&signer, b"hello").expect("sign_bytes should succeed");
+        let sig = super::sign_bytes(&signer, b"hello").expect("sign_bytes should succeed");
         let err = super::verify_signature(&other.public_key_b64, b"hello", &sig)
             .expect_err("verify_signature should reject signature from a different key");
         assert!(matches!(err, AuthError::SignatureVerificationFailed));

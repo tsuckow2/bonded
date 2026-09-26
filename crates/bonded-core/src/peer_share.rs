@@ -91,10 +91,7 @@ impl PeerShareAdvertisement {
                 TXT_CERT_FINGERPRINT_KEY.to_owned(),
                 self.listener_cert_fingerprint.clone(),
             ),
-            (
-                TXT_CAPABILITIES_KEY.to_owned(),
-                self.capabilities.join(","),
-            ),
+            (TXT_CAPABILITIES_KEY.to_owned(), self.capabilities.join(",")),
         ]
     }
 
@@ -163,8 +160,9 @@ mod tests {
             consumer_signature: "sig".to_owned(),
         };
 
-        let payload = String::from_utf8(request.signed_payload().expect("payload should serialize"))
-            .expect("payload should be utf8");
+        let payload =
+            String::from_utf8(request.signed_payload().expect("payload should serialize"))
+                .expect("payload should be utf8");
         assert!(payload.contains("consumer_device_public_key"));
         assert!(!payload.contains("consumer_signature"));
     }
@@ -181,8 +179,9 @@ mod tests {
             expires_at: 12345,
         };
 
-        let payload = String::from_utf8(claims.signing_payload().expect("payload should serialize"))
-            .expect("payload should be utf8");
+        let payload =
+            String::from_utf8(claims.signing_payload().expect("payload should serialize"))
+                .expect("payload should be utf8");
         assert!(payload.contains("expires_at"));
     }
 
@@ -229,8 +228,8 @@ mod tests {
             .clone()
             .into_control_frame()
             .expect("control frame should serialize");
-        let parsed = PeerRelayRegistration::from_control_frame(&frame)
-            .expect("control frame should parse");
+        let parsed =
+            PeerRelayRegistration::from_control_frame(&frame).expect("control frame should parse");
         assert_eq!(parsed, registration);
     }
 }

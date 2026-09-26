@@ -1,6 +1,5 @@
 use crate::{
-    cert_proof,
-    establish_naive_tcp_session, establish_naive_tcp_session_with_bind,
+    cert_proof, establish_naive_tcp_session, establish_naive_tcp_session_with_bind,
     establish_naive_tcp_sessions, establish_transport_paths, ClientTransport,
 };
 use bonded_core::auth::{create_auth_challenge, sign_bytes, verify_auth_challenge, DeviceKeypair};
@@ -12,9 +11,9 @@ use quinn::ServerConfig as QuicServerConfig;
 use rcgen::generate_simple_self_signed;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde_json::json;
-use std::sync::Arc;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -289,8 +288,8 @@ async fn h3_bootstrap_request_fetches_capabilities_after_cert_proof() {
     let key_der = cert.key_pair.serialize_der();
     let fingerprint = cert_proof::compute_fingerprint(&cert_der);
     let server_identity = DeviceKeypair::generate();
-    let signature = sign_bytes(&server_identity, fingerprint.as_bytes())
-        .expect("fingerprint should sign");
+    let signature =
+        sign_bytes(&server_identity, fingerprint.as_bytes()).expect("fingerprint should sign");
 
     let endpoint = quinn::Endpoint::server(
         build_test_h3_server_config(cert_der, key_der),
@@ -359,7 +358,10 @@ async fn h3_bootstrap_request_fetches_capabilities_after_cert_proof() {
             request_count += 1;
         }
 
-        assert_eq!(request_count, 2, "server should handle cert-proof and capabilities requests");
+        assert_eq!(
+            request_count, 2,
+            "server should handle cert-proof and capabilities requests"
+        );
     });
 
     let mut cfg = test_client_config(addr.to_string(), &DeviceKeypair::generate());
@@ -377,8 +379,8 @@ async fn h3_bootstrap_request_fetches_capabilities_after_cert_proof() {
     .await
     .expect("HTTP/3 bootstrap request should succeed");
 
-    let parsed: serde_json::Value = serde_json::from_str(&body)
-        .expect("HTTP/3 bootstrap JSON should parse");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&body).expect("HTTP/3 bootstrap JSON should parse");
     assert_eq!(parsed["transports"], json!(["h3"]));
 
     server_task.await.expect("HTTP/3 server task should join");
@@ -396,8 +398,8 @@ async fn h3_bootstrap_rejects_wrong_server_identity_key() {
     let key_der = cert.key_pair.serialize_der();
     let fingerprint = cert_proof::compute_fingerprint(&cert_der);
     let server_identity = DeviceKeypair::generate();
-    let signature = sign_bytes(&server_identity, fingerprint.as_bytes())
-        .expect("fingerprint should sign");
+    let signature =
+        sign_bytes(&server_identity, fingerprint.as_bytes()).expect("fingerprint should sign");
 
     let endpoint = quinn::Endpoint::server(
         build_test_h3_server_config(cert_der, key_der),
@@ -499,17 +501,22 @@ async fn h3_bootstrap_retries_after_stale_cert_pin() {
     let key_der = cert.key_pair.serialize_der();
     let fingerprint = cert_proof::compute_fingerprint(&cert_der);
     let server_identity = DeviceKeypair::generate();
-    let signature = sign_bytes(&server_identity, fingerprint.as_bytes())
-        .expect("fingerprint should sign");
+    let signature =
+        sign_bytes(&server_identity, fingerprint.as_bytes()).expect("fingerprint should sign");
 
     let tcp_listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("TLS bootstrap listener should bind");
-    let addr = tcp_listener.local_addr().expect("TLS bootstrap addr should resolve");
+    let addr = tcp_listener
+        .local_addr()
+        .expect("TLS bootstrap addr should resolve");
     let tls_acceptor = build_test_tls_acceptor(cert_der.clone(), key_der.clone());
 
     let tls_task = tokio::spawn(async move {
-        let (stream, _) = tcp_listener.accept().await.expect("TLS accept should succeed");
+        let (stream, _) = tcp_listener
+            .accept()
+            .await
+            .expect("TLS accept should succeed");
         let mut tls = tls_acceptor
             .accept(stream)
             .await
@@ -532,14 +539,13 @@ async fn h3_bootstrap_retries_after_stale_cert_pin() {
         tls.write_all(response.as_bytes())
             .await
             .expect("TLS response should write");
-        tls.shutdown().await.expect("TLS response should close cleanly");
+        tls.shutdown()
+            .await
+            .expect("TLS response should close cleanly");
     });
 
-    let endpoint = quinn::Endpoint::server(
-        build_test_h3_server_config(cert_der, key_der),
-        addr,
-    )
-    .expect("HTTP/3 endpoint should bind");
+    let endpoint = quinn::Endpoint::server(build_test_h3_server_config(cert_der, key_der), addr)
+        .expect("HTTP/3 endpoint should bind");
 
     let h3_task = tokio::spawn(async move {
         let connection = loop {
@@ -596,7 +602,10 @@ async fn h3_bootstrap_retries_after_stale_cert_pin() {
             request_count += 1;
         }
 
-        assert_eq!(request_count, 1, "server should handle one retried H3 request");
+        assert_eq!(
+            request_count, 1,
+            "server should handle one retried H3 request"
+        );
     });
 
     let mut cfg = test_client_config(addr.to_string(), &DeviceKeypair::generate());
@@ -614,8 +623,8 @@ async fn h3_bootstrap_retries_after_stale_cert_pin() {
     .await
     .expect("HTTP/3 bootstrap should recover from a stale pin");
 
-    let parsed: serde_json::Value = serde_json::from_str(&body)
-        .expect("HTTP/3 bootstrap JSON should parse");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&body).expect("HTTP/3 bootstrap JSON should parse");
     assert_eq!(parsed["transports"], json!(["h3"]));
 
     tls_task.await.expect("TLS bootstrap task should join");
@@ -986,7 +995,10 @@ async fn mixed_websocket_quic_failover_continues_exchange() {
         .send(frame)
         .await
         .expect("QUIC fallback send should work");
-    let echoed = paths[1].recv().await.expect("QUIC fallback echo should arrive");
+    let echoed = paths[1]
+        .recv()
+        .await
+        .expect("QUIC fallback echo should arrive");
     assert_eq!(&echoed.payload[..], b"mixed-failover");
     let _ = quic_done_tx.send(());
 

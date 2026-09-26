@@ -12,6 +12,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -35,7 +36,7 @@ use crate::auth_handshake::perform_websocket_auth_handshake;
 use crate::authorized_keys::AuthorizedKeysStore;
 use crate::peer_relay::resolve_session_binding;
 use crate::session_registry::SessionRegistry;
-use crate::smoltcp_forwarder::SmoltcpForwarder;
+use crate::smoltcp_forwarder::{SessionContext, SessionOutboundRouter, SmoltcpForwarder};
 use crate::tunnel_pcap::TunnelPcapLogger;
 
 /// Maximum bytes to read while searching for the end of HTTP request headers.
@@ -44,7 +45,7 @@ const MAX_HEADER_BYTES: usize = 16 * 1024;
 /// Maximum frames to drain from the forwarder response queue per scheduler turn.
 const MAX_DRAIN: usize = 256;
 
-type ForwarderRegistry = Arc<RwLock<HashMap<u64, Arc<SmoltcpForwarder>>>>;
+type ForwarderRegistry = Arc<RwLock<HashMap<u64, Arc<SessionContext>>>>;
 
 #[derive(Debug, Clone)]
 pub(crate) struct AdvertisedBootstrapEndpoints {
@@ -798,12 +799,30 @@ async fn handle_websocket_session(
     );
 
     let (forward_tx, mut forward_rx) = mpsc::unbounded_channel::<SessionFrame>();
-    let forwarder = Arc::new(SmoltcpForwarder::new(handle.session_id, forward_tx));
-
-    forwarders
-        .write()
-        .expect("forwarder registry lock should not be poisoned")
-        .insert(handle.session_id, forwarder.clone());
+    let transport_id = crate::smoltcp_forwarder::alloc_transport_id();
+    // Exactly one forwarding context per session, shared by every path: the
+    // flow state and outbound sequence space must survive the death of any
+    // single path for failover to work.
+    let session_ctx: Arc<SessionContext> = {
+        let mut guard = forwarders
+            .write()
+            .expect("forwarder registry lock should not be poisoned");
+        if let Some(existing) = guard.get(&handle.session_id) {
+            existing.clone()
+        } else {
+            let (router, fwd_tx) = SessionOutboundRouter::new();
+            let forwarder = Arc::new(SmoltcpForwarder::new(
+                handle.session_id,
+                fwd_tx,
+                Arc::new(AtomicU64::new(0)),
+            ));
+            let ctx = Arc::new(SessionContext { forwarder, router });
+            guard.insert(handle.session_id, ctx.clone());
+            ctx
+        }
+    };
+    session_ctx.router.add_transport(transport_id, forward_tx);
+    let forwarder: Arc<SmoltcpForwarder> = session_ctx.forwarder.clone();
 
     let mut pending_frame = binding.initial_frame;
     loop {
@@ -827,7 +846,7 @@ async fn handle_websocket_session(
             if frame.header.flags & FLAG_PING != 0 && frame.payload.is_empty() {
                 let pong = SessionFrame {
                     header: SessionHeader {
-                        connection_id: frame.header.connection_id,
+                        connection_id: handle.session_id as u32,
                         sequence: frame.header.sequence,
                         flags: FLAG_PONG,
                     },
@@ -839,6 +858,7 @@ async fn handle_websocket_session(
                     break;
                 }
             } else {
+                session_ctx.router.mark_active(transport_id);
                 forwarder.ingest_packet(frame);
             }
             continue;
@@ -878,6 +898,7 @@ async fn handle_websocket_session(
                             }
                             continue;
                         }
+                        session_ctx.router.mark_active(transport_id);
                         forwarder.ingest_packet(frame);
                     }
                     Err(err) => {
@@ -891,12 +912,17 @@ async fn handle_websocket_session(
         }
     }
 
-    forwarder.clear_session();
-    forwarders
-        .write()
-        .expect("forwarder registry lock should not be poisoned")
-        .remove(&handle.session_id);
-    sessions.unregister_client(&binding.client_public_key);
+    session_ctx.router.remove_transport(transport_id);
+    // Only tear down the session when its last path disconnects; otherwise
+    // the surviving path keeps the flow state and sequence space alive.
+    if session_ctx.router.transport_count() == 0 {
+        forwarder.clear_session();
+        forwarders
+            .write()
+            .expect("forwarder registry lock should not be poisoned")
+            .remove(&handle.session_id);
+        sessions.unregister_client(&binding.client_public_key);
+    }
     Ok(())
 }
 
