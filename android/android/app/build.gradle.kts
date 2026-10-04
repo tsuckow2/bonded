@@ -16,7 +16,9 @@ val gitBuildNumber = run {
         commandLine("git", "rev-list", "--count", "HEAD")
         standardOutput = stdout
     }
-    stdout.toString().trim().toInt()
+    // Play Store already has v124; ensure version code exceeds it.
+    // Base offset 120 + git count (6) = 126 > 124.
+    stdout.toString().trim().toInt() + 120
 }
 
 val keystoreProperties = Properties()
