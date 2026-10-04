@@ -316,6 +316,8 @@ pub struct SmoltcpForwarder {
     /// Outbound channel so UDP/ICMP handlers can send frames directly.
     outbound_tx: mpsc::UnboundedSender<SessionFrame>,
     session_id: u64,
+    /// Count of packets delivered to ingest_packet (for tests).
+    ingested_packets: AtomicU64,
 }
 
 // ── Session-level outbound routing ──────────────────────────────────────────
@@ -486,6 +488,7 @@ impl SmoltcpForwarder {
             udp_flow_map: Arc::new(TokioMutex::new(HashMap::new())),
             outbound_tx,
             session_id,
+            ingested_packets: AtomicU64::new(0),
         }
     }
 
@@ -495,6 +498,7 @@ impl SmoltcpForwarder {
     /// UDP is handled inline via per-flow Tokio tasks.
     /// ICMP is handled inline via the shared ICMP socket.
     pub fn ingest_packet(&self, frame: SessionFrame) {
+        self.ingested_packets.fetch_add(1, Ordering::Relaxed);
         let payload = frame.payload.as_ref();
         if payload.len() < 20 {
             return;
@@ -507,6 +511,12 @@ impl SmoltcpForwarder {
             1 => self.dispatch_icmp(frame),
             _ => {} // unsupported protocol, drop
         }
+    }
+
+    /// Return the number of packets delivered to ingest_packet.
+    /// Used by regression tests to prove the session loop delivers frames.
+    pub fn ingested_packet_count(&self) -> u64 {
+        self.ingested_packets.load(Ordering::Relaxed)
     }
 
     /// Clear all state for this session (called on session teardown).
@@ -1027,7 +1037,7 @@ fn smoltcp_poll_thread(
                     rewrite_src_ip_outbound(&mut pkt, original_src);
                     let frame = SessionFrame {
                         header: SessionHeader {
-                            connection_id: 0,
+                            connection_id: session_id as u32,
                             sequence: outbound_seq.fetch_add(1, Ordering::Relaxed),
                             flags: 0,
                         },
@@ -1053,7 +1063,7 @@ fn smoltcp_poll_thread(
                 rewrite_src_ip_outbound(&mut pkt, original_src);
                 let frame = SessionFrame {
                     header: SessionHeader {
-                        connection_id: 0,
+                        connection_id: session_id as u32,
                         sequence: outbound_seq.fetch_add(1, Ordering::Relaxed),
                         flags: 0,
                     },
@@ -2787,5 +2797,52 @@ mod tests {
             h.join().expect("thread panicked");
         }
         assert_eq!(seq.load(Ordering::Relaxed), 1000);
+    }
+
+    /// Regression test for H1: outbound TCP frames must carry the session's
+    /// connection_id, not 0. The client drops frames with mismatched IDs.
+    #[tokio::test]
+    async fn tcp_outbound_frames_carry_session_connection_id() {
+        let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<SessionFrame>();
+        // Session 1 (like the harness consumer; provider gets 0).
+        let forwarder = SmoltcpForwarder::new(1, outbound_tx, Arc::new(AtomicU64::new(0)));
+
+        let client_ip = Ipv4Addr::new(10, 8, 0, 2);
+        let client_port = 40000u16;
+        let server_ip = Ipv4Addr::LOCALHOST;
+        let server_port = 18080u16;
+
+        let syn = build_ipv4_tcp_packet(
+            client_ip,
+            server_ip,
+            client_port,
+            server_port,
+            1000,
+            0,
+            TCP_SYN,
+            &[],
+        );
+        forwarder.ingest_packet(SessionFrame {
+            header: SessionHeader {
+                connection_id: 1,
+                sequence: 1,
+                flags: 0,
+            },
+            payload: syn.into(),
+        });
+
+        // Receive the SYN-ACK frame and check its connection_id.
+        let frame = timeout(Duration::from_secs(3), outbound_rx.recv())
+            .await
+            .expect("timed out waiting for SYN-ACK")
+            .expect("outbound channel closed");
+        assert_eq!(
+            frame.header.connection_id, 1,
+            "outbound TCP frame must carry session connection_id=1, got {}",
+            frame.header.connection_id
+        );
+        // Verify it's actually a SYN-ACK.
+        let pkt = parse_ipv4_tcp_packet(&frame.payload).expect("should parse as TCP");
+        assert_eq!(pkt.flags & (TCP_SYN | TCP_ACK), TCP_SYN | TCP_ACK);
     }
 }
