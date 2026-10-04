@@ -34,6 +34,8 @@ class PairedServerStoreSelectionTest {
             peerShareEnabled = false,
             peerShareBindAddress = "",
             peerShareAdvertiseIp = "",
+            peerShareMaxConsumers = 4,
+            peerShareRelayBandwidthKbps = 0,
             pairedAt = pairedAt,
         )
 }

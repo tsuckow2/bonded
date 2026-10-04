@@ -218,6 +218,16 @@ pub struct ClientConfig {
     pub socket_network_bind: Option<SocketNetworkBindFn>,
 }
 
+/// Peer-share role mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerShareMode {
+    #[default]
+    Both,
+    ProviderOnly,
+    ConsumerOnly,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientSection {
     pub device_name: String,
@@ -258,9 +268,22 @@ pub struct ClientSection {
     #[serde(default)]
     pub peer_share_enabled: bool,
     #[serde(default)]
+    pub peer_share_mode: PeerShareMode,
+    #[serde(default)]
     pub peer_share_bind_address: String,
     #[serde(default)]
     pub peer_share_advertise_ip: String,
+    /// Maximum number of concurrent peer-share consumers this device will
+    /// relay for. Additional consumers are rejected at accept time.
+    #[serde(default = "default_peer_share_max_consumers")]
+    pub peer_share_max_consumers: u32,
+    /// Bandwidth cap per peer relay in kilobits per second. 0 = unlimited.
+    #[serde(default)]
+    pub peer_share_relay_bandwidth_kbps: u64,
+}
+
+fn default_peer_share_max_consumers() -> u32 {
+    4
 }
 
 impl Default for ClientSection {
@@ -281,8 +304,11 @@ impl Default for ClientSection {
             tls_cert_fingerprint: String::new(),
             wireguard_server_public_key: String::new(),
             peer_share_enabled: false,
+            peer_share_mode: PeerShareMode::Both,
             peer_share_bind_address: "0.0.0.0:54443".to_owned(),
             peer_share_advertise_ip: String::new(),
+            peer_share_max_consumers: default_peer_share_max_consumers(),
+            peer_share_relay_bandwidth_kbps: 0,
         }
     }
 }

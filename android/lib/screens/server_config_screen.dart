@@ -16,6 +16,8 @@ class _ServerConfigScreenState extends State<ServerConfigScreen> {
   late TextEditingController _publicKeyController;
   late TextEditingController _peerShareBindAddressController;
   late TextEditingController _peerShareAdvertiseIpController;
+  late TextEditingController _peerShareMaxConsumersController;
+  late TextEditingController _peerShareRelayBandwidthController;
   late List<String> _selectedProtocols;
   late bool _peerShareEnabled;
   bool _isSaving = false;
@@ -35,6 +37,12 @@ class _ServerConfigScreenState extends State<ServerConfigScreen> {
     _peerShareAdvertiseIpController = TextEditingController(
       text: widget.server.peerShareAdvertiseIp,
     );
+    _peerShareMaxConsumersController = TextEditingController(
+      text: widget.server.peerShareMaxConsumers.toString(),
+    );
+    _peerShareRelayBandwidthController = TextEditingController(
+      text: widget.server.peerShareRelayBandwidthKbps.toString(),
+    );
     _selectedProtocols = List.from(widget.server.supportedProtocols);
     _peerShareEnabled = widget.server.peerShareEnabled;
   }
@@ -45,6 +53,8 @@ class _ServerConfigScreenState extends State<ServerConfigScreen> {
     _publicKeyController.dispose();
     _peerShareBindAddressController.dispose();
     _peerShareAdvertiseIpController.dispose();
+    _peerShareMaxConsumersController.dispose();
+    _peerShareRelayBandwidthController.dispose();
     super.dispose();
   }
 
@@ -57,6 +67,10 @@ class _ServerConfigScreenState extends State<ServerConfigScreen> {
       peerShareEnabled: _peerShareEnabled,
       peerShareBindAddress: _peerShareBindAddressController.text.trim(),
       peerShareAdvertiseIp: _peerShareAdvertiseIpController.text.trim(),
+      peerShareMaxConsumers:
+          int.tryParse(_peerShareMaxConsumersController.text.trim()) ?? 4,
+      peerShareRelayBandwidthKbps:
+          int.tryParse(_peerShareRelayBandwidthController.text.trim()) ?? 0,
       pairedAt: widget.server.pairedAt,
     );
 
@@ -288,6 +302,44 @@ class _ServerConfigScreenState extends State<ServerConfigScreen> {
               controller: _peerShareAdvertiseIpController,
               decoration: InputDecoration(
                 hintText: 'Optional LAN IP override',
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                filled: true,
+                fillColor: Colors.grey[100],
+              ),
+            ),
+            const SizedBox(height: 24),
+            const Text(
+              'Max Concurrent Consumers',
+              style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 8),
+            TextField(
+              controller: _peerShareMaxConsumersController,
+              keyboardType: TextInputType.number,
+              decoration: InputDecoration(
+                hintText: '4',
+                helperText: 'Max peers that can relay through this device',
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                filled: true,
+                fillColor: Colors.grey[100],
+              ),
+            ),
+            const SizedBox(height: 24),
+            const Text(
+              'Relay Bandwidth Cap (kbps)',
+              style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 8),
+            TextField(
+              controller: _peerShareRelayBandwidthController,
+              keyboardType: TextInputType.number,
+              decoration: InputDecoration(
+                hintText: '0 = unlimited',
+                helperText: 'Per-relay bandwidth limit, kilobits per second',
                 border: OutlineInputBorder(
                   borderRadius: BorderRadius.circular(8),
                 ),

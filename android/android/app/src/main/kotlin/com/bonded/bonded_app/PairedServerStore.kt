@@ -13,6 +13,8 @@ data class PairedServerRecord(
     val peerShareEnabled: Boolean,
     val peerShareBindAddress: String,
     val peerShareAdvertiseIp: String,
+    val peerShareMaxConsumers: Int,
+    val peerShareRelayBandwidthKbps: Long,
         val pairedAt: String,
 ) {
     val serverPublicKey: String
@@ -94,6 +96,8 @@ object PairedServerStore {
                             .put("peerShareEnabled", record.peerShareEnabled)
                             .put("peerShareBindAddress", record.peerShareBindAddress)
                             .put("peerShareAdvertiseIp", record.peerShareAdvertiseIp)
+                            .put("peerShareMaxConsumers", record.peerShareMaxConsumers)
+                            .put("peerShareRelayBandwidthKbps", record.peerShareRelayBandwidthKbps)
                             .put("pairedAt", record.pairedAt),
             )
         }
@@ -154,6 +158,9 @@ object PairedServerStore {
                                 item.optString("peerShareBindAddress", ""),
                             peerShareAdvertiseIp =
                                 item.optString("peerShareAdvertiseIp", ""),
+                            peerShareMaxConsumers = item.optInt("peerShareMaxConsumers", 4),
+                            peerShareRelayBandwidthKbps =
+                                item.optLong("peerShareRelayBandwidthKbps", 0),
                                 pairedAt = item.optString("pairedAt", Instant.now().toString()),
                         ),
                 )
@@ -182,6 +189,8 @@ object PairedServerStore {
                 peerShareEnabled = false,
                 peerShareBindAddress = "",
                 peerShareAdvertiseIp = "",
+                peerShareMaxConsumers = 4,
+                peerShareRelayBandwidthKbps = 0,
                 pairedAt = prefs.getString(LEGACY_KEY_PAIRED_AT, Instant.now().toString())
                                 ?: Instant.now().toString(),
         )

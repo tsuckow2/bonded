@@ -658,6 +658,8 @@ class BondedVpnService : VpnService() {
             peerShareEnabled: Boolean,
             peerShareBindAddress: String,
             peerShareAdvertiseIp: String,
+            peerShareMaxConsumers: Int,
+            peerShareRelayBandwidthKbps: Long,
             storageDir: String,
     ): Boolean
 
@@ -795,6 +797,8 @@ class BondedVpnService : VpnService() {
                             server.peerShareEnabled,
                             server.peerShareBindAddress,
                             server.peerShareAdvertiseIp,
+                            server.peerShareMaxConsumers,
+                            server.peerShareRelayBandwidthKbps,
                             filesDir.absolutePath,
                     )
             android.util.Log.i("BondedVPN", "nativeStartSession returned: $started")

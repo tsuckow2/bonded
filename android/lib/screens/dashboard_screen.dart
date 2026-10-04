@@ -511,6 +511,15 @@ class _PeerShareStatusCard extends StatelessWidget {
           const Divider(height: 16),
           _Row('Advertise IP', _displayValue(server.peerShareAdvertiseIp)),
           const Divider(height: 16),
+          _Row('Max consumers', '${server.peerShareMaxConsumers}'),
+          const Divider(height: 16),
+          _Row(
+            'Bandwidth cap',
+            server.peerShareRelayBandwidthKbps == 0
+                ? 'Unlimited'
+                : '${server.peerShareRelayBandwidthKbps} kbps',
+          ),
+          const Divider(height: 16),
           _Row('Active peer relays', '$peerRelayCount'),
         ],
       ),

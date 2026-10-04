@@ -59,6 +59,8 @@ class PairedServer {
   final bool peerShareEnabled;
   final String peerShareBindAddress;
   final String peerShareAdvertiseIp;
+  final int peerShareMaxConsumers;
+  final int peerShareRelayBandwidthKbps;
   final DateTime pairedAt;
 
   PairedServer({
@@ -69,6 +71,8 @@ class PairedServer {
     this.peerShareEnabled = false,
     this.peerShareBindAddress = '',
     this.peerShareAdvertiseIp = '',
+    this.peerShareMaxConsumers = 4,
+    this.peerShareRelayBandwidthKbps = 0,
     required this.pairedAt,
   });
 
@@ -83,6 +87,8 @@ class PairedServer {
     'peerShareEnabled': peerShareEnabled,
     'peerShareBindAddress': peerShareBindAddress,
     'peerShareAdvertiseIp': peerShareAdvertiseIp,
+    'peerShareMaxConsumers': peerShareMaxConsumers,
+    'peerShareRelayBandwidthKbps': peerShareRelayBandwidthKbps,
     'pairedAt': pairedAt.toIso8601String(),
   };
 
@@ -96,6 +102,9 @@ class PairedServer {
     peerShareEnabled: json['peerShareEnabled'] == true,
     peerShareBindAddress: (json['peerShareBindAddress'] ?? '').toString(),
     peerShareAdvertiseIp: (json['peerShareAdvertiseIp'] ?? '').toString(),
+    peerShareMaxConsumers: (json['peerShareMaxConsumers'] as num?)?.toInt() ?? 4,
+    peerShareRelayBandwidthKbps:
+        (json['peerShareRelayBandwidthKbps'] as num?)?.toInt() ?? 0,
     pairedAt: DateTime.parse(
       json['pairedAt'] ?? DateTime.now().toIso8601String(),
     ),

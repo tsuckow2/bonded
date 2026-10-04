@@ -35,6 +35,8 @@ class PairingService {
     bool peerShareEnabled = false,
     String peerShareBindAddress = '',
     String peerShareAdvertiseIp = '',
+    int peerShareMaxConsumers = 4,
+    int peerShareRelayBandwidthKbps = 0,
   }) async {
     try {
       await _channel.invokeMethod<void>('storePairedServer', {
@@ -45,6 +47,8 @@ class PairingService {
         'peerShareEnabled': peerShareEnabled,
         'peerShareBindAddress': peerShareBindAddress,
         'peerShareAdvertiseIp': peerShareAdvertiseIp,
+        'peerShareMaxConsumers': peerShareMaxConsumers,
+        'peerShareRelayBandwidthKbps': peerShareRelayBandwidthKbps,
       });
     } on PlatformException catch (e) {
       throw PairingException('Failed to store paired server: ${e.message}');
@@ -74,6 +78,8 @@ class PairingService {
         'peerShareEnabled': server.peerShareEnabled,
         'peerShareBindAddress': server.peerShareBindAddress,
         'peerShareAdvertiseIp': server.peerShareAdvertiseIp,
+        'peerShareMaxConsumers': server.peerShareMaxConsumers,
+        'peerShareRelayBandwidthKbps': server.peerShareRelayBandwidthKbps,
       });
     } on PlatformException catch (e) {
       throw PairingException('Failed to update paired server: ${e.message}');

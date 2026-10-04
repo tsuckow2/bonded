@@ -200,6 +200,8 @@ class MainActivity : FlutterActivity() {
             peerShareEnabled: Boolean = false,
             peerShareBindAddress: String = "",
             peerShareAdvertiseIp: String = "",
+            peerShareMaxConsumers: Int = 4,
+            peerShareRelayBandwidthKbps: Long = 0,
     ) {
         PairedServerStore.save(
                 this,
@@ -211,6 +213,8 @@ class MainActivity : FlutterActivity() {
                 peerShareEnabled = peerShareEnabled,
                 peerShareBindAddress = peerShareBindAddress,
                 peerShareAdvertiseIp = peerShareAdvertiseIp,
+                peerShareMaxConsumers = peerShareMaxConsumers,
+                peerShareRelayBandwidthKbps = peerShareRelayBandwidthKbps,
                         pairedAt = Instant.now().toString(),
                 ),
         )
@@ -494,6 +498,10 @@ class MainActivity : FlutterActivity() {
                                     (args?.get("peerShareBindAddress") as? String)?.trim().orEmpty()
                                 val peerShareAdvertiseIp =
                                     (args?.get("peerShareAdvertiseIp") as? String)?.trim().orEmpty()
+                                val peerShareMaxConsumers =
+                                    (args?.get("peerShareMaxConsumers") as? Number)?.toInt() ?: 4
+                                val peerShareRelayBandwidthKbps =
+                                    (args?.get("peerShareRelayBandwidthKbps") as? Number)?.toLong() ?: 0
 
                             if (deviceId.isNullOrBlank() ||
                                             publicAddress.isNullOrBlank() ||
@@ -513,6 +521,8 @@ class MainActivity : FlutterActivity() {
                                         peerShareEnabled,
                                         peerShareBindAddress,
                                         peerShareAdvertiseIp,
+                                        peerShareMaxConsumers,
+                                        peerShareRelayBandwidthKbps,
                                     )
                                 result.success(null)
                             }
@@ -529,6 +539,8 @@ class MainActivity : FlutterActivity() {
                                                 "peerShareEnabled" to server.peerShareEnabled,
                                                 "peerShareBindAddress" to server.peerShareBindAddress,
                                                 "peerShareAdvertiseIp" to server.peerShareAdvertiseIp,
+                                                "peerShareMaxConsumers" to server.peerShareMaxConsumers,
+                                                "peerShareRelayBandwidthKbps" to server.peerShareRelayBandwidthKbps,
                                                 "pairedAt" to server.pairedAt,
                                         )
                                     }
@@ -551,6 +563,10 @@ class MainActivity : FlutterActivity() {
                                     (args?.get("peerShareBindAddress") as? String)?.trim().orEmpty()
                                 val peerShareAdvertiseIp =
                                     (args?.get("peerShareAdvertiseIp") as? String)?.trim().orEmpty()
+                                val peerShareMaxConsumers =
+                                    (args?.get("peerShareMaxConsumers") as? Number)?.toInt() ?: 4
+                                val peerShareRelayBandwidthKbps =
+                                    (args?.get("peerShareRelayBandwidthKbps") as? Number)?.toLong() ?: 0
 
                             val existing = deviceId?.let { PairedServerStore.findById(this, it) }
                             if (deviceId.isNullOrBlank() ||
@@ -574,6 +590,8 @@ class MainActivity : FlutterActivity() {
                                             peerShareEnabled = peerShareEnabled,
                                             peerShareBindAddress = peerShareBindAddress,
                                             peerShareAdvertiseIp = peerShareAdvertiseIp,
+                                            peerShareMaxConsumers = peerShareMaxConsumers,
+                                            peerShareRelayBandwidthKbps = peerShareRelayBandwidthKbps,
                                                 pairedAt = existing.pairedAt,
                                         ),
                                 )

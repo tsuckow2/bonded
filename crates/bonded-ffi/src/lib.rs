@@ -541,6 +541,8 @@ fn start_android_session(
     peer_share_enabled: bool,
     peer_share_bind_address: &str,
     peer_share_advertise_ip: &str,
+    peer_share_max_consumers: u32,
+    peer_share_relay_bandwidth_kbps: u64,
     storage_dir: &str,
 ) -> anyhow::Result<()> {
     alog_info!(
@@ -593,6 +595,8 @@ fn start_android_session(
         config.client.path_bind_addresses = bind_addresses;
     }
     config.client.peer_share_enabled = peer_share_enabled;
+    config.client.peer_share_max_consumers = peer_share_max_consumers.max(1);
+    config.client.peer_share_relay_bandwidth_kbps = peer_share_relay_bandwidth_kbps;
     if let Some(bind_address) = normalize_optional_string(peer_share_bind_address) {
         config.client.peer_share_bind_address = bind_address;
     }
@@ -1140,6 +1144,8 @@ pub extern "system" fn Java_com_bonded_bonded_1app_BondedVpnService_nativeStartS
     peer_share_enabled: jni::sys::jboolean,
     peer_share_bind_address: jni::objects::JString,
     peer_share_advertise_ip: jni::objects::JString,
+    peer_share_max_consumers: jni::sys::jint,
+    peer_share_relay_bandwidth_kbps: jni::sys::jlong,
     storage_dir: jni::objects::JString,
 ) -> jni::sys::jboolean {
     // Store global ref to the service so protect_fd can call back into Java.
@@ -1192,6 +1198,8 @@ pub extern "system" fn Java_com_bonded_bonded_1app_BondedVpnService_nativeStartS
         peer_share_enabled != 0,
         &peer_share_bind_address,
         &peer_share_advertise_ip,
+        peer_share_max_consumers.max(1) as u32,
+        peer_share_relay_bandwidth_kbps.max(0) as u64,
         &storage_dir,
     )
     .is_ok()
@@ -1462,6 +1470,8 @@ mod tests {
             false,
             "",
             "",
+            4,
+            0,
             storage_dir.to_string_lossy().as_ref(),
         )
         .expect("android session should start");
