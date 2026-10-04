@@ -145,13 +145,120 @@ where
     A: Transport,
     B: Transport,
 {
+    use tracing::{debug, warn};
     loop {
         select! {
             peer_frame = peer.recv() => {
-                upstream.send(peer_frame?).await?;
+                let frame = match peer_frame {
+                    Ok(f) => f,
+                    Err(e) => {
+                        warn!(error = %e, "relay: peer recv failed, terminating relay");
+                        return Err(e.into());
+                    }
+                };
+                debug!(flags = frame.header.flags, payload_len = frame.payload.len(), seq = frame.header.sequence, "relay: peer->upstream forwarding frame");
+                if let Err(e) = upstream.send(frame).await {
+                    warn!(error = %e, "relay: upstream send failed");
+                    return Err(e.into());
+                }
             }
             upstream_frame = upstream.recv() => {
-                peer.send(upstream_frame?).await?;
+                let frame = match upstream_frame {
+                    Ok(f) => f,
+                    Err(e) => {
+                        warn!(error = %e, "relay: upstream recv failed, terminating relay");
+                        return Err(e.into());
+                    }
+                };
+                debug!(flags = frame.header.flags, payload_len = frame.payload.len(), seq = frame.header.sequence, "relay: upstream->peer forwarding frame");
+                if let Err(e) = peer.send(frame).await {
+                    warn!(error = %e, "relay: peer send failed");
+                    return Err(e.into());
+                }
+            }
+        }
+    }
+}
+
+/// Simple pacing rate limiter for peer relay bandwidth caps.
+/// `kbps == 0` means unlimited. Sends are paced so the long-term average
+/// does not exceed the cap; the first send is never delayed.
+pub struct PeerRelayRateLimiter {
+    kbps: u64,
+    next_allowed: std::time::Instant,
+}
+
+impl PeerRelayRateLimiter {
+    pub fn new(kbps: u64) -> Self {
+        Self {
+            kbps,
+            next_allowed: std::time::Instant::now(),
+        }
+    }
+
+    pub fn unlimited() -> Self {
+        Self::new(0)
+    }
+
+    /// Pace `bytes` under the configured cap. Returns immediately when
+    /// unlimited or when still within the allowed budget.
+    pub async fn throttle(&mut self, bytes: usize) {
+        if self.kbps == 0 {
+            return;
+        }
+        let bytes_per_sec = self.kbps as f64 * 125.0;
+        let now = std::time::Instant::now();
+        let start = self.next_allowed.max(now);
+        let send_duration = std::time::Duration::from_secs_f64(bytes as f64 / bytes_per_sec);
+        self.next_allowed = start + send_duration;
+        if start > now {
+            tokio::time::sleep(start - now).await;
+        }
+    }
+}
+
+/// Relay frames between peer and upstream with an optional bandwidth cap
+/// applied in both directions.
+pub async fn relay_peer_frames_rate_limited<A, B>(
+    peer: &mut A,
+    upstream: &mut B,
+    limiter: &mut PeerRelayRateLimiter,
+) -> anyhow::Result<()>
+where
+    A: Transport,
+    B: Transport,
+{
+    use tokio::select;
+    use tracing::warn;
+    loop {
+        select! {
+            peer_frame = peer.recv() => {
+                let frame = match peer_frame {
+                    Ok(f) => f,
+                    Err(e) => {
+                        warn!(error = %e, "relay: peer recv failed, terminating relay");
+                        return Err(e.into());
+                    }
+                };
+                limiter.throttle(frame.payload.len()).await;
+                if let Err(e) = upstream.send(frame).await {
+                    warn!(error = %e, "relay: upstream send failed");
+                    return Err(e.into());
+                }
+            }
+            upstream_frame = upstream.recv() => {
+                let frame = match upstream_frame {
+                    Ok(f) => f,
+                    Err(e) => {
+                        warn!(error = %e, "relay: upstream recv failed, terminating relay");
+                        return Err(e.into());
+                    }
+                };
+                limiter.throttle(frame.payload.len()).await;
+                if let Err(e) = peer.send(frame).await {
+                    warn!(error = %e, "relay: peer send failed");
+                    return Err(e.into());
+                }
             }
         }
     }
@@ -200,7 +307,7 @@ mod tests {
     use super::{
         accept_peer_relay, connect_peer_relay, register_peer_relay_upstream, relay_peer_frames,
         verify_consumer_introduction, verify_provider_introduction, AcceptedPeerRelay,
-        PeerListenerIdentity,
+        PeerListenerIdentity, PeerRelayRateLimiter,
     };
     use bonded_core::auth::{sign_bytes, DeviceKeypair};
     use bonded_core::peer_share::{
@@ -243,6 +350,34 @@ mod tests {
 
         verify_provider_introduction(&server.public_key_b64, &listener, &introduction)
             .expect("matching introduction should verify");
+    }
+
+    #[tokio::test]
+    async fn rate_limiter_unlimited_returns_immediately() {
+        let mut limiter = PeerRelayRateLimiter::unlimited();
+        let start = std::time::Instant::now();
+        limiter.throttle(10 * 1024 * 1024).await;
+        assert!(start.elapsed() < std::time::Duration::from_millis(100));
+    }
+
+    #[tokio::test]
+    async fn rate_limiter_throttles_to_configured_bandwidth() {
+        // 800 kbps = 100 KB/s; pacing two 100 KB sends must take ~1s.
+        let mut limiter = PeerRelayRateLimiter::new(800);
+        let start = std::time::Instant::now();
+        limiter.throttle(100 * 1024).await;
+        limiter.throttle(100 * 1024).await;
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_millis(900),
+            "expected ~1s pacing, got {elapsed:?}"
+        );
+        // Upper bound is generous: on a heavily loaded CI box tokio timer
+        // wakeups can be delayed well past the ~1s pacing target.
+        assert!(
+            elapsed < std::time::Duration::from_secs(30),
+            "pacing took too long: {elapsed:?}"
+        );
     }
 
     #[test]

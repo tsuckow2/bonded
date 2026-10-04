@@ -26,6 +26,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket as StdUdpSocket
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{lookup_host, TcpSocket, TcpStream};
 #[cfg(target_os = "linux")]
@@ -55,6 +56,7 @@ pub enum ClientTransport {
         transport: Box<QuicTransport>,
         peer_id: String,
         close_notifier: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+        expires_at: u64,
     },
     WireGuard(Box<WireGuardTransport>),
 }
@@ -64,11 +66,13 @@ impl ClientTransport {
         transport: QuicTransport,
         peer_id: String,
         close_notifier: tokio::sync::mpsc::UnboundedSender<String>,
+        expires_at: u64,
     ) -> Self {
         Self::PeerRelay {
             transport: Box::new(transport),
             peer_id,
             close_notifier: Some(close_notifier),
+            expires_at,
         }
     }
 
@@ -81,6 +85,7 @@ impl ClientTransport {
                 transport,
                 peer_id,
                 close_notifier,
+                ..
             } => match transport.send(frame).await {
                 Ok(()) => Ok(()),
                 Err(err) => {
@@ -101,6 +106,7 @@ impl ClientTransport {
                 transport,
                 peer_id,
                 close_notifier,
+                ..
             } => match transport.recv().await {
                 Ok(frame) => Ok(frame),
                 Err(err) => {
@@ -121,6 +127,7 @@ impl ClientTransport {
                 transport,
                 peer_id,
                 close_notifier,
+                ..
             } => {
                 notify_peer_relay_closed(close_notifier, peer_id);
                 transport.close().await
@@ -1700,10 +1707,14 @@ fn build_quic_client_config(
     alpn: &[u8],
 ) -> anyhow::Result<quinn::ClientConfig> {
     rustls_config.alpn_protocols = vec![alpn.to_vec()];
-    Ok(quinn::ClientConfig::new(Arc::new(
+    let mut client_config = quinn::ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(rustls_config)
             .map_err(|e| anyhow::anyhow!("QUIC crypto config error: {e}"))?,
-    )))
+    ));
+    let mut transport = quinn::TransportConfig::default();
+    transport.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
+    client_config.transport_config(Arc::new(transport));
+    Ok(client_config)
 }
 
 pub(crate) fn extract_quic_peer_certificate(
@@ -2166,6 +2177,14 @@ async fn run_linux_packet_loop(
     }
     let mut state = SessionState::new(session_id);
     let mut tun_buf = vec![0_u8; 8192];
+    // Path liveness: send periodic PINGs; if no PONG arrives within the
+    // timeout, the path is blackholed (send() may still return Ok while the
+    // kernel buffers into Send-Q). Fail over to the next path.
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_pong = Instant::now();
+    // Skip the immediate first tick; we just completed binding.
+    heartbeat.tick().await;
 
     loop {
         select! {
@@ -2177,6 +2196,11 @@ async fn run_linux_packet_loop(
                 }
 
                 let frame = state.create_outbound_frame(Bytes::copy_from_slice(&tun_buf[..read]), 0);
+                // Deep-dive: log data frame sends on peer transports to trace HTTP SYN path.
+                let kind = transports[active_index].kind();
+                if matches!(kind, bonded_core::transport::TransportKind::Quic) {
+                    debug!(active_path = active_index, kind = ?kind, payload_len = read, seq = frame.header.sequence, "sending TUN data frame on peer path");
+                }
                 match transports[active_index].send(frame).await {
                     Ok(()) => {}
                     Err(err) => {
@@ -2192,6 +2216,42 @@ async fn run_linux_packet_loop(
                     }
                 }
             }
+            _ = heartbeat.tick() => {
+                // Liveness check: if no PONG since the timeout, the active
+                // path is blackholed. Drop it and fail over.
+                if last_pong.elapsed() > Duration::from_secs(15) {
+                    warn!(active_path = active_index, "heartbeat timeout: no PONG in 15s, dropping blackholed path");
+                    transports.remove(active_index);
+                    if transports.is_empty() {
+                        anyhow::bail!("all paths lost liveness");
+                    }
+                    if active_index >= transports.len() {
+                        active_index = 0;
+                    }
+                    last_pong = Instant::now();
+                    continue;
+                }
+                // Send PING on the active path.
+                let ping = SessionFrame {
+                    header: SessionHeader {
+                        connection_id: session_id,
+                        sequence: 0,
+                        flags: FLAG_PING,
+                    },
+                    payload: Bytes::new(),
+                };
+                if let Err(err) = transports[active_index].send(ping).await {
+                    warn!(active_path = active_index, error = %err, "heartbeat ping send failed, dropping path");
+                    transports.remove(active_index);
+                    if transports.is_empty() {
+                        anyhow::bail!("all paths failed");
+                    }
+                    if active_index >= transports.len() {
+                        active_index = 0;
+                    }
+                    last_pong = Instant::now();
+                }
+            }
             peer_transport = peer_transport_rx.recv() => {
                 if let Some(transport) = peer_transport {
                     let kind = transport.kind();
@@ -2205,6 +2265,7 @@ async fn run_linux_packet_loop(
                         // Heartbeat pongs are liveness replies, not TUN data: keep them
                         // out of the session reorder buffer and off the TUN device.
                         if frame.header.flags & FLAG_PONG != 0 {
+                            last_pong = Instant::now();
                             continue;
                         }
                         let ready = state.ingest_inbound(frame)?;
@@ -2213,6 +2274,10 @@ async fn run_linux_packet_loop(
                         }
                     }
                     Err(err) => {
+                        // Deep-dive: log the actual recv error and which transport kind failed.
+                        // This is critical for diagnosing the peer QUIC path dying on HTTP data.
+                        let kind = transports[active_index].kind();
+                        warn!(active_path = active_index, kind = ?kind, error = %err, "recv failed on active path");
                         if transports.len() == 1 {
                             return Err(err);
                         }

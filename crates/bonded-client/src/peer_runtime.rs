@@ -1,11 +1,12 @@
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
 use bonded_core::auth::{create_auth_challenge, sign_bytes, DeviceKeypair};
-use bonded_core::config::SocketProtectFn;
+use bonded_core::config::{PeerShareMode, SocketProtectFn};
 use bonded_core::peer_share::{
     PeerShareAdvertisement, PeerShareIntroductionRequest, SignedPeerShareIntroduction,
 };
@@ -19,8 +20,8 @@ use tracing::{info, warn};
 use crate::cert_proof;
 use crate::peer_discovery::{PeerShareAdvertiser, PeerShareBrowser};
 use crate::peer_listener::{
-    accept_peer_relay, connect_peer_relay, register_peer_relay_upstream, relay_peer_frames,
-    AcceptedPeerRelay, PeerListenerIdentity,
+    accept_peer_relay, connect_peer_relay, register_peer_relay_upstream,
+    relay_peer_frames_rate_limited, AcceptedPeerRelay, PeerListenerIdentity, PeerRelayRateLimiter,
 };
 use crate::{
     bootstrap_scheme_candidates, enumerate_interfaces, establish_transport_paths,
@@ -29,7 +30,7 @@ use crate::{
 
 pub struct PeerShareRuntime {
     tasks: Vec<JoinHandle<()>>,
-    _listener_endpoint: quinn::Endpoint,
+    _listener_endpoint: Option<quinn::Endpoint>,
 }
 
 pub type PeerShareEventLogger = Arc<dyn Fn(String) + Send + Sync>;
@@ -52,30 +53,57 @@ pub async fn start_peer_share_runtime(
     let private_key_path = crate::expand_home_path(&config.client.private_key_path);
     let public_key_path = crate::expand_home_path(&config.client.public_key_path);
     let device_keypair = load_or_create_device_keypair(&private_key_path, &public_key_path)?;
-    let (listener_endpoint, listener_identity, advertisement) =
-        build_listener_runtime(config, &device_keypair)?;
-    let advertiser = PeerShareAdvertiser::start(&advertisement)?;
-    let browser = PeerShareBrowser::start()?;
+    let mode = config.client.peer_share_mode;
+    let is_provider = mode == PeerShareMode::Both || mode == PeerShareMode::ProviderOnly;
+    let is_consumer = mode == PeerShareMode::Both || mode == PeerShareMode::ConsumerOnly;
 
-    info!(
-        endpoint = %advertisement.endpoint,
-        nonce = %listener_identity.instance_nonce,
-        "peer-share runtime started"
-    );
-    emit_peer_share_event(
-        event_logger.as_ref(),
-        format!(
-            "runtime started endpoint={} nonce={}",
-            advertisement.endpoint, listener_identity.instance_nonce
-        ),
-    );
+    // Provider side: QUIC listener + mDNS advertiser + accept task
+    let (listener_endpoint, listener_identity, advertisement, advertiser) = if is_provider {
+        let (endpoint, identity, adv) = build_listener_runtime(config, &device_keypair)?;
+        let advertiser = PeerShareAdvertiser::start(&adv)?;
+        (Some(endpoint), Some(identity), Some(adv), Some(advertiser))
+    } else {
+        (None, None, None, None)
+    };
+    // Consumer side: mDNS browser
+    let browser = if is_consumer {
+        Some(PeerShareBrowser::start()?)
+    } else {
+        None
+    };
 
-    let accept_endpoint = listener_endpoint.clone();
-    let accept_config = config.clone();
-    let accept_server_key = config.client.server_public_key.clone();
-    let accept_identity = listener_identity.clone();
-    let accept_logger = event_logger.clone();
-    let accept_task = tokio::spawn(async move {
+    if let (Some(adv), Some(identity)) = (advertisement.as_ref(), listener_identity.as_ref()) {
+        info!(
+            endpoint = %adv.endpoint,
+            nonce = %identity.instance_nonce,
+            "peer-share runtime started"
+        );
+        emit_peer_share_event(
+            event_logger.as_ref(),
+            format!(
+                "runtime started endpoint={} nonce={}",
+                adv.endpoint, identity.instance_nonce
+            ),
+        );
+    } else {
+        info!("peer-share runtime started (consumer-only mode)");
+        emit_peer_share_event(
+            event_logger.as_ref(),
+            "runtime started (consumer-only mode)".to_owned(),
+        );
+    }
+
+    let accept_task = if is_provider {
+        let accept_endpoint = listener_endpoint.clone().expect("provider mode requires listener");
+        let accept_config = config.clone();
+        let accept_server_key = config.client.server_public_key.clone();
+        let accept_identity = listener_identity.clone().expect("provider mode requires identity");
+        let accept_logger = event_logger.clone();
+        let accept_max_consumers = config.client.peer_share_max_consumers.max(1) as usize;
+        let accept_bandwidth_kbps = config.client.peer_share_relay_bandwidth_kbps;
+        let active_relays = Arc::new(AtomicUsize::new(0));
+        let advertiser = advertiser;
+        Some(tokio::spawn(async move {
         let _advertiser = advertiser;
         while let Some(incoming) = accept_endpoint.accept().await {
             let connection = match incoming.await {
@@ -104,71 +132,123 @@ pub async fn start_peer_share_runtime(
                     continue;
                 }
             };
+            let consumer_key = introduction.introduction.consumer_device_public_key.clone();
+            // Enforce the provider's concurrent-consumer cap before spending
+            // resources on a dedicated upstream transport.
+            let in_flight = active_relays.fetch_add(1, Ordering::SeqCst);
+            if in_flight >= accept_max_consumers {
+                active_relays.fetch_sub(1, Ordering::SeqCst);
+                warn!(
+                    consumer = %consumer_key,
+                    max = accept_max_consumers,
+                    "peer-share consumer cap reached; rejecting relay"
+                );
+                emit_peer_share_event(
+                    accept_logger.as_ref(),
+                    format!("consumer cap reached; rejecting relay for consumer={consumer_key}"),
+                );
+                continue;
+            }
+            info!(
+                consumer = %consumer_key,
+                provider_nonce = %introduction.introduction.provider_instance_nonce,
+                "peer-share relay accepted"
+            );
             emit_peer_share_event(
                 accept_logger.as_ref(),
                 format!(
                     "accepted relay for consumer={} provider_nonce={}",
-                    introduction.introduction.consumer_device_public_key,
-                    introduction.introduction.provider_instance_nonce,
+                    consumer_key, introduction.introduction.provider_instance_nonce,
                 ),
             );
 
-            let mut upstreams = match establish_peer_upstream_paths(&accept_config).await {
-                Ok(paths) => paths,
-                Err(err) => {
-                    warn!(error = %err, "failed to establish upstream path for peer relay");
-                    emit_peer_share_event(
-                        accept_logger.as_ref(),
-                        format!("failed to establish upstream path: {err}"),
-                    );
-                    sleep(PEER_RUNTIME_RETRY_DELAY).await;
-                    continue;
+            let relay_config = accept_config.clone();
+            let relay_logger = accept_logger.clone();
+            let relay_count = active_relays.clone();
+            tokio::spawn(async move {
+                let mut peer = peer;
+                // Resilience: if the upstream (provider->server) connection fails,
+                // re-establish it instead of terminating the relay permanently.
+                // The peer (consumer->provider QUIC) connection is kept alive
+                // across upstream reconnects.
+                let result = async {
+                    let mut retry_delay = std::time::Duration::from_secs(1);
+                    const MAX_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
+                    loop {
+                        let mut upstreams = match establish_peer_upstream_paths(&relay_config).await {
+                            Ok(u) => u,
+                            Err(e) => {
+                                tracing::warn!(error = %e, "provider: failed to establish upstream paths, retrying");
+                                tokio::time::sleep(retry_delay).await;
+                                retry_delay = std::cmp::min(retry_delay * 2, MAX_RETRY_DELAY);
+                                continue;
+                            }
+                        };
+                        if upstreams.is_empty() {
+                            anyhow::bail!(
+                                "peer-share relay accept produced no upstream transport paths"
+                            );
+                        }
+                        let mut upstream = upstreams.remove(0);
+                        tracing::warn!("provider: sending relay registration");
+                        if let Err(e) = register_peer_relay_upstream(&mut upstream, introduction.clone()).await {
+                            tracing::warn!(error = %e, "provider: relay registration failed, retrying");
+                            tokio::time::sleep(retry_delay).await;
+                            retry_delay = std::cmp::min(retry_delay * 2, MAX_RETRY_DELAY);
+                            continue;
+                        }
+                        tracing::warn!("provider: relay registration sent");
+                        let mut limiter = PeerRelayRateLimiter::new(accept_bandwidth_kbps);
+                        match relay_peer_frames_rate_limited(&mut peer, &mut upstream, &mut limiter).await {
+                            Ok(()) => {
+                                // Relay completed normally (peer disconnected)
+                                return Ok(());
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "provider: relay upstream failed, re-establishing");
+                                // Check if peer is still alive before retrying
+                                // If peer.recv() would fail immediately, the peer is gone
+                                tokio::time::sleep(retry_delay).await;
+                                retry_delay = std::cmp::min(retry_delay * 2, MAX_RETRY_DELAY);
+                                // Continue loop to re-establish upstream
+                            }
+                        }
+                    }
                 }
-            };
-
-            if upstreams.is_empty() {
-                warn!("peer-share relay accept produced no upstream transport paths");
-                emit_peer_share_event(
-                    accept_logger.as_ref(),
-                    "relay accept produced no upstream transport paths".to_owned(),
-                );
-                sleep(PEER_RUNTIME_RETRY_DELAY).await;
-                continue;
-            }
-
-            let mut upstream = upstreams.remove(0);
-            if let Err(err) = register_peer_relay_upstream(&mut upstream, introduction).await {
-                warn!(error = %err, "failed to register peer relay upstream session");
-                emit_peer_share_event(
-                    accept_logger.as_ref(),
-                    format!("failed to register upstream relay session: {err}"),
-                );
-                sleep(PEER_RUNTIME_RETRY_DELAY).await;
-                continue;
-            }
-            emit_peer_share_event(
-                accept_logger.as_ref(),
-                "registered upstream relay session".to_owned(),
-            );
-            if let Err(err) = relay_peer_frames(&mut peer, &mut upstream).await {
-                warn!(error = %err, "peer relay loop terminated");
-                emit_peer_share_event(
-                    accept_logger.as_ref(),
-                    format!("relay loop terminated: {err}"),
-                );
-            }
+                .await;
+                relay_count.fetch_sub(1, Ordering::SeqCst);
+                match result {
+                    Ok(()) => {
+                        emit_peer_share_event(
+                            relay_logger.as_ref(),
+                            format!("relay loop completed for consumer={consumer_key}"),
+                        );
+                    }
+                    Err(err) => {
+                        warn!(error = %err, consumer = %consumer_key, "peer relay terminated");
+                        emit_peer_share_event(
+                            relay_logger.as_ref(),
+                            format!("relay terminated for consumer={consumer_key}: {err}"),
+                        );
+                    }
+                }
+            });
         }
-    });
+    }))
+    } else {
+        None
+    };
 
-    let browse_config = config.clone();
-    let browse_server_key = config.client.server_public_key.clone();
-    let browse_device_keypair = device_keypair.clone();
-    let browse_self_key = device_keypair.public_key_b64.clone();
-    let browse_bind_ip = peer_relay_bind_ip(config)?;
-    let browse_logger = event_logger.clone();
-    let (closed_peer_tx, mut closed_peer_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    let browse_task = tokio::spawn(async move {
-        let browser = browser;
+    let browse_task = if is_consumer {
+        let browse_config = config.clone();
+        let browse_server_key = config.client.server_public_key.clone();
+        let browse_device_keypair = device_keypair.clone();
+        let browse_self_key = device_keypair.public_key_b64.clone();
+        let browse_bind_ip = peer_relay_bind_ip(config)?;
+        let browse_logger = event_logger.clone();
+        let (closed_peer_tx, mut closed_peer_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let browser = browser.expect("consumer mode requires browser");
+        Some(tokio::spawn(async move {
         let mut connected_peers = HashSet::new();
         loop {
             let advertisement = tokio::select! {
@@ -208,6 +288,11 @@ pub async fn start_peer_share_runtime(
             if connected_peers.contains(&peer_id) {
                 continue;
             }
+            info!(
+                peer = %peer_id,
+                endpoint = %advertisement.endpoint,
+                "discovered peer-share advertisement"
+            );
             emit_peer_share_event(
                 browse_logger.as_ref(),
                 format!(
@@ -234,6 +319,7 @@ pub async fn start_peer_share_runtime(
                     continue;
                 }
             };
+            info!(peer = %peer_id, "peer-share introduction issued");
             emit_peer_share_event(
                 browse_logger.as_ref(),
                 format!("introduction issued for peer={peer_id}"),
@@ -264,11 +350,13 @@ pub async fn start_peer_share_runtime(
                 format!("relay dial succeeded for peer={peer_id}"),
             );
 
+            let relay_expires_at = introduction.introduction.expires_at;
             if peer_transport_tx
                 .send(ClientTransport::peer_relay(
                     transport,
                     peer_id.clone(),
                     closed_peer_tx.clone(),
+                    relay_expires_at,
                 ))
                 .is_err()
             {
@@ -276,10 +364,21 @@ pub async fn start_peer_share_runtime(
             }
             connected_peers.insert(peer_id);
         }
-    });
+        }))
+    } else {
+        None
+    };
+
+    let mut tasks = Vec::new();
+    if let Some(task) = accept_task {
+        tasks.push(task);
+    }
+    if let Some(task) = browse_task {
+        tasks.push(task);
+    }
 
     Ok(PeerShareRuntime {
-        tasks: vec![accept_task, browse_task],
+        tasks,
         _listener_endpoint: listener_endpoint,
     })
 }
@@ -539,6 +638,10 @@ fn build_peer_server_config(cert_der: Vec<u8>, key_der: Vec<u8>) -> quinn::Serve
     ));
     let mut transport = quinn::TransportConfig::default();
     transport.max_concurrent_bidi_streams(4u32.into());
+    // Peer relays are standby failover paths: they sit idle until the primary
+    // path fails. Quinn's default 30s max idle timeout would silently kill an
+    // idle relay, so send periodic PINGs to keep the QUIC connection alive.
+    transport.keep_alive_interval(Some(Duration::from_secs(10)));
     server_config.transport_config(Arc::new(transport));
     server_config
 }
@@ -551,7 +654,7 @@ mod tests {
         build_peer_introduction_request, resolve_advertise_ip, should_accept_discovered_peer,
     };
     use bonded_core::auth::DeviceKeypair;
-    use bonded_core::config::ClientConfig;
+    use bonded_core::config::{ClientConfig, PeerShareMode};
     use bonded_core::peer_share::PeerShareAdvertisement;
     use pnet_datalink::NetworkInterface;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
