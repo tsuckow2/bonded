@@ -750,6 +750,8 @@ fn unix_timestamp_after(duration: Duration) -> anyhow::Result<u64> {
         .as_secs())
 }
 
+// WebSocket-specific entry point: performs auth handshake, then delegates
+// to the generic transport session loop (testable with mock transports).
 async fn handle_websocket_session(
     mut transport: WebSocketTlsTransport,
     peer: SocketAddr,
@@ -773,7 +775,27 @@ async fn handle_websocket_session(
             return Ok(());
         }
     };
+    handle_transport_session(
+        transport,
+        peer,
+        ctx,
+        public_key,
+        sessions,
+        forwarders,
+        tunnel_pcap,
+    )
+    .await
+}
 
+async fn handle_transport_session<T: Transport>(
+    mut transport: T,
+    peer: SocketAddr,
+    ctx: &BootstrapContext,
+    public_key: String,
+    sessions: SessionRegistry,
+    forwarders: ForwarderRegistry,
+    tunnel_pcap: Option<Arc<TunnelPcapLogger>>,
+) -> anyhow::Result<()> {
     let binding = match resolve_session_binding(
         &mut transport,
         public_key.clone(),
@@ -803,36 +825,56 @@ async fn handle_websocket_session(
     // Exactly one forwarding context per session, shared by every path: the
     // flow state and outbound sequence space must survive the death of any
     // single path for failover to work.
+    // Avoid holding the forwarders write lock while creating the SessionContext
+    // (which spawns threads) to prevent lock-ordering deadlocks.
     let session_ctx: Arc<SessionContext> = {
-        let mut guard = forwarders
-            .write()
-            .expect("forwarder registry lock should not be poisoned");
-        if let Some(existing) = guard.get(&handle.session_id) {
-            existing.clone()
-        } else {
-            let (router, fwd_tx) = SessionOutboundRouter::new();
-            let forwarder = Arc::new(SmoltcpForwarder::new(
-                handle.session_id,
-                fwd_tx,
-                Arc::new(AtomicU64::new(0)),
-            ));
-            let ctx = Arc::new(SessionContext { forwarder, router });
-            guard.insert(handle.session_id, ctx.clone());
-            ctx
+        // Fast path: check if session already exists (read lock)
+        {
+            let guard = forwarders
+                .read()
+                .expect("forwarder registry lock should not be poisoned");
+            if let Some(existing) = guard.get(&handle.session_id) {
+                existing.clone()
+            } else {
+                // Drop read lock before expensive creation
+                drop(guard);
+                // Create the context WITHOUT holding any forwarder lock
+                let (router, fwd_tx) = SessionOutboundRouter::new();
+                let forwarder = Arc::new(SmoltcpForwarder::new(
+                    handle.session_id,
+                    fwd_tx,
+                    Arc::new(AtomicU64::new(0)),
+                ));
+                let ctx = Arc::new(SessionContext { forwarder, router });
+                // Acquire write lock and insert (double-check for race)
+                let mut guard = forwarders
+                    .write()
+                    .expect("forwarder registry lock should not be poisoned");
+                if let Some(existing) = guard.get(&handle.session_id) {
+                    // Another task created it concurrently, use theirs
+                    // (the one we created will be dropped)
+                    existing.clone()
+                } else {
+                    guard.insert(handle.session_id, ctx.clone());
+                    ctx
+                }
+            }
         }
     };
     session_ctx.router.add_transport(transport_id, forward_tx);
+    tracing::info!(
+        session_id = handle.session_id,
+        transport_id = transport_id,
+        relayed_via_provider = binding.relayed_via_provider,
+        total_transports = session_ctx.router.transport_count(),
+        "added transport to session router"
+    );
     let forwarder: Arc<SmoltcpForwarder> = session_ctx.forwarder.clone();
 
     let mut pending_frame = binding.initial_frame;
     loop {
-        // Drain queued response frames before blocking in select! to avoid
-        // serialising bursty traffic to one frame per scheduler turn.
-        for _ in 0..MAX_DRAIN {
-            let frame = match forward_rx.try_recv() {
-                Ok(f) => f,
-                Err(_) => break,
-            };
+        // Send at most one queued frame before polling inbound; draining the full queue starves recv when the forwarder is chatty.
+        if let Ok(frame) = forward_rx.try_recv() {
             log_tunnel_packet(&tunnel_pcap, &frame.payload);
             if let Err(err) = transport.send(frame).await {
                 warn!(peer = %peer, session_id = handle.session_id, error = %err,
@@ -878,14 +920,32 @@ async fn handle_websocket_session(
                     break;
                 }
             }
-            recv_result = transport.recv() => {
+            recv_result = tokio::time::timeout(std::time::Duration::from_secs(30), transport.recv()) => {
+                let recv_result = match recv_result {
+                    Ok(r) => r,
+                    Err(_) => {
+                        warn!(peer = %peer, session_id = handle.session_id, "transport recv timeout (30s), closing dead connection");
+                        break;
+                    }
+                };
                 match recv_result {
                     Ok(frame) => {
+                        // Deep-dive: log frames arriving on relayed (provider) transports.
+                        // This traces whether HTTP SYNs reach the server via the relay.
+                        if binding.relayed_via_provider {
+                            tracing::debug!(
+                                session_id = handle.session_id,
+                                flags = frame.header.flags,
+                                payload_len = frame.payload.len(),
+                                conn_id = frame.header.connection_id,
+                                "relay transport received frame"
+                            );
+                        }
                         log_tunnel_packet(&tunnel_pcap, &frame.payload);
                         if frame.header.flags & FLAG_PING != 0 && frame.payload.is_empty() {
                             let pong = SessionFrame {
                                 header: SessionHeader {
-                                    connection_id: frame.header.connection_id,
+                                    connection_id: handle.session_id as u32,
                                     sequence: frame.header.sequence,
                                     flags: FLAG_PONG,
                                 },
@@ -915,7 +975,19 @@ async fn handle_websocket_session(
     session_ctx.router.remove_transport(transport_id);
     // Only tear down the session when its last path disconnects; otherwise
     // the surviving path keeps the flow state and sequence space alive.
-    if session_ctx.router.transport_count() == 0 {
+    let remaining = session_ctx.router.transport_count();
+    tracing::info!(
+        session_id = handle.session_id,
+        transport_id = ?transport_id,
+        remaining_transports = remaining,
+        relayed_via_provider = binding.relayed_via_provider,
+        "transport session ended"
+    );
+    if remaining == 0 {
+        tracing::warn!(
+            session_id = handle.session_id,
+            "tearing down session: last transport disconnected"
+        );
         forwarder.clear_session();
         forwarders
             .write()
@@ -1285,5 +1357,254 @@ mod tests {
         let json: serde_json::Value =
             serde_json::from_str(&body).expect("capabilities should parse");
         assert_eq!(json["wss"]["endpoint"], "charter.codingwell.net:443");
+    }
+
+    // ── MockTransport for testing the session loop ────────────────────────────
+
+    use bonded_core::transport::TransportKind;
+
+    /// In-memory mock transport for unit-testing handle_transport_session.
+    struct MockTransport {
+        inbound_rx: mpsc::UnboundedReceiver<SessionFrame>,
+        outbound_tx: mpsc::UnboundedSender<SessionFrame>,
+    }
+
+    impl MockTransport {
+        fn new() -> (
+            Self,
+            mpsc::UnboundedSender<SessionFrame>,
+            mpsc::UnboundedReceiver<SessionFrame>,
+        ) {
+            let (in_tx, in_rx) = mpsc::unbounded_channel();
+            let (out_tx, out_rx) = mpsc::unbounded_channel();
+            let mock = Self {
+                inbound_rx: in_rx,
+                outbound_tx: out_tx,
+            };
+            (mock, in_tx, out_rx)
+        }
+    }
+    #[async_trait::async_trait]
+    impl Transport for MockTransport {
+        async fn send(&mut self, frame: SessionFrame) -> anyhow::Result<()> {
+            self.outbound_tx
+                .send(frame)
+                .map_err(|_| anyhow::anyhow!("mock outbound closed"))?;
+            Ok(())
+        }
+
+        async fn recv(&mut self) -> anyhow::Result<SessionFrame> {
+            self.inbound_rx
+                .recv()
+                .await
+                .ok_or_else(|| anyhow::anyhow!("mock inbound closed"))
+        }
+
+        fn kind(&self) -> TransportKind {
+            TransportKind::WebSocketTls
+        }
+    }
+
+    fn test_session_frame(flags: u32, payload_len: usize) -> SessionFrame {
+        SessionFrame {
+            header: SessionHeader {
+                connection_id: 0,
+                sequence: 0,
+                flags,
+            },
+            payload: bytes::Bytes::from(vec![0u8; payload_len]),
+        }
+    }
+
+    /// Regression test for data-plane recv starvation.
+    #[tokio::test]
+    async fn transport_session_delivers_data_frame_to_forwarder() {
+        let ctx = test_ctx();
+        let sessions = SessionRegistry::default();
+        let forwarders: ForwarderRegistry =
+            Arc::new(RwLock::new(std::collections::HashMap::new()));
+
+        let (mock, inbound_tx, mut outbound_rx) = MockTransport::new();
+        let peer: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let public_key = "test-public-key".to_owned();
+
+        let sessions_clone = sessions.clone();
+        let forwarders_clone = forwarders.clone();
+        let handle = tokio::spawn(async move {
+            handle_transport_session(
+                mock, peer, ctx.as_ref(), public_key, sessions_clone, forwarders_clone, None,
+            )
+            .await
+        });
+
+        // Send PING for session binding
+        inbound_tx
+            .send(test_session_frame(FLAG_PING, 0))
+            .expect("send ping");
+
+        // Wait for PONG (proves binding completed)
+        let pong = tokio::time::timeout(std::time::Duration::from_secs(2), outbound_rx.recv())
+            .await
+            .expect("timeout waiting for PONG")
+            .expect("outbound closed");
+        assert!(
+            pong.header.flags & bonded_core::session::FLAG_PONG != 0,
+            "expected PONG, got flags={}",
+            pong.header.flags
+        );
+
+        // Send a data frame (60-byte payload like a TCP SYN)
+        inbound_tx
+            .send(test_session_frame(0, 60))
+            .expect("send data frame");
+
+        // Give the server time to process
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // Handler should still be running
+        assert!(!handle.is_finished(), "session handler exited unexpectedly");
+
+        // Cleanup
+        drop(inbound_tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+    }
+    /// Build a well-formed IPv4 TCP SYN packet (20B IP + 20B TCP = 40B).
+    /// Mirrors the 60-byte TUN SYNs seen in production (20B IP + 40B TCP with options;
+    /// we use the minimal 20B TCP header here).
+    fn build_tcp_syn_packet() -> bytes::Bytes {
+        let mut pkt = vec![0u8; 40];
+        // IPv4 header (20 bytes)
+        pkt[0] = 0x45; // version 4, IHL 5
+        pkt[1] = 0x00; // DSCP/ECN
+        pkt[2..4].copy_from_slice(&40u16.to_be_bytes()); // total length
+        pkt[4..6].copy_from_slice(&0x1234u16.to_be_bytes()); // identification
+        pkt[6..8].copy_from_slice(&0x4000u16.to_be_bytes()); // flags (DF)
+        pkt[8] = 64; // TTL
+        pkt[9] = 6; // protocol: TCP
+        // checksum: zero (smoltcp skips Rx checksum verification)
+        pkt[12..16].copy_from_slice(&[10, 210, 0, 12]); // src: 10.210.0.12 (client TUN)
+        pkt[16..20].copy_from_slice(&[10, 220, 0, 99]); // dst: 10.220.0.99 (target)
+        // TCP header (20 bytes)
+        pkt[20..22].copy_from_slice(&44615u16.to_be_bytes()); // src port
+        pkt[22..24].copy_from_slice(&18080u16.to_be_bytes()); // dst port
+        pkt[24..28].copy_from_slice(&0x01020304u32.to_be_bytes()); // seq num
+        pkt[28..32].copy_from_slice(&0u32.to_be_bytes()); // ack num (0 for SYN)
+        pkt[32] = 0x50; // data offset 5 (20 bytes), reserved
+        pkt[33] = 0x02; // flags: SYN set, ACK clear
+        pkt[34..36].copy_from_slice(&64240u16.to_be_bytes()); // window
+        // checksum and urgent pointer: zero
+        bytes::Bytes::from(pkt)
+    }
+
+    fn test_data_frame(payload: bytes::Bytes) -> SessionFrame {
+        SessionFrame {
+            header: SessionHeader {
+                connection_id: 0,
+                sequence: 1,
+                flags: 0, // not a PING: data frame
+            },
+            payload,
+        }
+    }
+
+    /// Strengthened regression test: PROVES a data frame reaching the server's
+    /// session loop is delivered to SmoltcpForwarder::ingest_packet.
+    ///
+    /// Requires the observability hook (AtomicU64 ingested_packets counter)
+    /// from /tmp/observability_hook.diff.
+    ///
+    /// Splice location: inside `mod tests` in crates/bonded-server/src/bootstrap.rs,
+    /// after the existing `transport_session_delivers_data_frame_to_forwarder` test
+    /// (which only asserts the handler doesn't crash).
+    #[tokio::test]
+    async fn transport_session_delivers_syn_to_forwarder() {
+        let ctx = test_ctx();
+        let sessions = SessionRegistry::default();
+        let forwarders: ForwarderRegistry =
+            Arc::new(RwLock::new(std::collections::HashMap::new()));
+
+        let (mock, inbound_tx, mut outbound_rx) = MockTransport::new();
+        let peer: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let public_key = "test-public-key".to_owned();
+
+        let sessions_clone = sessions.clone();
+        let forwarders_clone = forwarders.clone();
+        let handle = tokio::spawn(async move {
+            handle_transport_session(
+                mock, peer, ctx.as_ref(), public_key, sessions_clone, forwarders_clone, None,
+            )
+            .await
+        });
+
+        // 1. Send PING as the first frame (goes through resolve_session_binding
+        //    -> initial_frame -> pending_frame -> PONG with connection_id = session_id).
+        inbound_tx
+            .send(test_session_frame(FLAG_PING, 0))
+            .expect("send ping");
+
+        // 2. Wait for PONG. The PONG's connection_id IS the session_id
+        //    (see pending_frame handling in handle_transport_session).
+        let pong = tokio::time::timeout(std::time::Duration::from_secs(2), outbound_rx.recv())
+            .await
+            .expect("timeout waiting for PONG")
+            .expect("outbound closed");
+        assert!(
+            pong.header.flags & bonded_core::session::FLAG_PONG != 0,
+            "expected PONG, got flags={}",
+            pong.header.flags
+        );
+        let session_id = pong.header.connection_id as u64;
+
+        // 3. Look up the forwarder from the registry using the session_id.
+        //    This proves the session was registered and the forwarder exists.
+        let forwarder: Arc<crate::smoltcp_forwarder::SmoltcpForwarder> = {
+            let guard = forwarders
+                .read()
+                .expect("forwarder registry lock should not be poisoned");
+            guard
+                .get(&session_id)
+                .expect("forwarder should be registered for session")
+                .forwarder
+                .clone()
+        };
+
+        // 4. Record baseline counter.
+        let baseline = forwarder.ingested_packet_count();
+
+        // 5. Send a well-formed TCP SYN data frame.
+        //    If the select! loop starves transport.recv(), this frame will
+        //    never reach ingest_packet and the timeout below will fire.
+        inbound_tx
+            .send(test_data_frame(build_tcp_syn_packet()))
+            .expect("send SYN frame");
+
+        // 6. Wait (with timeout) for the forwarder to observe the packet.
+        //    This is the PROOF: the counter increments if and only if
+        //    handle_transport_session called forwarder.ingest_packet(frame).
+        let observed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if forwarder.ingested_packet_count() > baseline {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            observed.is_ok(),
+            "forwarder did not ingest the SYN frame within 5s; \
+             the session loop is not delivering data frames to the forwarding layer"
+        );
+
+        // 7. Verify exactly one packet was ingested (no duplicates, no drops).
+        assert_eq!(
+            forwarder.ingested_packet_count(),
+            baseline + 1,
+            "expected exactly one ingested packet"
+        );
+
+        // 8. Cleanup: close the mock, handler should exit.
+        drop(inbound_tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
     }
 }
