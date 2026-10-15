@@ -11,7 +11,9 @@ use bonded_core::config::SocketNetworkBindFn;
 use bonded_core::config::SocketProtectFn;
 use bonded_core::session::SessionFrame;
 #[cfg(any(target_os = "android", test))]
-use bonded_core::session::{SessionState, FLAG_PING, FLAG_PONG};
+use bonded_core::session::{SessionHeader, SessionState, FLAG_PING, FLAG_PONG};
+#[cfg(any(target_os = "android", test))]
+use bonded_core::transport::{NaiveTcpTransport, Transport};
 #[cfg(any(target_os = "android", test))]
 use bytes::Bytes;
 #[cfg(any(target_os = "android", test))]
@@ -1040,7 +1042,34 @@ fn redeem_invite_token(
 
     runtime.block_on(async {
         let stream = establish_naive_tcp_session(&config).await?;
-        drop(stream);
+        // The server binds the session to the first frame it receives after
+        // authentication (see resolve_session_binding on the server), so a
+        // bare connect + auth + drop leaves it waiting for a frame that
+        // never comes and the connection is discarded when the stream
+        // closes. Complete the binding with the same PING/PONG discovery
+        // exchange the full client runtime performs on every path.
+        let mut transport = NaiveTcpTransport::from_stream(stream);
+        transport
+            .send(SessionFrame {
+                header: SessionHeader {
+                    connection_id: 0,
+                    sequence: 0,
+                    flags: FLAG_PING,
+                },
+                payload: Bytes::new(),
+            })
+            .await?;
+        let pong = tokio::time::timeout(Duration::from_secs(10), transport.recv())
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!("timed out waiting for the server to bind the pairing session")
+            })??;
+        anyhow::ensure!(
+            pong.header.flags & FLAG_PONG != 0,
+            "unexpected first frame from server while redeeming invite token: flags={}",
+            pong.header.flags
+        );
+        drop(transport);
         Ok::<(), anyhow::Error>(())
     })
 }
@@ -1317,8 +1346,9 @@ mod tests {
         stop_android_session,
     };
     use bonded_core::auth::{create_auth_challenge, verify_auth_challenge};
-    use bonded_core::session::{SessionFrame, SessionHeader};
+    use bonded_core::session::{SessionFrame, SessionHeader, FLAG_PING, FLAG_PONG};
     use bonded_core::transport::{NaiveTcpTransport, Transport};
+    use bytes::Bytes;
     use serde_json::json;
     use std::fs;
     use std::path::PathBuf;
@@ -1437,8 +1467,31 @@ mod tests {
 
         let server_task = runtime.spawn(async move {
             let (pair_stream, _) = listener.accept().await.expect("pair accept should succeed");
-            let (public_key, _) =
+            let (public_key, pair_stream) =
                 handshake_server_connection(pair_stream, None, "android-invite").await;
+            // The redeem flow completes the server's session binding with a
+            // PING/PONG exchange after authentication; answer it the way the
+            // real server does.
+            let mut pair_transport = NaiveTcpTransport::from_stream(pair_stream);
+            let ping = pair_transport
+                .recv()
+                .await
+                .expect("pairing ping should arrive");
+            assert!(
+                ping.header.flags & FLAG_PING != 0,
+                "expected PING as the pairing session's first frame"
+            );
+            pair_transport
+                .send(SessionFrame {
+                    header: SessionHeader {
+                        connection_id: 7,
+                        sequence: 0,
+                        flags: FLAG_PONG,
+                    },
+                    payload: Bytes::new(),
+                })
+                .await
+                .expect("pairing pong should send");
 
             let (session_stream, session_peer_addr) = listener
                 .accept()

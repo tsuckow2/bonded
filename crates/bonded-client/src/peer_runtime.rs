@@ -613,13 +613,51 @@ fn resolve_advertise_ip(
         _ => {}
     }
 
-    interfaces
+    let candidates: Vec<IpAddr> = interfaces
         .iter()
         .flat_map(|interface| interface.ips.iter())
         .map(|network| network.ip())
-        .find(|ip| !ip.is_loopback() && !ip.is_unspecified())
-        .ok_or_else(|| {
-            anyhow::anyhow!("failed to determine a non-loopback peer-share advertise IP")
+        .collect();
+    select_advertise_ip(&candidates).ok_or_else(|| {
+        anyhow::anyhow!("failed to determine a non-loopback peer-share advertise IP")
+    })
+}
+
+/// Whether the peer-share listener can actually bind and advertise this
+/// address: not loopback/unspecified/multicast, and not link-local. A
+/// link-local address (169.254.0.0/16, fe80::/10) cannot be bound without
+/// a scope id, so `UdpSocket::bind` rejects it with EINVAL — and interface
+/// enumeration on phones commonly lists a link-local IPv6 address ahead of
+/// the usable LAN IPv4 address.
+fn is_bindable_advertise_ip(ip: &IpAddr) -> bool {
+    if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() {
+        return false;
+    }
+    match ip {
+        IpAddr::V4(ip) => !ip.is_link_local(),
+        IpAddr::V6(ip) => (ip.segments()[0] & 0xffc0) != 0xfe80,
+    }
+}
+
+/// Pick the address to advertise for the peer-share listener: a bindable
+/// IPv4 address first, then any bindable address, then — so unusual setups
+/// keep working — the first non-loopback address of any kind.
+fn select_advertise_ip(candidates: &[IpAddr]) -> Option<IpAddr> {
+    candidates
+        .iter()
+        .copied()
+        .find(|ip| ip.is_ipv4() && is_bindable_advertise_ip(ip))
+        .or_else(|| {
+            candidates
+                .iter()
+                .copied()
+                .find(|ip| is_bindable_advertise_ip(ip))
+        })
+        .or_else(|| {
+            candidates
+                .iter()
+                .copied()
+                .find(|ip| !ip.is_loopback() && !ip.is_unspecified())
         })
 }
 
@@ -651,13 +689,14 @@ mod tests {
     use bonded_core::auth::verify_signature;
 
     use super::{
-        build_peer_introduction_request, resolve_advertise_ip, should_accept_discovered_peer,
+        build_peer_introduction_request, resolve_advertise_ip, select_advertise_ip,
+        should_accept_discovered_peer,
     };
     use bonded_core::auth::DeviceKeypair;
     use bonded_core::config::{ClientConfig, PeerShareMode};
     use bonded_core::peer_share::PeerShareAdvertisement;
     use pnet_datalink::NetworkInterface;
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
     #[test]
     fn discovered_peers_ignore_self_and_other_servers() {
@@ -723,5 +762,47 @@ mod tests {
         )
         .expect("override should parse");
         assert_eq!(ip, IpAddr::V4(Ipv4Addr::LOCALHOST));
+    }
+
+    #[test]
+    fn advertise_ip_skips_link_local_ipv6_for_lan_ipv4() {
+        // The phone failure mode: enumeration lists a link-local IPv6
+        // address first; binding it would fail with EINVAL, so the LAN
+        // IPv4 address must win.
+        let candidates = vec![
+            IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 42)),
+        ];
+        assert_eq!(
+            select_advertise_ip(&candidates),
+            Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 42)))
+        );
+    }
+
+    #[test]
+    fn advertise_ip_skips_link_local_ipv4_for_global_ipv6() {
+        let candidates = vec![
+            IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1)),
+            IpAddr::V6(Ipv6Addr::new(0x2600, 0, 0, 0, 0, 0, 0, 5)),
+        ];
+        assert_eq!(
+            select_advertise_ip(&candidates),
+            Some(IpAddr::V6(Ipv6Addr::new(0x2600, 0, 0, 0, 0, 0, 0, 5)))
+        );
+    }
+
+    #[test]
+    fn advertise_ip_falls_back_when_only_link_local_exists() {
+        let candidates = vec![IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 9))];
+        assert_eq!(
+            select_advertise_ip(&candidates),
+            Some(IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 9)))
+        );
+    }
+
+    #[test]
+    fn advertise_ip_rejects_loopback_only() {
+        let candidates = vec![IpAddr::V4(Ipv4Addr::LOCALHOST)];
+        assert_eq!(select_advertise_ip(&candidates), None);
     }
 }
