@@ -197,11 +197,24 @@ impl ClientRuntime {
             let (peer_transport_tx, peer_transport_rx) = tokio::sync::mpsc::unbounded_channel();
             let _peer_transport_hold = peer_transport_tx.clone();
             let _peer_share_runtime = if self.config.client.peer_share_enabled {
-                Some(
-                    peer_runtime::start_peer_share_runtime(&self.config, peer_transport_tx, None)
-                        .await
-                        .context("failed to start peer-share runtime")?,
+                match peer_runtime::start_peer_share_runtime(
+                    &self.config,
+                    peer_transport_tx,
+                    None,
                 )
+                .await
+                {
+                    Ok(runtime) => Some(runtime),
+                    Err(err) => {
+                        // Peer-share is an enhancement, not the session itself:
+                        // degrade to direct paths only instead of failing a
+                        // session whose transports already connected.
+                        warn!(
+                            "peer-share runtime failed to start; continuing without peer-share: {err:#}"
+                        );
+                        None
+                    }
+                }
             } else {
                 None
             };

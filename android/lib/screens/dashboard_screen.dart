@@ -35,6 +35,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
   int _peerRelayCount = 0;
   String _activeTransport = 'Unknown';
   String? _lastError;
+  String? _peerShareError;
   PairedServer? _pairedServer;
 
   @override
@@ -134,6 +135,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
         final String activeTransport =
           sessionStatus?['activeTransport'] as String? ?? 'Unknown';
       final String? lastError = sessionStatus?['lastError'] as String?;
+      final String? peerShareError =
+          sessionStatus?['peerShareError'] as String?;
 
       if (mounted) {
         setState(() {
@@ -152,6 +155,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
           _peerRelayCount = peerRelayCount;
           _activeTransport = activeTransport;
           _lastError = lastError?.isNotEmpty == true ? lastError : null;
+          _peerShareError =
+              peerShareError?.isNotEmpty == true ? peerShareError : null;
           _activePathCount = networkPathCount;
           _isBackgroundRunning = backgroundRunning;
         });
@@ -278,6 +283,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                       _PeerShareStatusCard(
                         server: _pairedServer!,
                         peerRelayCount: _peerRelayCount,
+                        peerShareError: _peerShareError,
                       ),
                     ],
                     if (_lastError != null) ...[
@@ -479,10 +485,12 @@ class _TrustStatusCard extends StatelessWidget {
 class _PeerShareStatusCard extends StatelessWidget {
   final PairedServer server;
   final int peerRelayCount;
+  final String? peerShareError;
 
   const _PeerShareStatusCard({
     required this.server,
     required this.peerRelayCount,
+    this.peerShareError,
   });
 
   String _displayValue(String value) => value.isEmpty ? 'Not set' : value;
@@ -521,6 +529,13 @@ class _PeerShareStatusCard extends StatelessWidget {
           ),
           const Divider(height: 16),
           _Row('Active peer relays', '$peerRelayCount'),
+          if (peerShareError != null) ...[
+            const Divider(height: 16),
+            Text(
+              'Peer-share failed to start — this device is connected directly only.\n$peerShareError',
+              style: TextStyle(color: Colors.red[700], fontSize: 13),
+            ),
+          ],
         ],
       ),
     );

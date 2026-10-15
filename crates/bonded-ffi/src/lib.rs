@@ -306,6 +306,9 @@ struct AndroidSessionSnapshot {
     /// Unix timestamp in milliseconds when the session reached "connected".
     connected_at_ms: u64,
     last_error: Option<String>,
+    /// Set when the peer-share runtime failed to start. The session itself
+    /// keeps running without peer-share; this is informational, not fatal.
+    peer_share_error: Option<String>,
 }
 
 #[cfg(any(target_os = "android", test))]
@@ -432,9 +435,14 @@ fn snapshot_json(snapshot: &AndroidSessionSnapshot) -> String {
         .as_ref()
         .map(|value| format!("\"{}\"", escape_json(value)))
         .unwrap_or_else(|| "null".to_owned());
+    let peer_share_error = snapshot
+        .peer_share_error
+        .as_ref()
+        .map(|value| format!("\"{}\"", escape_json(value)))
+        .unwrap_or_else(|| "null".to_owned());
 
     format!(
-        "{{\"state\":\"{}\",\"serverAddress\":\"{}\",\"activeTransport\":\"{}\",\"transportCount\":{},\"peerRelayCount\":{},\"outboundPackets\":{},\"inboundPackets\":{},\"outboundBytes\":{},\"inboundBytes\":{},\"connectedAtMs\":{},\"lastError\":{}}}",
+        "{{\"state\":\"{}\",\"serverAddress\":\"{}\",\"activeTransport\":\"{}\",\"transportCount\":{},\"peerRelayCount\":{},\"outboundPackets\":{},\"inboundPackets\":{},\"outboundBytes\":{},\"inboundBytes\":{},\"connectedAtMs\":{},\"lastError\":{},\"peerShareError\":{}}}",
         escape_json(&snapshot.state),
         escape_json(&snapshot.server_address),
         escape_json(&snapshot.active_transport),
@@ -446,6 +454,7 @@ fn snapshot_json(snapshot: &AndroidSessionSnapshot) -> String {
         snapshot.inbound_bytes,
         snapshot.connected_at_ms,
         last_error,
+        peer_share_error,
     )
 }
 
@@ -574,6 +583,7 @@ fn start_android_session(
         inbound_bytes: 0,
         connected_at_ms: 0,
         last_error: None,
+        peer_share_error: None,
     }));
     let worker_snapshot = Arc::clone(&snapshot);
     let cancel_token = CancellationToken::new();
@@ -703,14 +713,17 @@ fn start_android_session(
                 match peer_runtime::start_peer_share_runtime(&config, peer_transport_tx, Some(peer_logger)).await {
                     Ok(runtime) => Some(runtime),
                     Err(err) => {
-                        alog_error!("Failed to start peer-share runtime: {}", err);
+                        // Peer-share is an enhancement, not the session itself:
+                        // degrade to a direct-paths-only session instead of
+                        // tearing down transports that already connected.
+                        alog_error!(
+                            "Peer-share runtime failed to start; continuing without peer-share: {}",
+                            err
+                        );
                         update_snapshot(&worker_snapshot, |session_snapshot| {
-                            session_snapshot.state = "error".to_owned();
-                            session_snapshot.last_error = Some(format!(
-                                "failed to start peer-share runtime: {err}"
-                            ));
+                            session_snapshot.peer_share_error = Some(err.to_string());
                         });
-                        return;
+                        None
                     }
                 }
             } else {
