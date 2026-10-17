@@ -1,7 +1,7 @@
 #[cfg(any(target_os = "android", test))]
 use bonded_client::{
-    establish_naive_tcp_session, establish_transport_paths_with_observer, peer_runtime,
-    ClientTransport,
+    establish_naive_tcp_session, establish_transport_paths,
+    establish_transport_paths_with_observer, peer_runtime, ClientTransport,
 };
 #[cfg(any(target_os = "android", test))]
 use bonded_core::config::ClientConfig;
@@ -1138,37 +1138,54 @@ fn redeem_invite_token(
         .build()?;
 
     runtime.block_on(async {
-        let stream = establish_naive_tcp_session(&config).await?;
-        // The server binds the session to the first frame it receives after
-        // authentication (see resolve_session_binding on the server), so a
-        // bare connect + auth + drop leaves it waiting for a frame that
-        // never comes and the connection is discarded when the stream
-        // closes. Complete the binding with the same PING/PONG discovery
-        // exchange the full client runtime performs on every path.
-        let mut transport = NaiveTcpTransport::from_stream(stream);
-        transport
-            .send(SessionFrame {
-                header: SessionHeader {
-                    connection_id: 0,
-                    sequence: 0,
-                    flags: FLAG_PING,
-                },
-                payload: Bytes::new(),
-            })
-            .await?;
-        let pong = tokio::time::timeout(Duration::from_secs(10), transport.recv())
-            .await
-            .map_err(|_| {
-                anyhow::anyhow!("timed out waiting for the server to bind the pairing session")
-            })??;
-        anyhow::ensure!(
-            pong.header.flags & FLAG_PONG != 0,
-            "unexpected first frame from server while redeeming invite token: flags={}",
-            pong.header.flags
-        );
+        // Dial with the same transport machinery the session runtime uses,
+        // honoring the configured protocols (wss first against production
+        // servers). This used to open the plaintext naive-TCP handshake
+        // unconditionally, which a TLS bootstrap endpoint rejects while
+        // handshaking — the server logs a TLS "corrupt message" error and
+        // the redeem dies with "unexpected end of file" — so pairing
+        // against a production server could never succeed.
+        let mut paths = establish_transport_paths(&config, 1).await?;
+        let mut transport = paths.remove(0);
+        complete_pairing_session_binding(&mut transport).await?;
         drop(transport);
         Ok::<(), anyhow::Error>(())
     })
+}
+
+/// Complete server-side session binding on an authenticated pairing
+/// connection with a PING/PONG discovery exchange. The server binds the
+/// session to the first frame it receives after authentication (see
+/// resolve_session_binding on the server), so a bare connect + auth +
+/// drop leaves it waiting for a frame that never comes and the
+/// connection is discarded when the stream closes.
+#[cfg(any(target_os = "android", test))]
+async fn complete_pairing_session_binding(
+    transport: &mut ClientTransport,
+) -> anyhow::Result<()> {
+    transport
+        .send(SessionFrame {
+            header: SessionHeader {
+                connection_id: 0,
+                sequence: 0,
+                flags: FLAG_PING,
+            },
+            payload: Bytes::new(),
+        })
+        .await?;
+    let pong = tokio::time::timeout(Duration::from_secs(10), transport.recv())
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "timed out waiting for the server to bind the pairing session"
+            )
+        })??;
+    anyhow::ensure!(
+        pong.header.flags & FLAG_PONG != 0,
+        "unexpected first frame from server while redeeming invite token: flags={}",
+        pong.header.flags
+    );
+    Ok(())
 }
 
 #[unsafe(no_mangle)]
@@ -1438,10 +1455,12 @@ pub unsafe extern "C" fn bonded_ffi_decode_frame_metadata(
 #[cfg(test)]
 mod tests {
     use super::{
-        bonded_ffi_api_version, decode_frame_metadata, get_session_snapshot_json,
-        poll_inbound_packet, queue_outbound_packet, redeem_invite_token, start_android_session,
+        android_client_config, bonded_ffi_api_version, complete_pairing_session_binding,
+        decode_frame_metadata, establish_naive_tcp_session, get_session_snapshot_json,
+        poll_inbound_packet, queue_outbound_packet, start_android_session,
         stop_android_session,
     };
+    use bonded_client::ClientTransport;
     use bonded_core::auth::{create_auth_challenge, verify_auth_challenge};
     use bonded_core::session::{SessionFrame, SessionHeader, FLAG_PING, FLAG_PONG};
     use bonded_core::transport::{NaiveTcpTransport, Transport};
@@ -1624,13 +1643,29 @@ mod tests {
             transport.send(frame).await.expect("echo should send");
         });
 
-        redeem_invite_token(
+        // The production redeem entry dials via establish_transport_paths
+        // (the configured session protocols, wss first); against this
+        // plaintext test server, dial the naive path directly and then run
+        // the same pairing session-binding exchange the redeem performs
+        // once its transport is up.
+        let mut pair_config = android_client_config(
             &addr.to_string(),
+            "",
             "server-pub",
-            "android-invite",
             storage_dir.to_string_lossy().as_ref(),
-        )
-        .expect("invite redemption should succeed");
+        );
+        pair_config.client.invite_token = "android-invite".to_owned();
+        runtime
+            .block_on(async {
+                let pair_stream = establish_naive_tcp_session(&pair_config)
+                    .await
+                    .expect("pairing connection should establish");
+                let mut pair_transport =
+                    ClientTransport::NaiveTcp(NaiveTcpTransport::from_stream(pair_stream));
+                complete_pairing_session_binding(&mut pair_transport)
+                    .await
+                    .expect("pairing session binding should complete");
+            });
 
         start_android_session(
             &addr.to_string(),
