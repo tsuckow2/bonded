@@ -1,7 +1,36 @@
 import 'package:flutter/material.dart';
+import 'package:package_info_plus/package_info_plus.dart';
 
-class SettingsScreen extends StatelessWidget {
+class SettingsScreen extends StatefulWidget {
   const SettingsScreen({super.key});
+
+  @override
+  State<SettingsScreen> createState() => _SettingsScreenState();
+}
+
+class _SettingsScreenState extends State<SettingsScreen> {
+  String _versionLabel = '';
+
+  @override
+  void initState() {
+    super.initState();
+    _loadVersion();
+  }
+
+  Future<void> _loadVersion() async {
+    try {
+      final info = await PackageInfo.fromPlatform();
+      if (!mounted) return;
+      setState(() {
+        // Android's system UI only surfaces the version name; show the
+        // build number (Play version code) here so testers can identify
+        // exactly which build is installed.
+        _versionLabel = '${info.version} (build ${info.buildNumber})';
+      });
+    } catch (_) {
+      // Leave the label empty; dialogs fall back to the bare name.
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -11,13 +40,18 @@ class SettingsScreen extends StatelessWidget {
         children: [
           ListTile(
             title: const Text('About Bonded'),
-            subtitle: const Text('App information and licenses'),
+            subtitle: Text(
+              _versionLabel.isEmpty
+                  ? 'App information and licenses'
+                  : 'Version $_versionLabel',
+            ),
             trailing: const Icon(Icons.arrow_forward),
             onTap: () {
               showAboutDialog(
                 context: context,
                 applicationName: 'Bonded VPN',
-                applicationVersion: '1.0.0',
+                applicationVersion:
+                    _versionLabel.isEmpty ? null : _versionLabel,
                 children: [
                   const Text(
                     'Bonded is a secure VPN solution with multi-path support.',
@@ -44,10 +78,10 @@ class SettingsScreen extends StatelessWidget {
       builder:
           (context) => AlertDialog(
             title: const Text('Debug Information'),
-            content: const SingleChildScrollView(
+            content: SingleChildScrollView(
               child: Text(
                 'Bonded VPN Android Client\n'
-                'Version: 1.0.0\n'
+                'Version: ${_versionLabel.isEmpty ? 'unknown' : _versionLabel}\n'
                 'Platform: Flutter 3.x\n'
                 'Rust FFI: Enabled\n'
                 '\n'

@@ -36,6 +36,15 @@
                 <action android:name="android.intent.action.MAIN"/>
                 <category android:name="android.intent.category.LAUNCHER"/>
             </intent-filter>
+            <!-- Deep link for pairing: bonded://pair?server=...&token=...&key=...
+                 Lets users tap a link (instead of scanning a QR) to open the
+                 app directly to the pairing confirmation screen. -->
+            <intent-filter android:autoVerify="false">
+                <action android:name="android.intent.action.VIEW"/>
+                <category android:name="android.intent.category.DEFAULT"/>
+                <category android:name="android.intent.category.BROWSABLE"/>
+                <data android:scheme="bonded" android:host="pair"/>
+            </intent-filter>
         </activity>
         <!-- Headless activity for ADB-driven VPN control during debugging.
              Usage: adb shell am start -n com.bonded.bonded_app/.DebugVpnActivity

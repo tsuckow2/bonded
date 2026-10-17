@@ -729,8 +729,92 @@ fn start_android_session(
             } else {
                 None
             };
+            // Complete server-side session binding on every path with an
+            // initial PING/PONG discovery exchange, mirroring the Linux
+            // packet loop. The server binds the session to the first frame
+            // it receives after authentication (resolve_session_binding)
+            // and answers the ping with a PONG carrying the authoritative
+            // session id, which the frame state below adopts. Without this
+            // exchange the session sent nothing until the 25s heartbeat,
+            // and any teardown inside that window (e.g. the pre-129
+            // peer-share failure path) closed the transports before the
+            // server ever saw a frame — the server logged "failed to
+            // receive initial session frame" and no session ever bound.
+            let mut session_id: u32 = 0;
+            let mut path_index = 0_usize;
+            while path_index < transports.len() {
+                let ping = SessionFrame {
+                    header: SessionHeader {
+                        connection_id: 0,
+                        sequence: 0,
+                        flags: FLAG_PING,
+                    },
+                    payload: Bytes::new(),
+                };
+                if let Err(err) = transports[path_index].send(ping).await {
+                    alog_warn!(
+                        "Worker: path {} failed during session discovery (send): {}",
+                        path_index, err
+                    );
+                    transports.remove(path_index);
+                    continue;
+                }
+                match tokio::time::timeout(
+                    Duration::from_secs(10),
+                    transports[path_index].recv(),
+                )
+                .await
+                {
+                    Ok(Ok(frame)) if frame.header.flags & FLAG_PONG != 0 => {
+                        session_id = frame.header.connection_id;
+                        alog_info!(
+                            "Worker: path {} bound to session {}",
+                            path_index, session_id
+                        );
+                        path_index += 1;
+                    }
+                    Ok(Ok(frame)) => {
+                        let message = format!(
+                            "expected session announcement pong on path {path_index}, got a frame with flags={}",
+                            frame.header.flags
+                        );
+                        alog_error!("Worker: {}", message);
+                        update_snapshot(&worker_snapshot, |session_snapshot| {
+                            session_snapshot.state = "error".to_owned();
+                            session_snapshot.last_error = Some(message);
+                        });
+                        close_client_transports(&mut transports).await;
+                        return;
+                    }
+                    Ok(Err(err)) => {
+                        alog_warn!(
+                            "Worker: path {} failed during session discovery (recv): {}",
+                            path_index, err
+                        );
+                        transports.remove(path_index);
+                    }
+                    Err(_) => {
+                        alog_warn!(
+                            "Worker: path {} timed out during session discovery",
+                            path_index
+                        );
+                        transports.remove(path_index);
+                    }
+                }
+            }
+            if transports.is_empty() {
+                let message =
+                    "all transport paths failed session discovery".to_owned();
+                alog_error!("Worker: {}", message);
+                update_snapshot(&worker_snapshot, |session_snapshot| {
+                    session_snapshot.state = "error".to_owned();
+                    session_snapshot.last_error = Some(message);
+                });
+                return;
+            }
+            sync_transport_snapshot(&worker_snapshot, &transports, 0);
             let mut active_index = 0_usize;
-            let mut session = SessionState::new(1);
+            let mut session = SessionState::new(session_id);
             let mut ping_sequence = 0u64;
             let mut last_ping_sent_ms: Option<u64> = None;
             let mut heartbeat = tokio::time::interval(Duration::from_secs(25));
@@ -1514,6 +1598,28 @@ mod tests {
             let (_, session_stream) =
                 handshake_server_connection(session_stream, Some(&public_key), "").await;
             let mut transport = NaiveTcpTransport::from_stream(session_stream);
+            // The session runtime completes server-side session binding with
+            // a PING/PONG discovery exchange on each path before any data
+            // flows; answer it the way the real server does.
+            let discovery_ping = transport
+                .recv()
+                .await
+                .expect("session discovery ping should arrive");
+            assert!(
+                discovery_ping.header.flags & FLAG_PING != 0,
+                "expected PING as the session's first frame"
+            );
+            transport
+                .send(SessionFrame {
+                    header: SessionHeader {
+                        connection_id: 3,
+                        sequence: discovery_ping.header.sequence,
+                        flags: FLAG_PONG,
+                    },
+                    payload: Bytes::new(),
+                })
+                .await
+                .expect("session discovery pong should send");
             let frame = transport.recv().await.expect("session frame should arrive");
             transport.send(frame).await.expect("echo should send");
         });

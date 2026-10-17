@@ -35,7 +35,42 @@ pub fn emit_pairing_qr(
     let rendered = qr.render::<unicode::Dense1x2>().build();
     info!(payload = %payload_json, "pairing payload json");
     info!("startup pairing qr:\n{}", rendered);
+
+    // Also emit a clickable deep link for devices that can't scan the QR
+    // (e.g. pairing from the same device, or via a shared link).
+    let deep_link = build_pairing_deep_link(public_address, invite, server_public_key);
+    info!("startup pairing link: {}", deep_link);
+
     Some(payload_json)
+}
+
+/// Builds a `bonded://pair?...` deep link that opens the Android app
+/// directly to the pairing confirmation screen.
+fn build_pairing_deep_link(
+    public_address: &str,
+    invite: &InviteToken,
+    server_public_key: &str,
+) -> String {
+    format!(
+        "bonded://pair?server={}&token={}&key={}",
+        percent_encode(public_address.trim()),
+        percent_encode(&invite.token),
+        percent_encode(server_public_key),
+    )
+}
+
+/// Minimal percent-encoding for query parameter values.
+fn percent_encode(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for b in input.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
 }
 
 fn build_pairing_payload_json(
@@ -57,7 +92,7 @@ fn build_pairing_payload_json(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_pairing_payload_json, PairingPayload};
+    use super::{build_pairing_deep_link, build_pairing_payload_json, percent_encode, PairingPayload};
     use bonded_core::auth::InviteToken;
 
     #[test]
@@ -87,5 +122,26 @@ mod tests {
 
         let payload = build_pairing_payload_json("", &invite, "pub-key");
         assert!(payload.is_none());
+    }
+
+    #[test]
+    fn deep_link_encodes_all_fields() {
+        let invite = InviteToken {
+            token: "token-123".to_owned(),
+            expires_at: "unix:123".to_owned(),
+            uses_remaining: 1,
+        };
+
+        let link = build_pairing_deep_link("bonded.example.com:8443", &invite, "pub+key/with=special");
+        assert_eq!(
+            link,
+            "bonded://pair?server=bonded.example.com%3A8443&token=token-123&key=pub%2Bkey%2Fwith%3Dspecial"
+        );
+    }
+
+    #[test]
+    fn percent_encode_leaves_unreserved_chars() {
+        assert_eq!(percent_encode("abcXYZ019-_.~"), "abcXYZ019-_.~");
+        assert_eq!(percent_encode("a b+c"), "a%20b%2Bc");
     }
 }
