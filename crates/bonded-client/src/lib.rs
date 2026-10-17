@@ -36,7 +36,7 @@ use tokio_rustls::TlsConnector;
 use tokio_tungstenite::client_async_tls_with_config;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::Connector;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 #[cfg(target_os = "linux")]
 use tun::Configuration;
 
@@ -281,6 +281,58 @@ where
     );
 
     let target = count.max(1);
+
+    // Session-start identity gate: when a paired server key is configured,
+    // verify the bootstrap endpoint's cert proof against it before any path
+    // is established. A verification failure is fatal — the server key
+    // changed or the connection is being steered to a different server, and
+    // proceeding would silently pair a working VPN with dead peering. A
+    // reachability failure is not fatal: per-path verification below still
+    // applies, and a bound path may reach the server when the default route
+    // cannot.
+    let (gate_host, gate_port) = bootstrap_host_port(config);
+    let mut identity_error: Option<String> = None;
+    if !config.client.server_public_key.is_empty() {
+        let dial_override = (!config.client.server_resolved_address.trim().is_empty())
+            .then_some(config.client.server_resolved_address.as_str());
+        match timeout(
+            PATH_ESTABLISH_TIMEOUT,
+            cert_proof::fetch_and_verify_cert_proof(
+                &gate_host,
+                gate_port,
+                &config.client.server_public_key,
+                config.socket_protect.as_ref(),
+                dial_override,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(fingerprint)) => {
+                observer(format!(
+                    "server identity verified via cert proof fingerprint={fingerprint}"
+                ));
+            }
+            Ok(Err(err)) if cert_proof::is_identity_mismatch_error(&err) => {
+                return Err(server_identity_failure(
+                    &gate_host,
+                    gate_port,
+                    &format!("{err:#}"),
+                ));
+            }
+            Ok(Err(err)) => {
+                observer(format!(
+                    "server identity gate unreachable ({err:#}); continuing with per-path verification"
+                ));
+            }
+            Err(_) => {
+                observer(
+                    "server identity gate timed out; continuing with per-path verification"
+                        .to_owned(),
+                );
+            }
+        }
+    }
+
     let mut paths = Vec::with_capacity(target);
     for path_index in 0..target {
         let mut attempt_errors: Vec<String> = Vec::new();
@@ -373,6 +425,11 @@ where
                     break;
                 }
                 Err(err) => {
+                    if identity_error.is_none()
+                        && cert_proof::is_identity_mismatch_error(&err)
+                    {
+                        identity_error = Some(format!("{err:#}"));
+                    }
                     let bind_context = bind_address
                         .map(|bind| format!(", bind_address={bind}"))
                         .unwrap_or_default();
@@ -386,6 +443,15 @@ where
                     ));
                 }
             }
+        }
+
+        // Fail closed on identity evidence from any attempt: a well-formed
+        // proof that does not verify can only come from a real bonded server
+        // holding a different key (or a relay of one), never from a merely
+        // broken network — so a path that connected anyway (e.g. an
+        // unverified debug transport) must not carry this session.
+        if let Some(detail) = &identity_error {
+            return Err(server_identity_failure(&gate_host, gate_port, detail));
         }
 
         let Some(path) = connected else {
@@ -413,6 +479,41 @@ where
     }
 
     Ok(paths)
+}
+
+/// Derive the bootstrap endpoint (host, port) from the client config,
+/// mirroring the address handling in the QUIC establishment path.
+fn bootstrap_host_port(config: &ClientConfig) -> (String, u16) {
+    let address = &config.client.server_public_address;
+    let ws_addr = &config.client.server_websocket_address;
+    let raw = if ws_addr.trim().is_empty() {
+        address.as_str()
+    } else {
+        ws_addr.as_str()
+    };
+    let host_port = raw
+        .trim()
+        .trim_start_matches("wss://")
+        .trim_start_matches("ws://")
+        .trim_start_matches("h3://");
+    let host_port = host_port.split('/').next().unwrap_or(host_port);
+    if let Some(pos) = host_port.rfind(':') {
+        if let Ok(port) = host_port[pos + 1..].parse::<u16>() {
+            return (host_port[..pos].to_owned(), port);
+        }
+    }
+    (host_port.to_owned(), 443)
+}
+
+/// The canonical, user-surfaced error for a server-identity verification
+/// failure. The "Server identity verification failed" prefix is matched by
+/// the Android service to skip automatic session recovery — reconnecting
+/// cannot fix a key mismatch, the user must re-pair — and the full message
+/// is what the dashboard error banner displays.
+fn server_identity_failure(host: &str, port: u16, detail: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "Server identity verification failed: the server at {host}:{port} did not prove the identity this device paired with. Its key may have changed, or this connection is being steered to a different server. Re-pair this device to trust the current server. Detail: {detail}"
+    )
 }
 
 const PATH_ESTABLISH_TIMEOUT: Duration = Duration::from_secs(8);
@@ -1946,10 +2047,28 @@ async fn resolve_wss_tls_connector(
                 let tls_config = cert_proof::make_pinned_tls_config(&fingerprint);
                 return Ok(Some(Connector::Rustls(tls_config)));
             }
+            Err(err) if cert_proof::is_identity_mismatch_error(&err) => {
+                // The endpoint answered with a well-formed proof that does
+                // not verify against the paired server key: the server key
+                // changed, or this connection is being steered to a different
+                // server. Never fall back to CA validation here — that would
+                // silently defeat the pairing pin.
+                return Err(err).with_context(|| {
+                    format!(
+                        "WSS cert-proof identity verification failed for {host}:{port}; refusing CA fallback"
+                    )
+                });
+            }
             Err(err) => {
-                warn!(
+                // The proof could not be obtained at all (endpoint
+                // unreachable, non-proof response). Keep the CA fallback for
+                // reachability, but log it loudly: the server identity is
+                // NOT verified for this connection.
+                error!(
                     error = %err,
-                    "cert-proof bootstrap failed; falling back to system CAs"
+                    host,
+                    port,
+                    "cert-proof bootstrap unreachable; falling back to system CAs (server identity NOT verified)"
                 );
                 // Fall through to default connector.
             }

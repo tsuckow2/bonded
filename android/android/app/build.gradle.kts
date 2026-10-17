@@ -108,5 +108,8 @@ flutter {
 dependencies {
     // Consider viability of com.google.android.gms:play-services-cronet
     implementation("org.chromium.net:cronet-embedded:143.7445.0")
+    // Play in-app updates: the dashboard checks whether a newer build is
+    // available on the Play track and offers the update flow.
+    implementation("com.google.android.play:app-update:2.1.0")
     testImplementation("junit:junit:4.13.2")
 }

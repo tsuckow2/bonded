@@ -1008,3 +1008,130 @@ async fn mixed_websocket_quic_failover_continues_exchange() {
     let _ = fs::remove_file(&cfg.client.private_key_path);
     let _ = fs::remove_file(&cfg.client.public_key_path);
 }
+
+/// Spawn a minimal TLS server that answers only the cert-proof request
+/// (with a proof signed by `signing_key` over `fingerprint`) and drops any
+/// other connection. Returns the bound address.
+async fn spawn_cert_proof_only_server(
+    cert_der: Vec<u8>,
+    key_der: Vec<u8>,
+    signing_key: &DeviceKeypair,
+    fingerprint: String,
+) -> String {
+    let acceptor = build_test_tls_acceptor(cert_der, key_der);
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("proof server should bind");
+    let addr = listener.local_addr().expect("proof server addr");
+    let signature =
+        sign_bytes(signing_key, fingerprint.as_bytes()).expect("fingerprint should sign");
+    let body = json!({
+        "cert_fingerprint": fingerprint,
+        "ed25519_signature": signature,
+    })
+    .to_string();
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            let acceptor = acceptor.clone();
+            let body = body.clone();
+            tokio::spawn(async move {
+                let Ok(mut tls) = acceptor.accept(stream).await else {
+                    return;
+                };
+                let mut buf = vec![0u8; 8192];
+                let Ok(n) = tls.read(&mut buf).await else {
+                    return;
+                };
+                let request = String::from_utf8_lossy(&buf[..n]);
+                if request.contains("/v1/bootstrap/cert-proof") {
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = tls.write_all(response.as_bytes()).await;
+                    let _ = tls.flush().await;
+                    // Clean TLS shutdown (close_notify): the client's proof
+                    // fetch reads to end-of-stream and treats an abrupt
+                    // close as a transport error before it can parse.
+                    let _ = tls.shutdown().await;
+                }
+                // Anything else (e.g. a websocket upgrade) is dropped: the
+                // session attempt then fails for a non-identity reason.
+            });
+        }
+    });
+    addr.to_string()
+}
+
+#[tokio::test]
+async fn identity_gate_fails_closed_on_wrong_paired_server_key() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let cert = generate_simple_self_signed(vec!["127.0.0.1".to_owned()])
+        .expect("self-signed cert should generate");
+    let cert_der = cert.cert.der().to_vec();
+    let key_der = cert.key_pair.serialize_der();
+    let fingerprint = cert_proof::compute_fingerprint(&cert_der);
+
+    let real_server_identity = DeviceKeypair::generate();
+    let addr = spawn_cert_proof_only_server(
+        cert_der,
+        key_der,
+        &real_server_identity,
+        fingerprint,
+    )
+    .await;
+
+    let client_keypair = DeviceKeypair::generate();
+
+    // Wrong pin: the client paired with some OTHER server's key. The proof
+    // endpoint answers, but its signature cannot verify — establishment must
+    // fail with the canonical identity error, not fall back or time out.
+    let mut wrong_cfg = test_client_config(addr.clone(), &client_keypair);
+    wrong_cfg.client.server_public_key = DeviceKeypair::generate().public_key_b64;
+    wrong_cfg.client.preferred_protocols = vec!["wss".to_owned()];
+    let wrong_result = timeout(
+        Duration::from_secs(20),
+        establish_transport_paths(&wrong_cfg, 1),
+    )
+    .await
+    .expect("wrong-pin establishment should not hang");
+    let wrong_err = match wrong_result {
+        Ok(_) => panic!("wrong-pin establishment must fail"),
+        Err(err) => err,
+    };
+    assert!(
+        wrong_err.to_string().contains("Server identity verification failed"),
+        "wrong pin must surface the canonical identity error, got: {wrong_err}"
+    );
+
+    // Right pin: the gate verifies and establishment proceeds — it still
+    // fails against this proof-only mock (no websocket endpoint), but the
+    // failure must NOT be the identity error.
+    let mut right_cfg = test_client_config(addr.clone(), &client_keypair);
+    right_cfg.client.server_public_key = real_server_identity.public_key_b64.clone();
+    right_cfg.client.preferred_protocols = vec!["wss".to_owned()];
+    let right_result = timeout(
+        Duration::from_secs(20),
+        establish_transport_paths(&right_cfg, 1),
+    )
+    .await
+    .expect("right-pin establishment should not hang");
+    let right_err = match right_result {
+        Ok(_) => panic!("proof-only mock cannot complete a session"),
+        Err(err) => err,
+    };
+    assert!(
+        !right_err.to_string().contains("Server identity verification failed"),
+        "right pin must pass the identity gate, got: {right_err}"
+    );
+
+    let _ = fs::remove_file(&wrong_cfg.client.private_key_path);
+    let _ = fs::remove_file(&wrong_cfg.client.public_key_path);
+    let _ = fs::remove_file(&right_cfg.client.private_key_path);
+    let _ = fs::remove_file(&right_cfg.client.public_key_path);
+}

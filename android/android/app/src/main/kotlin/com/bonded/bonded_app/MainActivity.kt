@@ -5,6 +5,9 @@ import android.content.Intent
 import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
+import com.google.android.play.core.appupdate.AppUpdateManagerFactory
+import com.google.android.play.core.install.model.AppUpdateType
+import com.google.android.play.core.install.model.UpdateAvailability
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.EventChannel
@@ -16,6 +19,7 @@ import java.util.UUID
 
 class MainActivity : FlutterActivity() {
     private val channelName = "bonded/native"
+    private val appUpdateRequestCode = 7911
     private val backgroundEventsChannelName = "bonded/background-events"
     private var backgroundEventSink: EventChannel.EventSink? = null
     private var pendingVpnStartResult: MethodChannel.Result? = null
@@ -313,6 +317,66 @@ class MainActivity : FlutterActivity() {
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, channelName)
                 .setMethodCallHandler { call, result ->
                     when (call.method) {
+                        "checkAppUpdate" -> {
+                            // Best-effort: any failure (no Play Store,
+                            // sideloaded build) reports "no update" so the
+                            // dashboard simply shows no banner.
+                            val noUpdate =
+                                    mapOf<String, Any>(
+                                            "updateAvailable" to false,
+                                            "availableVersionCode" to 0,
+                                    )
+                            try {
+                                val manager = AppUpdateManagerFactory.create(this)
+                                manager.appUpdateInfo
+                                        .addOnSuccessListener { info ->
+                                            val available =
+                                                    info.updateAvailability() ==
+                                                            UpdateAvailability
+                                                                    .UPDATE_AVAILABLE &&
+                                                            info.isUpdateTypeAllowed(
+                                                                    AppUpdateType.IMMEDIATE
+                                                            )
+                                            result.success(
+                                                    mapOf<String, Any>(
+                                                            "updateAvailable" to available,
+                                                            "availableVersionCode" to
+                                                                    info.availableVersionCode(),
+                                                    )
+                                            )
+                                        }
+                                        .addOnFailureListener { result.success(noUpdate) }
+                            } catch (e: Exception) {
+                                result.success(noUpdate)
+                            }
+                        }
+                        "startAppUpdate" -> {
+                            try {
+                                val manager = AppUpdateManagerFactory.create(this)
+                                manager.appUpdateInfo
+                                        .addOnSuccessListener { info ->
+                                            if (info.updateAvailability() ==
+                                                            UpdateAvailability
+                                                                    .UPDATE_AVAILABLE &&
+                                                    info.isUpdateTypeAllowed(
+                                                            AppUpdateType.IMMEDIATE
+                                                    )) {
+                                                manager.startUpdateFlowForResult(
+                                                        info,
+                                                        AppUpdateType.IMMEDIATE,
+                                                        this,
+                                                        appUpdateRequestCode,
+                                                )
+                                                result.success(true)
+                                            } else {
+                                                result.success(false)
+                                            }
+                                        }
+                                        .addOnFailureListener { result.success(false) }
+                            } catch (e: Exception) {
+                                result.success(false)
+                            }
+                        }
                         "getClientLogs" -> {
                             val args = call.arguments as? Map<*, *>
                             val maxLines = (args?.get("maxLines") as? Number)?.toInt() ?: 500

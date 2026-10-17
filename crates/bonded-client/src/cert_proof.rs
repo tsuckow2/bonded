@@ -33,6 +33,26 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpSocket;
 use tokio_rustls::TlsConnector;
 
+/// Marker embedded in the message of cert-proof errors that represent a
+/// *verification* failure: the endpoint produced a well-formed proof, but it
+/// does not check out against the paired server key (signature invalid, or
+/// the signed fingerprint does not match the certificate actually presented).
+///
+/// This class of failure means "the server's identity key changed, or this
+/// connection is being steered to a different server" and callers must treat
+/// it as fatal — never as a cue to fall back to CA validation. Proof
+/// *reachability* failures (connect errors, non-200 status, malformed JSON,
+/// missing fields) are deliberately NOT marked: they say nothing about the
+/// server's identity.
+pub const IDENTITY_MISMATCH_MARKER: &str = "server-identity-mismatch";
+
+/// True when `err` (or any cause in its chain) is a cert-proof verification
+/// failure — see [`IDENTITY_MISMATCH_MARKER`].
+pub fn is_identity_mismatch_error(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| cause.to_string().contains(IDENTITY_MISMATCH_MARKER))
+}
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /// Fetch the server's TLS cert fingerprint via the bootstrap cert-proof
@@ -158,12 +178,16 @@ pub fn verify_cert_proof_response(
         .ok_or_else(|| anyhow::anyhow!("cert-proof response missing 'ed25519_signature'"))?;
 
     bonded_core::auth::verify_signature(server_public_key_b64, fingerprint.as_bytes(), signature)
-        .map_err(|e| anyhow::anyhow!("cert-proof signature verification failed: {e}"))?;
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "{IDENTITY_MISMATCH_MARKER}: cert-proof signature verification failed: {e}"
+            )
+        })?;
 
     let computed = compute_fingerprint(presented_cert_der);
     if computed != fingerprint {
         anyhow::bail!(
-            "cert-proof fingerprint mismatch: server presented cert with fingerprint {computed} but cert-proof response claimed {fingerprint}. This may indicate an active MITM."
+            "{IDENTITY_MISMATCH_MARKER}: cert-proof fingerprint mismatch: server presented cert with fingerprint {computed} but cert-proof response claimed {fingerprint}. This may indicate an active MITM."
         );
     }
 
@@ -309,5 +333,80 @@ impl ServerCertVerifier for PinnedCertVerifier {
             SignatureScheme::ED25519,
             SignatureScheme::ED448,
         ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bonded_core::auth::{sign_bytes, DeviceKeypair};
+
+    fn proof_body(keypair: &DeviceKeypair, fingerprint: &str) -> String {
+        let signature = sign_bytes(keypair, fingerprint.as_bytes())
+            .expect("test keypair should sign");
+        serde_json::json!({
+            "cert_fingerprint": fingerprint,
+            "ed25519_signature": signature,
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn valid_proof_verifies_and_returns_fingerprint() {
+        let server = DeviceKeypair::generate();
+        let cert_der = b"fake server cert der bytes";
+        let fingerprint = compute_fingerprint(cert_der);
+        let body = proof_body(&server, &fingerprint);
+
+        let verified = verify_cert_proof_response(cert_der, &server.public_key_b64, &body)
+            .expect("valid proof should verify");
+        assert_eq!(verified, fingerprint);
+    }
+
+    #[test]
+    fn proof_signed_by_another_key_is_an_identity_mismatch() {
+        let real_server = DeviceKeypair::generate();
+        let other_server = DeviceKeypair::generate();
+        let cert_der = b"fake server cert der bytes";
+        let fingerprint = compute_fingerprint(cert_der);
+        // The endpoint presents a proof signed by a DIFFERENT key than the
+        // one this client paired with (server re-keyed, or steering).
+        let body = proof_body(&other_server, &fingerprint);
+
+        let err = verify_cert_proof_response(cert_der, &real_server.public_key_b64, &body)
+            .expect_err("proof signed by another key must not verify");
+        let wrapped = err.context("session establishment wrapper");
+        assert!(
+            is_identity_mismatch_error(&wrapped),
+            "signature failure must classify as identity mismatch through context layers: {wrapped:#}"
+        );
+    }
+
+    #[test]
+    fn signed_fingerprint_that_differs_from_presented_cert_is_an_identity_mismatch() {
+        let server = DeviceKeypair::generate();
+        let presented = b"presented cert bytes";
+        let claimed = compute_fingerprint(b"some other cert bytes");
+        // Signature is valid over the claimed fingerprint, but the cert on
+        // this connection computes to a different one (MITM relay shape).
+        let body = proof_body(&server, &claimed);
+
+        let err = verify_cert_proof_response(presented, &server.public_key_b64, &body)
+            .expect_err("fingerprint mismatch must not verify");
+        assert!(
+            is_identity_mismatch_error(&err),
+            "fingerprint mismatch must classify as identity mismatch: {err:#}"
+        );
+    }
+
+    #[test]
+    fn malformed_proof_is_not_an_identity_mismatch() {
+        let server = DeviceKeypair::generate();
+        let err = verify_cert_proof_response(b"cert", &server.public_key_b64, "not json at all")
+            .expect_err("malformed body must error");
+        assert!(
+            !is_identity_mismatch_error(&err),
+            "reachability/parse failures must not classify as identity mismatch: {err:#}"
+        );
     }
 }

@@ -516,6 +516,19 @@ class BondedVpnService : VpnService() {
             return
         }
 
+        // A server-identity failure cannot be fixed by reconnecting: the
+        // paired record's server key no longer matches the server that
+        // answers. Retrying would loop forever and flap the error banner;
+        // the user must re-pair. The prefix is the canonical message set by
+        // the native client (server_identity_failure in bonded-client).
+        if (lastError?.contains("Server identity verification failed") == true) {
+            android.util.Log.e(
+                    "BondedVPN",
+                    "Session recovery skipped: server identity verification failed; re-pairing is required",
+            )
+            return
+        }
+
         if (sessionStartupInProgress || networkRebindInProgress || sessionRecoveryInProgress) {
             return
         }

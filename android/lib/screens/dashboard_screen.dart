@@ -36,6 +36,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
   String _activeTransport = 'Unknown';
   String? _lastError;
   String? _peerShareError;
+  int? _updateAvailableVersionCode;
   PairedServer? _pairedServer;
 
   @override
@@ -43,7 +44,37 @@ class _DashboardScreenState extends State<DashboardScreen> {
     super.initState();
     _loadPairedServer();
     _refreshStatus();
+    _checkForUpdate();
     _listenToBackgroundEvents();
+  }
+
+  /// Ask the native side whether Play has a newer build for this install.
+  /// Best-effort: on any failure (sideload, no Play Store) nothing shows.
+  Future<void> _checkForUpdate() async {
+    try {
+      final result = await _channel.invokeMapMethod<String, dynamic>(
+        'checkAppUpdate',
+      );
+      if (!mounted || result == null) {
+        return;
+      }
+      if (result['updateAvailable'] == true) {
+        setState(() {
+          _updateAvailableVersionCode =
+              (result['availableVersionCode'] as num?)?.toInt();
+        });
+      }
+    } catch (_) {
+      // Update checks must never disrupt the dashboard.
+    }
+  }
+
+  Future<void> _startUpdate() async {
+    try {
+      await _channel.invokeMethod<bool>('startAppUpdate');
+    } catch (_) {
+      // Play update flow unavailable; the banner simply stays.
+    }
   }
 
   Future<void> _loadPairedServer() async {
@@ -88,15 +119,10 @@ class _DashboardScreenState extends State<DashboardScreen> {
             await _refreshStatus();
           }
 
-          if (!mounted) {
-            return;
-          }
-
-          if (event.message != null) {
-            ScaffoldMessenger.of(
-              context,
-            ).showSnackBar(SnackBar(content: Text(event.message!)));
-          }
+          // No SnackBar for background events: status events fire
+          // repeatedly while connected and the popup covers the bottom
+          // action button. Live state is already on this screen (status
+          // banner, cards, and the persistent error banner for failures).
         },
         onError: (error) {
           // Background event stream errors are non-fatal
@@ -285,6 +311,13 @@ class _DashboardScreenState extends State<DashboardScreen> {
                         peerRelayCount: _peerRelayCount,
                         peerShareError: _peerShareError,
                       ),
+                    ],
+                    if (_updateAvailableVersionCode != null) ...[
+                      _UpdateBanner(
+                        versionCode: _updateAvailableVersionCode!,
+                        onTap: _startUpdate,
+                      ),
+                      const SizedBox(height: 12),
                     ],
                     if (_lastError != null) ...[
                       const SizedBox(height: 12),
@@ -560,6 +593,45 @@ class _Row extends StatelessWidget {
             style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
           ),
         ],
+      ),
+    );
+  }
+}
+
+class _UpdateBanner extends StatelessWidget {
+  final int versionCode;
+  final VoidCallback onTap;
+  const _UpdateBanner({required this.versionCode, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: Colors.green[50],
+      borderRadius: BorderRadius.circular(8),
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(8),
+        child: Container(
+          width: double.infinity,
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(color: Colors.green[300]!),
+          ),
+          child: Row(
+            children: [
+              const Icon(Icons.system_update, color: Colors.green, size: 18),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  'Update available (build $versionCode) — tap to update',
+                  style: const TextStyle(color: Colors.green, fontSize: 13),
+                ),
+              ),
+              const Icon(Icons.chevron_right, color: Colors.green, size: 18),
+            ],
+          ),
+        ),
       ),
     );
   }
