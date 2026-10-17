@@ -1017,9 +1017,27 @@ fn start_android_session(
                             payload: Bytes::new(),
                         };
                         alog_info!("Sending heartbeat ping seq={}", ping_sequence);
-                        if let Err(err) = transports[active_index].send(ping).await {
-                            alog_warn!("Heartbeat ping send failed: {}", err);
-                        } else {
+                        // Ping EVERY path, not just the active one: the
+                        // server closes any transport it receives nothing
+                        // on for 30s, so an active-path-only heartbeat lets
+                        // every idle path be torn down and re-dialed in a
+                        // loop, leaving the session single-path in practice.
+                        let mut any_sent = false;
+                        for (path_index, transport) in transports.iter_mut().enumerate() {
+                            match transport.send(ping.clone()).await {
+                                Ok(()) => {
+                                    any_sent = true;
+                                }
+                                Err(err) => {
+                                    alog_warn!(
+                                        "Heartbeat ping send failed on path {}: {}",
+                                        path_index,
+                                        err
+                                    );
+                                }
+                            }
+                        }
+                        if any_sent {
                             last_ping_sent_ms = Some(now_ms);
                             ping_sequence = ping_sequence.wrapping_add(1);
                         }

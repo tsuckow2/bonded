@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -618,8 +618,49 @@ fn resolve_advertise_ip(
         .flat_map(|interface| interface.ips.iter())
         .map(|network| network.ip())
         .collect();
+    // Prefer an address on the same link as one of the client's server
+    // paths. Interface enumeration order is arbitrary, and on Android it
+    // includes the VPN's own tunnel interface — whose address is not a
+    // LAN address a peer can dial (and is identical on every client), so
+    // first-bindable-wins can advertise the tunnel address and make the
+    // provider unreachable. A candidate sharing a /24 with a configured
+    // path bind address is on the link the client actually uses.
+    if let Some(ip) = prefer_path_subnet_candidate(&candidates, &config.client.path_bind_addresses)
+    {
+        return Ok(ip);
+    }
     select_advertise_ip(&candidates).ok_or_else(|| {
         anyhow::anyhow!("failed to determine a non-loopback peer-share advertise IP")
+    })
+}
+
+/// Pick the first bindable IPv4 candidate that shares its /24 with one of
+/// the configured path bind addresses (the local addresses of the
+/// client's server transports). Returns None when no candidate matches,
+/// leaving default selection to apply.
+fn prefer_path_subnet_candidate(candidates: &[IpAddr], bind_addresses: &[String]) -> Option<IpAddr> {
+    let bind_ips: Vec<Ipv4Addr> = bind_addresses
+        .iter()
+        .filter_map(|raw| raw.trim().parse::<IpAddr>().ok())
+        .filter_map(|ip| match ip {
+            IpAddr::V4(ip) => Some(ip),
+            IpAddr::V6(_) => None,
+        })
+        .collect();
+    if bind_ips.is_empty() {
+        return None;
+    }
+    candidates.iter().copied().find(|candidate| {
+        let IpAddr::V4(candidate_v4) = candidate else {
+            return false;
+        };
+        if !is_bindable_advertise_ip(candidate) {
+            return false;
+        }
+        let candidate_octets = candidate_v4.octets();
+        bind_ips
+            .iter()
+            .any(|bind_ip| candidate_octets[..3] == bind_ip.octets()[..3])
     })
 }
 
@@ -689,8 +730,8 @@ mod tests {
     use bonded_core::auth::verify_signature;
 
     use super::{
-        build_peer_introduction_request, resolve_advertise_ip, select_advertise_ip,
-        should_accept_discovered_peer,
+        build_peer_introduction_request, prefer_path_subnet_candidate, resolve_advertise_ip,
+        select_advertise_ip, should_accept_discovered_peer,
     };
     use bonded_core::auth::DeviceKeypair;
     use bonded_core::config::{ClientConfig, PeerShareMode};
@@ -764,6 +805,33 @@ mod tests {
         assert_eq!(ip, IpAddr::V4(Ipv4Addr::LOCALHOST));
     }
 
+    #[test]
+    fn advertise_ip_prefers_path_subnet_over_tunnel_address() {
+        // The Android failure mode: enumeration lists the VPN tunnel
+        // address (10.8.0.2, the same on every client) before the Wi-Fi
+        // address. The Wi-Fi address shares a /24 with the Wi-Fi path
+        // bind address and must win; otherwise the provider advertises
+        // an address no peer can dial.
+        let candidates = vec![
+            IpAddr::V4(Ipv4Addr::new(10, 8, 0, 2)),
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 140)),
+        ];
+        let binds = vec!["192.168.1.140".to_owned(), "192.0.0.4".to_owned()];
+        assert_eq!(
+            prefer_path_subnet_candidate(&candidates, &binds),
+            Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 140)))
+        );
+    }
+
+    #[test]
+    fn advertise_ip_path_subnet_no_match_without_binds() {
+        let candidates = vec![IpAddr::V4(Ipv4Addr::new(192, 168, 1, 140))];
+        assert_eq!(prefer_path_subnet_candidate(&candidates, &[]), None);
+        assert_eq!(
+            prefer_path_subnet_candidate(&candidates, &["203.0.113.9".to_owned()]),
+            None
+        );
+    }
     #[test]
     fn advertise_ip_skips_link_local_ipv6_for_lan_ipv4() {
         // The phone failure mode: enumeration lists a link-local IPv6
