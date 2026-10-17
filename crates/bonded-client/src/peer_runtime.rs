@@ -175,6 +175,19 @@ pub async fn start_peer_share_runtime(
                     let mut retry_delay = std::time::Duration::from_secs(1);
                     const MAX_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
                     loop {
+                        // The introduction is a short-lived credential only
+                        // the consumer can mint. Once it expires the server
+                        // rejects every re-registration, so retrying is
+                        // futile: abandon the relay instead. Dropping the
+                        // peer connection lets the consumer notice the loss
+                        // and mint a fresh introduction. (Observed
+                        // 2026-10-17: ~44 rejected re-registrations over
+                        // 15 minutes against one expired introduction.)
+                        if introduction_expired(&introduction) {
+                            anyhow::bail!(
+                                "peer relay introduction expired; abandoning relay so the consumer can re-introduce"
+                            );
+                        }
                         let mut upstreams = match establish_peer_upstream_paths(&relay_config).await {
                             Ok(u) => u,
                             Err(e) => {
@@ -486,6 +499,17 @@ fn bind_peer_listener_socket(
     Ok(socket)
 }
 
+/// Whether a signed peer-share introduction has passed its expiry
+/// (Unix epoch seconds, matching the server's issuance and the
+/// verification-side `ensure_not_expired` check).
+fn introduction_expired(introduction: &SignedPeerShareIntroduction) -> bool {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    introduction.introduction.expires_at <= now
+}
+
 fn peer_relay_bind_ip(config: &ClientConfig) -> anyhow::Result<Option<IpAddr>> {
     let bind_ip = config.client.peer_share_advertise_ip.trim();
     if bind_ip.is_empty() {
@@ -730,12 +754,12 @@ mod tests {
     use bonded_core::auth::verify_signature;
 
     use super::{
-        build_peer_introduction_request, prefer_path_subnet_candidate, resolve_advertise_ip,
-        select_advertise_ip, should_accept_discovered_peer,
+        build_peer_introduction_request, introduction_expired, prefer_path_subnet_candidate,
+        resolve_advertise_ip, select_advertise_ip, should_accept_discovered_peer,
     };
     use bonded_core::auth::DeviceKeypair;
     use bonded_core::config::{ClientConfig, PeerShareMode};
-    use bonded_core::peer_share::PeerShareAdvertisement;
+    use bonded_core::peer_share::{PeerShareAdvertisement, SignedPeerShareIntroduction};
     use pnet_datalink::NetworkInterface;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
@@ -765,6 +789,34 @@ mod tests {
             "server-a",
             "peer-a"
         ));
+    }
+
+    #[test]
+    fn introduction_expiry_gate() {
+        let claims = bonded_core::peer_share::PeerShareIntroductionClaims {
+            consumer_device_public_key: "consumer".to_owned(),
+            provider_device_public_key: "provider".to_owned(),
+            provider_instance_nonce: "nonce-1".to_owned(),
+            provider_endpoint: "192.168.1.20:54443".to_owned(),
+            listener_transport: "quic".to_owned(),
+            listener_cert_fingerprint: "sha256:abcd".to_owned(),
+            expires_at: 0,
+        };
+        let mut introduction = SignedPeerShareIntroduction {
+            introduction: claims,
+            server_signature: "signature".to_owned(),
+        };
+        // expires_at = 0 is long past: the provider must abandon the relay
+        // instead of re-registering with this introduction.
+        assert!(introduction_expired(&introduction));
+
+        let future = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time after epoch")
+            .as_secs()
+            + 300;
+        introduction.introduction.expires_at = future;
+        assert!(!introduction_expired(&introduction));
     }
 
     #[test]

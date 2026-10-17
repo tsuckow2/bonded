@@ -16,6 +16,11 @@ data class PairedServerRecord(
     val peerShareMaxConsumers: Int,
     val peerShareRelayBandwidthKbps: Long,
         val pairedAt: String,
+    // Last server address that DNS resolved successfully (host:port with an
+    // IP literal). Session restarts that happen while the TUN is up cannot
+    // resolve the hostname — DNS routes into the dead tunnel — so they fall
+    // back to this. Empty until the first successful resolution.
+    val lastResolvedAddress: String = "",
 ) {
     val serverPublicKey: String
     get() = serverIdentityPublicKey
@@ -83,6 +88,21 @@ object PairedServerStore {
         persist(context, records)
     }
 
+    fun updateLastResolvedAddress(context: Context, id: String, resolvedAddress: String) {
+        if (resolvedAddress.isBlank()) {
+            return
+        }
+        val records =
+            loadAll(context).map { record ->
+                if (record.id == id) {
+                    record.copy(lastResolvedAddress = resolvedAddress)
+                } else {
+                    record
+                }
+            }
+        persist(context, records)
+    }
+
     private fun persist(context: Context, records: List<PairedServerRecord>) {
         val array = JSONArray()
         records.forEach { record ->
@@ -98,7 +118,8 @@ object PairedServerStore {
                             .put("peerShareAdvertiseIp", record.peerShareAdvertiseIp)
                             .put("peerShareMaxConsumers", record.peerShareMaxConsumers)
                             .put("peerShareRelayBandwidthKbps", record.peerShareRelayBandwidthKbps)
-                            .put("pairedAt", record.pairedAt),
+                            .put("pairedAt", record.pairedAt)
+                            .put("lastResolvedAddress", record.lastResolvedAddress),
             )
         }
 
@@ -162,6 +183,7 @@ object PairedServerStore {
                             peerShareRelayBandwidthKbps =
                                 item.optLong("peerShareRelayBandwidthKbps", 0),
                                 pairedAt = item.optString("pairedAt", Instant.now().toString()),
+                            lastResolvedAddress = item.optString("lastResolvedAddress", ""),
                         ),
                 )
             }

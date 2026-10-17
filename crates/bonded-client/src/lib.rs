@@ -76,6 +76,18 @@ impl ClientTransport {
         }
     }
 
+    /// Whether this transport is a peer relay whose server-signed
+    /// introduction has expired (Unix epoch seconds). An expired relay
+    /// can never be re-registered by the provider, so once it stops
+    /// carrying traffic it is unrecoverable and should be retired in
+    /// favour of a fresh introduction.
+    pub fn peer_relay_expired(&self, now_secs: u64) -> bool {
+        match self {
+            ClientTransport::PeerRelay { expires_at, .. } => *expires_at <= now_secs,
+            _ => false,
+        }
+    }
+
     pub async fn send(&mut self, frame: bonded_core::session::SessionFrame) -> anyhow::Result<()> {
         match self {
             ClientTransport::NaiveTcp(inner) => inner.send(frame).await,

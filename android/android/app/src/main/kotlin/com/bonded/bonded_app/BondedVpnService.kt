@@ -129,6 +129,13 @@ class BondedVpnService : VpnService() {
         // can't connect to VPN server). Caching the resolved IP here breaks that cycle.
         cachedServerAddress = resolveServerAddressEarly(pairedServer.publicAddress)
         android.util.Log.i("BondedVPN", "Cached server address: $cachedServerAddress")
+        // Persist only genuine resolutions (an IP-literal result), never the
+        // hostname fallback, so TUN-up restarts can fall back to a dialable
+        // address via the record (see startNativeSession's precedence).
+        val freshResolution = cachedServerAddress
+        if (!freshResolution.isNullOrBlank() && freshResolution != pairedServer.publicAddress) {
+            PairedServerStore.updateLastResolvedAddress(this, pairedServer.id, freshResolution)
+        }
 
         sessionStartupInProgress = true
         val pathManager = ensureNetworkPathManager()
@@ -777,9 +784,23 @@ class BondedVpnService : VpnService() {
         }
 
         return try {
-            // Use the pre-resolved IP address if available so native code never needs to
+            // Use a pre-resolved IP address if available so native code never needs to
             // perform DNS resolution inside an active VPN (which would route through TUN).
-            val resolvedServerAddr = cachedServerAddress ?: server.publicAddress
+            // Precedence: this start's fresh early resolution; then the record's
+            // persisted last-good resolution (the only source available to restarts
+            // that run while the TUN is up — recovery, network rebind, debug starts —
+            // where DNS is unreachable); then the raw configured address.
+            // (2026-10-17: restarts that skipped early resolution handed the native
+            // worker the bare hostname with the TUN up; every protocol attempt then
+            // timed out and the session could never recover on its own.)
+            val freshCachedAddress = cachedServerAddress
+            val resolvedServerAddr =
+                    when {
+                        !freshCachedAddress.isNullOrBlank() &&
+                                freshCachedAddress != server.publicAddress -> freshCachedAddress
+                        server.lastResolvedAddress.isNotBlank() -> server.lastResolvedAddress
+                        else -> freshCachedAddress ?: server.publicAddress
+                    }
             val protocolCsv = server.supportedProtocols.joinToString(",")
             val bindAddressesJson = JSONArray(bindAddresses).toString()
             android.util.Log.i(
