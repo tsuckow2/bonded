@@ -88,6 +88,19 @@ impl ClientTransport {
         }
     }
 
+    /// Whether this transport is a peer relay whose QUIC connection to
+    /// the provider has closed. A non-active relay is never read by the
+    /// session loop, so without this check a dead provider leg goes
+    /// unnoticed until the introduction expires: sends keep succeeding
+    /// into the closed connection's buffers while the provider's
+    /// re-registered upstreams starve at the server.
+    pub fn peer_relay_connection_closed(&self) -> bool {
+        match self {
+            ClientTransport::PeerRelay { transport, .. } => transport.connection_closed(),
+            _ => false,
+        }
+    }
+
     pub async fn send(&mut self, frame: bonded_core::session::SessionFrame) -> anyhow::Result<()> {
         match self {
             ClientTransport::NaiveTcp(inner) => inner.send(frame).await,

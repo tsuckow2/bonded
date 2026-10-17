@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -36,6 +36,85 @@ pub struct PeerShareRuntime {
 pub type PeerShareEventLogger = Arc<dyn Fn(String) + Send + Sync>;
 
 const PEER_RUNTIME_RETRY_DELAY: Duration = Duration::from_secs(2);
+
+/// Delay before re-driving discovery for a peer whose relay path
+/// closed, using its last known advertisement. mDNS `ServiceResolved`
+/// fires once per service instance, so without a re-drive the browse
+/// loop would wait forever for an event that never comes.
+const PEER_REDISCOVERY_DELAY: Duration = Duration::from_secs(10);
+
+/// How many times a closed peer's cached advertisement is re-driven
+/// before giving up until a fresh mDNS resolution arrives. Bounds the
+/// introduction requests made for a peer that has actually left.
+const PEER_REDISCOVERY_MAX_ATTEMPTS: u8 = 3;
+
+/// The browse loop's identity for a discovered peer: device key plus
+/// the provider instance nonce from its advertisement.
+fn peer_share_peer_id(advertisement: &PeerShareAdvertisement) -> String {
+    format!(
+        "{}:{}",
+        advertisement.device_public_key, advertisement.instance_nonce
+    )
+}
+
+/// Bounded re-drive queue for peers whose relay path closed.
+///
+/// Holds the last advertisement seen for each closed peer and hands it
+/// back a limited number of times so the browse loop can mint a fresh
+/// introduction and re-dial without depending on another mDNS
+/// resolution event for the same service instance.
+#[derive(Default)]
+struct RedialQueue {
+    queue: VecDeque<PeerShareAdvertisement>,
+    queued: HashSet<String>,
+    attempts_left: HashMap<String, u8>,
+}
+
+impl RedialQueue {
+    /// Queue a closed peer for re-discovery. A peer that already has a
+    /// redial pending keeps that single pending entry; its attempt
+    /// budget is refreshed only once the previous cycle has finished.
+    fn enqueue(&mut self, advertisement: PeerShareAdvertisement) {
+        let peer_id = peer_share_peer_id(&advertisement);
+        if self.queued.contains(&peer_id) {
+            return;
+        }
+        self.attempts_left
+            .insert(peer_id.clone(), PEER_REDISCOVERY_MAX_ATTEMPTS);
+        self.queued.insert(peer_id);
+        self.queue.push_back(advertisement);
+    }
+
+    /// Take the next peer to re-drive, if any.
+    fn pop(&mut self) -> Option<PeerShareAdvertisement> {
+        let advertisement = self.queue.pop_front()?;
+        self.queued.remove(&peer_share_peer_id(&advertisement));
+        Some(advertisement)
+    }
+
+    /// Record a failed re-drive attempt for a peer: re-queue it while
+    /// it still has attempts left, otherwise drop it (a fresh mDNS
+    /// resolution or a later path close can enqueue it again).
+    fn requeue_failed(&mut self, advertisement: &PeerShareAdvertisement) {
+        let peer_id = peer_share_peer_id(advertisement);
+        let Some(attempts) = self.attempts_left.get_mut(&peer_id) else {
+            return;
+        };
+        *attempts = attempts.saturating_sub(1);
+        if *attempts == 0 {
+            self.attempts_left.remove(&peer_id);
+            return;
+        }
+        if self.queued.insert(peer_id) {
+            self.queue.push_back(advertisement.clone());
+        }
+    }
+
+    /// Forget a peer's attempt budget once it is connected again.
+    fn forget(&mut self, peer_id: &str) {
+        self.attempts_left.remove(peer_id);
+    }
+}
 
 impl Drop for PeerShareRuntime {
     fn drop(&mut self) {
@@ -263,27 +342,43 @@ pub async fn start_peer_share_runtime(
         let browser = browser.expect("consumer mode requires browser");
         Some(tokio::spawn(async move {
         let mut connected_peers = HashSet::new();
+        // Last advertisement seen per peer. mDNS resolves each service
+        // instance only once, so when a relay path closes, the cached
+        // advertisement is the only way to re-drive discovery for that
+        // peer without a runtime restart.
+        let mut last_seen: HashMap<String, PeerShareAdvertisement> = HashMap::new();
+        let mut redials = RedialQueue::default();
         loop {
-            let advertisement = tokio::select! {
-                Some(peer_id) = closed_peer_rx.recv() => {
-                    connected_peers.remove(&peer_id);
-                    info!(peer = %peer_id, "peer-share path closed; allowing rediscovery");
-                    emit_peer_share_event(
-                        browse_logger.as_ref(),
-                        format!("path closed for peer={peer_id}; allowing rediscovery"),
-                    );
-                    continue;
-                }
-                advertisement = browser.recv() => {
-                    match advertisement {
-                        Ok(advertisement) => advertisement,
-                        Err(err) => {
-                            warn!(error = %err, "peer-share browser stopped");
-                            emit_peer_share_event(
-                                browse_logger.as_ref(),
-                                format!("browser stopped: {err}"),
-                            );
-                            break;
+            let (advertisement, is_redial) = if let Some(advertisement) = redials.pop() {
+                // Space re-drives out so a flapping path cannot spin
+                // introduction requests.
+                sleep(PEER_REDISCOVERY_DELAY).await;
+                (advertisement, true)
+            } else {
+                tokio::select! {
+                    Some(peer_id) = closed_peer_rx.recv() => {
+                        connected_peers.remove(&peer_id);
+                        info!(peer = %peer_id, "peer-share path closed; allowing rediscovery");
+                        emit_peer_share_event(
+                            browse_logger.as_ref(),
+                            format!("path closed for peer={peer_id}; allowing rediscovery"),
+                        );
+                        if let Some(advertisement) = last_seen.get(&peer_id) {
+                            redials.enqueue(advertisement.clone());
+                        }
+                        continue;
+                    }
+                    advertisement = browser.recv() => {
+                        match advertisement {
+                            Ok(advertisement) => (advertisement, false),
+                            Err(err) => {
+                                warn!(error = %err, "peer-share browser stopped");
+                                emit_peer_share_event(
+                                    browse_logger.as_ref(),
+                                    format!("browser stopped: {err}"),
+                                );
+                                break;
+                            }
                         }
                     }
                 }
@@ -294,13 +389,11 @@ pub async fn start_peer_share_runtime(
                 continue;
             }
 
-            let peer_id = format!(
-                "{}:{}",
-                advertisement.device_public_key, advertisement.instance_nonce
-            );
+            let peer_id = peer_share_peer_id(&advertisement);
             if connected_peers.contains(&peer_id) {
                 continue;
             }
+            last_seen.insert(peer_id.clone(), advertisement.clone());
             info!(
                 peer = %peer_id,
                 endpoint = %advertisement.endpoint,
@@ -328,6 +421,9 @@ pub async fn start_peer_share_runtime(
                         browse_logger.as_ref(),
                         format!("introduction request failed for peer={peer_id}: {err}"),
                     );
+                    if is_redial {
+                        redials.requeue_failed(&advertisement);
+                    }
                     sleep(PEER_RUNTIME_RETRY_DELAY).await;
                     continue;
                 }
@@ -354,6 +450,9 @@ pub async fn start_peer_share_runtime(
                         browse_logger.as_ref(),
                         format!("relay dial failed for peer={peer_id}: {err}"),
                     );
+                    if is_redial {
+                        redials.requeue_failed(&advertisement);
+                    }
                     sleep(PEER_RUNTIME_RETRY_DELAY).await;
                     continue;
                 }
@@ -375,6 +474,7 @@ pub async fn start_peer_share_runtime(
             {
                 break;
             }
+            redials.forget(&peer_id);
             connected_peers.insert(peer_id);
         }
         }))
@@ -754,8 +854,9 @@ mod tests {
     use bonded_core::auth::verify_signature;
 
     use super::{
-        build_peer_introduction_request, introduction_expired, prefer_path_subnet_candidate,
-        resolve_advertise_ip, select_advertise_ip, should_accept_discovered_peer,
+        build_peer_introduction_request, introduction_expired, peer_share_peer_id,
+        prefer_path_subnet_candidate, resolve_advertise_ip, select_advertise_ip,
+        should_accept_discovered_peer, RedialQueue, PEER_REDISCOVERY_MAX_ATTEMPTS,
     };
     use bonded_core::auth::DeviceKeypair;
     use bonded_core::config::{ClientConfig, PeerShareMode};
@@ -789,6 +890,59 @@ mod tests {
             "server-a",
             "peer-a"
         ));
+    }
+
+    fn sample_advertisement(nonce: &str) -> PeerShareAdvertisement {
+        PeerShareAdvertisement {
+            version: 1,
+            device_public_key: "peer-a".to_owned(),
+            server_public_key: "server-a".to_owned(),
+            instance_nonce: nonce.to_owned(),
+            endpoint: "192.168.1.20:54443".to_owned(),
+            listener_cert_fingerprint: "sha256:abcd".to_owned(),
+            capabilities: vec!["relay".to_owned(), "quic".to_owned()],
+        }
+    }
+
+    #[test]
+    fn redial_queue_dedupes_pending_peer() {
+        let mut queue = RedialQueue::default();
+        let advertisement = sample_advertisement("nonce-1");
+        queue.enqueue(advertisement.clone());
+        queue.enqueue(advertisement.clone());
+        assert_eq!(queue.pop(), Some(advertisement));
+        assert_eq!(queue.pop(), None);
+    }
+
+    #[test]
+    fn redial_queue_exhausts_attempts_then_allows_fresh_enqueue() {
+        let mut queue = RedialQueue::default();
+        let advertisement = sample_advertisement("nonce-1");
+        queue.enqueue(advertisement.clone());
+        // Each pop + failure consumes one attempt; after
+        // PEER_REDISCOVERY_MAX_ATTEMPTS failures nothing is re-queued.
+        for _ in 0..PEER_REDISCOVERY_MAX_ATTEMPTS {
+            let popped = queue.pop().expect("a redial should be pending");
+            queue.requeue_failed(&popped);
+        }
+        assert_eq!(queue.pop(), None);
+        // A later path close can still start a fresh cycle.
+        queue.enqueue(advertisement.clone());
+        assert_eq!(queue.pop(), Some(advertisement));
+    }
+
+    #[test]
+    fn redial_queue_forget_clears_attempt_budget() {
+        let mut queue = RedialQueue::default();
+        let advertisement = sample_advertisement("nonce-1");
+        let peer_id = peer_share_peer_id(&advertisement);
+        queue.enqueue(advertisement.clone());
+        let popped = queue.pop().expect("a redial should be pending");
+        queue.forget(&peer_id);
+        // Requeueing after forget is a no-op: the peer connected again,
+        // so its stale attempt budget must not resurrect a redial.
+        queue.requeue_failed(&popped);
+        assert_eq!(queue.pop(), None);
     }
 
     #[test]

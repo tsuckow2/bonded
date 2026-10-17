@@ -48,12 +48,29 @@ object ProtocolStressTester {
             logE: (String, Throwable?) -> Unit,
     ) {
         val rounds = config.rounds.coerceIn(1, 25)
-        val engine =
+        val engineBuilder =
                 CronetEngine.Builder(context.applicationContext)
                         .enableHttp2(true)
                         .enableQuic(true)
                         .enableBrotli(true)
-                        .build()
+        // Without a QUIC hint, a cold Cronet engine can only learn that
+        // the host supports QUIC from an Alt-Svc advertisement on a
+        // first HTTP/2 response — so the first rounds of every run fell
+        // back to h2 and failed the protocol check even though the
+        // fetch itself succeeded (the "unreliable" early-round http3
+        // failures; the engine is rebuilt per run, so the penalty was
+        // paid on every invocation). The hint makes QUIC eligible from
+        // the very first request.
+        val http3Target = try {
+            URL(config.http3Url)
+        } catch (_: Exception) {
+            null
+        }
+        if (http3Target != null && http3Target.protocol.equals("https", ignoreCase = true)) {
+            val port = if (http3Target.port >= 0) http3Target.port else 443
+            engineBuilder.addQuicHint(http3Target.host, port, port)
+        }
+        val engine = engineBuilder.build()
         val executor = Executors.newFixedThreadPool(min(8, max(4, rounds * 2)))
         val successCounts =
                 linkedMapOf(
@@ -74,6 +91,17 @@ object ProtocolStressTester {
             logI(
                     "Starting protocol stress test: rounds=$rounds dnsHost=${config.dnsHost} resolver=${config.dnsResolver} http=${config.httpUrl} https=${config.httpsUrl} http3=${config.http3Url}"
             )
+            // Unscored warm-up: lets the engine finish QUIC discovery
+            // (Alt-Svc / session state) before the scored rounds, so
+            // they measure steady-state HTTP/3 transport rather than
+            // cold-start protocol fallback. A warm-up failure does not
+            // fail the run — the scored rounds still execute.
+            try {
+                val warmupDetail = runHttp3Query(engine, config.http3Url, requireHttp3 = false)
+                logI("HTTP/3 warm-up completed | $warmupDetail")
+            } catch (e: Exception) {
+                logW("HTTP/3 warm-up failed; scored rounds will still run: ${e.message}")
+            }
             repeat(rounds) { index ->
                 val round = index + 1
                 val roundStart = System.currentTimeMillis()
@@ -195,7 +223,11 @@ object ProtocolStressTester {
         }
     }
 
-    private fun runHttp3Query(engine: CronetEngine, urlString: String): String {
+    private fun runHttp3Query(
+            engine: CronetEngine,
+            urlString: String,
+            requireHttp3: Boolean = true,
+    ): String {
         val completed = CountDownLatch(1)
         val protocolRef = AtomicReference<String>()
         val statusRef = AtomicReference<Int>()
@@ -266,7 +298,8 @@ object ProtocolStressTester {
 
             val elapsedMs = System.currentTimeMillis() - startMs
             val protocol = protocolRef.get().orEmpty()
-            if (!protocol.contains("h3", ignoreCase = true) &&
+            if (requireHttp3 &&
+                            !protocol.contains("h3", ignoreCase = true) &&
                             !protocol.contains("quic", ignoreCase = true)
             ) {
                 throw IllegalStateException(

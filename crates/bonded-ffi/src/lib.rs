@@ -1041,19 +1041,22 @@ fn start_android_session(
                             last_ping_sent_ms = Some(now_ms);
                             ping_sequence = ping_sequence.wrapping_add(1);
                         }
-                        // Retire expired peer-relay transports that are not
-                        // carrying traffic. The worker only recv()s the
-                        // active path, so a relay whose provider-side
-                        // upstream died is never noticed here: its QUIC leg
-                        // stays healthy and heartbeat sends keep succeeding
-                        // into the provider's buffers. But once the relay's
-                        // introduction has expired the provider can never
-                        // re-register it, so the path is unrecoverable.
-                        // Closing it fires the relay's close notifier,
-                        // which lets the peer runtime un-mark the peer and
-                        // mint a fresh introduction on the next
-                        // advertisement. (Observed 2026-10-17: a dead relay
-                        // lingered ~15 minutes and blocked rediscovery.)
+                        // Retire peer-relay transports that are not
+                        // carrying traffic and can no longer recover: the
+                        // relay's introduction has expired (the provider
+                        // can never re-register it), or its QUIC
+                        // connection to the provider has closed. The
+                        // worker only recv()s the active path, so neither
+                        // condition surfaces here on its own — sends keep
+                        // succeeding into a dead connection's buffers
+                        // while the provider's re-registered upstreams
+                        // starve at the server. Closing the transport
+                        // fires the relay's close notifier, which lets
+                        // the peer runtime un-mark the peer and
+                        // re-discover it. (Observed 2026-10-17: an expired
+                        // dead relay lingered ~15 minutes overnight; a
+                        // closed-leg relay churned provider upstreams
+                        // every 30 s until its introduction expired.)
                         let now_secs = now_ms / 1000;
                         let mut retired_any = false;
                         let mut index = transports.len();
@@ -1062,7 +1065,10 @@ fn start_android_session(
                             if index == active_index {
                                 continue;
                             }
-                            if !transports[index].peer_relay_expired(now_secs) {
+                            let expired = transports[index].peer_relay_expired(now_secs);
+                            let connection_closed =
+                                transports[index].peer_relay_connection_closed();
+                            if !expired && !connection_closed {
                                 continue;
                             }
                             let mut expired_transport = transports.remove(index);
@@ -1070,8 +1076,10 @@ fn start_android_session(
                                 active_index -= 1;
                             }
                             alog_info!(
-                                "Worker: retiring expired peer-relay transport (was index {})",
-                                index
+                                "Worker: retiring peer-relay transport (was index {}, expired={}, connection_closed={})",
+                                index,
+                                expired,
+                                connection_closed
                             );
                             let _ = tokio::time::timeout(
                                 ANDROID_TRANSPORT_CLOSE_TIMEOUT,

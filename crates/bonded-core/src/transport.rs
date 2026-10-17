@@ -415,6 +415,13 @@ impl QuicTransport {
         })
     }
 
+    /// Whether the underlying QUIC connection has closed (locally, by
+    /// the peer, or by error). Lets owners of a transport that is not
+    /// actively being read notice a dead connection without a recv.
+    pub fn connection_closed(&self) -> bool {
+        self._connection.close_reason().is_some()
+    }
+
     /// Send a UTF-8 text line terminated with `\n` over the QUIC stream.
     /// Used during the auth handshake before the session frame protocol starts.
     pub async fn send_text(&mut self, text: &str) -> anyhow::Result<()> {
