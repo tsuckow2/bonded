@@ -16,7 +16,8 @@ class DashboardScreen extends StatefulWidget {
   State<DashboardScreen> createState() => _DashboardScreenState();
 }
 
-class _DashboardScreenState extends State<DashboardScreen> {
+class _DashboardScreenState extends State<DashboardScreen>
+    with WidgetsBindingObserver {
   static const MethodChannel _channel = MethodChannel('bonded/native');
 
   String _vpnStatus = 'Unknown';
@@ -37,20 +38,41 @@ class _DashboardScreenState extends State<DashboardScreen> {
   String? _lastError;
   String? _peerShareError;
   int? _updateAvailableVersionCode;
+  DateTime? _lastUpdateCheckAt;
   PairedServer? _pairedServer;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _loadPairedServer();
     _refreshStatus();
     _checkForUpdate();
     _listenToBackgroundEvents();
   }
 
+  /// Re-check for a Play update when the app returns to the foreground.
+  /// The initState check alone misses updates published while the app
+  /// process stays alive — which is the norm, since the VPN foreground
+  /// service keeps the process (and this dashboard) around for days
+  /// (2026-10-18: build 142 never surfaced in-app for exactly this
+  /// reason). Throttled so foregrounding the app doesn't spam Play.
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state != AppLifecycleState.resumed) {
+      return;
+    }
+    final last = _lastUpdateCheckAt;
+    if (last != null && DateTime.now().difference(last).inMinutes < 30) {
+      return;
+    }
+    _checkForUpdate();
+  }
+
   /// Ask the native side whether Play has a newer build for this install.
   /// Best-effort: on any failure (sideload, no Play Store) nothing shows.
   Future<void> _checkForUpdate() async {
+    _lastUpdateCheckAt = DateTime.now();
     try {
       final result = await _channel.invokeMapMethod<String, dynamic>(
         'checkAppUpdate',
@@ -235,6 +257,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _backgroundEventsSubscription?.cancel();
     super.dispose();
   }
