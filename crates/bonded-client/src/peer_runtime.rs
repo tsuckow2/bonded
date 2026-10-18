@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use bonded_core::auth::{create_auth_challenge, sign_bytes, DeviceKeypair};
@@ -113,6 +113,141 @@ impl RedialQueue {
     /// Forget a peer's attempt budget once it is connected again.
     fn forget(&mut self, peer_id: &str) {
         self.attempts_left.remove(peer_id);
+    }
+}
+
+/// How long before a relay's introduction expires the consumer dials
+/// its replacement leg (make-before-break renewal). Introductions live
+/// 300 s; renewing 60 s early leaves room for one retry while the old
+/// leg is still bound, so a healthy relay no longer drops to zero for
+/// the rediscovery gap every five minutes (observed live 2026-10-18:
+/// legs died at 301 s / 303 s / on expiry, re-forming 11–60 s later).
+const PEER_RELAY_RENEWAL_LEAD_SECS: u64 = 60;
+
+/// Delay for the single renewal retry after a failed renewal dial.
+const PEER_RELAY_RENEWAL_RETRY_DELAY: Duration = Duration::from_secs(30);
+
+/// A renewal is only worth retrying while the current leg still has
+/// comfortably more than the retry delay left before expiry.
+const PEER_RELAY_RENEWAL_RETRY_MIN_REMAINING_SECS: u64 =
+    PEER_RELAY_RENEWAL_RETRY_DELAY.as_secs() + 5;
+
+/// Floor for the renewal delay so a nearly-expired introduction still
+/// renews promptly instead of waiting for the expiry backstop.
+const PEER_RELAY_RENEWAL_MIN_DELAY: Duration = Duration::from_secs(5);
+
+fn now_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+/// Delay from `now_secs` until a relay whose introduction expires at
+/// `expires_at` should be renewed.
+fn renewal_delay(expires_at: u64, now_secs: u64) -> Duration {
+    let renew_at = expires_at.saturating_sub(PEER_RELAY_RENEWAL_LEAD_SECS);
+    Duration::from_secs(renew_at.saturating_sub(now_secs)).max(PEER_RELAY_RENEWAL_MIN_DELAY)
+}
+
+/// Fire a renewal notice for one peer after `delay`. The notice carries
+/// the dial generation it was scheduled for; the browse loop ignores
+/// notices whose generation a newer dial has superseded.
+fn spawn_renewal_notice(
+    renewal_tx: &tokio::sync::mpsc::UnboundedSender<(String, u64)>,
+    peer_id: String,
+    generation: u64,
+    delay: Duration,
+) {
+    let renewal_tx = renewal_tx.clone();
+    tokio::spawn(async move {
+        sleep(delay).await;
+        let _ = renewal_tx.send((peer_id, generation));
+    });
+}
+
+/// Live relay legs per discovered peer, with the renewal bookkeeping.
+///
+/// A peer can briefly hold two legs (the renewal overlap), so
+/// "connected" is a count, not a flag: discovery is only re-driven
+/// when the LAST leg closes. The generation identifies the newest
+/// dial; renewal notices scheduled by superseded dials are stale.
+#[derive(Default)]
+struct PeerLegTracker {
+    legs: HashMap<String, usize>,
+    generations: HashMap<String, u64>,
+    expires_at: HashMap<String, u64>,
+}
+
+impl PeerLegTracker {
+    fn is_connected(&self, peer_id: &str) -> bool {
+        self.legs.get(peer_id).copied().unwrap_or(0) > 0
+    }
+
+    fn leg_count(&self, peer_id: &str) -> usize {
+        self.legs.get(peer_id).copied().unwrap_or(0)
+    }
+
+    /// Record a freshly dialed leg; returns its renewal generation.
+    fn note_dial(&mut self, peer_id: &str, expires_at: u64) -> u64 {
+        *self.legs.entry(peer_id.to_owned()).or_default() += 1;
+        self.expires_at.insert(peer_id.to_owned(), expires_at);
+        let generation = self.generations.entry(peer_id.to_owned()).or_default();
+        *generation += 1;
+        *generation
+    }
+
+    /// Record a closed leg. Returns true when the peer has no legs
+    /// left (or was never tracked), i.e. discovery should be re-driven.
+    fn note_close(&mut self, peer_id: &str) -> bool {
+        match self.legs.get_mut(peer_id) {
+            Some(count) => {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    self.legs.remove(peer_id);
+                    true
+                } else {
+                    false
+                }
+            }
+            None => true,
+        }
+    }
+
+    fn is_current_generation(&self, peer_id: &str, generation: u64) -> bool {
+        self.generations.get(peer_id).copied() == Some(generation)
+    }
+
+    fn current_generation(&self, peer_id: &str) -> Option<u64> {
+        self.generations.get(peer_id).copied()
+    }
+
+    fn current_expires_at(&self, peer_id: &str) -> Option<u64> {
+        self.expires_at.get(peer_id).copied()
+    }
+}
+
+/// After a failed renewal dial, schedule one retry notice while the
+/// current leg still has enough life left for the retry to land before
+/// expiry. Otherwise the expiry + redial machinery is the backstop.
+fn schedule_renewal_retry(
+    legs: &PeerLegTracker,
+    renewal_tx: &tokio::sync::mpsc::UnboundedSender<(String, u64)>,
+    peer_id: &str,
+) {
+    let (Some(expires_at), Some(generation)) = (
+        legs.current_expires_at(peer_id),
+        legs.current_generation(peer_id),
+    ) else {
+        return;
+    };
+    if expires_at.saturating_sub(now_unix_secs()) > PEER_RELAY_RENEWAL_RETRY_MIN_REMAINING_SECS {
+        spawn_renewal_notice(
+            renewal_tx,
+            peer_id.to_owned(),
+            generation,
+            PEER_RELAY_RENEWAL_RETRY_DELAY,
+        );
     }
 }
 
@@ -339,9 +474,11 @@ pub async fn start_peer_share_runtime(
         let browse_bind_ip = peer_relay_bind_ip(config)?;
         let browse_logger = event_logger.clone();
         let (closed_peer_tx, mut closed_peer_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (renewal_tx, mut renewal_rx) =
+            tokio::sync::mpsc::unbounded_channel::<(String, u64)>();
         let browser = browser.expect("consumer mode requires browser");
         Some(tokio::spawn(async move {
-        let mut connected_peers = HashSet::new();
+        let mut legs = PeerLegTracker::default();
         // Last advertisement seen per peer. mDNS resolves each service
         // instance only once, so when a relay path closes, the cached
         // advertisement is the only way to re-drive discovery for that
@@ -349,28 +486,55 @@ pub async fn start_peer_share_runtime(
         let mut last_seen: HashMap<String, PeerShareAdvertisement> = HashMap::new();
         let mut redials = RedialQueue::default();
         loop {
-            let (advertisement, is_redial) = if let Some(advertisement) = redials.pop() {
+            let (advertisement, is_redial, is_renewal) = if let Some(advertisement) = redials.pop() {
                 // Space re-drives out so a flapping path cannot spin
                 // introduction requests.
                 sleep(PEER_REDISCOVERY_DELAY).await;
-                (advertisement, true)
+                (advertisement, true, false)
             } else {
                 tokio::select! {
                     Some(peer_id) = closed_peer_rx.recv() => {
-                        connected_peers.remove(&peer_id);
-                        info!(peer = %peer_id, "peer-share path closed; allowing rediscovery");
-                        emit_peer_share_event(
-                            browse_logger.as_ref(),
-                            format!("path closed for peer={peer_id}; allowing rediscovery"),
-                        );
-                        if let Some(advertisement) = last_seen.get(&peer_id) {
-                            redials.enqueue(advertisement.clone());
+                        if legs.note_close(&peer_id) {
+                            info!(peer = %peer_id, "peer-share path closed; allowing rediscovery");
+                            emit_peer_share_event(
+                                browse_logger.as_ref(),
+                                format!("path closed for peer={peer_id}; allowing rediscovery"),
+                            );
+                            if let Some(advertisement) = last_seen.get(&peer_id) {
+                                redials.enqueue(advertisement.clone());
+                            }
+                        } else {
+                            info!(
+                                peer = %peer_id,
+                                remaining = legs.leg_count(&peer_id),
+                                "peer-share relay leg closed; peer still connected"
+                            );
                         }
                         continue;
                     }
+                    Some((peer_id, generation)) = renewal_rx.recv() => {
+                        // Make-before-break renewal: dial the replacement
+                        // leg while the current one is still bound.
+                        if !legs.is_connected(&peer_id)
+                            || !legs.is_current_generation(&peer_id, generation)
+                        {
+                            continue;
+                        }
+                        match last_seen.get(&peer_id) {
+                            Some(advertisement) => {
+                                info!(peer = %peer_id, "peer-share relay renewal due");
+                                emit_peer_share_event(
+                                    browse_logger.as_ref(),
+                                    format!("relay renewal due for peer={peer_id}"),
+                                );
+                                (advertisement.clone(), false, true)
+                            }
+                            None => continue,
+                        }
+                    }
                     advertisement = browser.recv() => {
                         match advertisement {
-                            Ok(advertisement) => (advertisement, false),
+                            Ok(advertisement) => (advertisement, false, false),
                             Err(err) => {
                                 warn!(error = %err, "peer-share browser stopped");
                                 emit_peer_share_event(
@@ -390,7 +554,7 @@ pub async fn start_peer_share_runtime(
             }
 
             let peer_id = peer_share_peer_id(&advertisement);
-            if connected_peers.contains(&peer_id) {
+            if !is_renewal && legs.is_connected(&peer_id) {
                 continue;
             }
             last_seen.insert(peer_id.clone(), advertisement.clone());
@@ -424,6 +588,9 @@ pub async fn start_peer_share_runtime(
                     if is_redial {
                         redials.requeue_failed(&advertisement);
                     }
+                    if is_renewal {
+                        schedule_renewal_retry(&legs, &renewal_tx, &peer_id);
+                    }
                     sleep(PEER_RUNTIME_RETRY_DELAY).await;
                     continue;
                 }
@@ -453,6 +620,9 @@ pub async fn start_peer_share_runtime(
                     if is_redial {
                         redials.requeue_failed(&advertisement);
                     }
+                    if is_renewal {
+                        schedule_renewal_retry(&legs, &renewal_tx, &peer_id);
+                    }
                     sleep(PEER_RUNTIME_RETRY_DELAY).await;
                     continue;
                 }
@@ -475,7 +645,19 @@ pub async fn start_peer_share_runtime(
                 break;
             }
             redials.forget(&peer_id);
-            connected_peers.insert(peer_id);
+            let generation = legs.note_dial(&peer_id, relay_expires_at);
+            spawn_renewal_notice(
+                &renewal_tx,
+                peer_id.clone(),
+                generation,
+                renewal_delay(relay_expires_at, now_unix_secs()),
+            );
+            if is_renewal {
+                emit_peer_share_event(
+                    browse_logger.as_ref(),
+                    format!("relay renewed for peer={peer_id}"),
+                );
+            }
         }
         }))
     } else {
@@ -855,14 +1037,78 @@ mod tests {
 
     use super::{
         build_peer_introduction_request, introduction_expired, peer_share_peer_id,
-        prefer_path_subnet_candidate, resolve_advertise_ip, select_advertise_ip,
-        should_accept_discovered_peer, RedialQueue, PEER_REDISCOVERY_MAX_ATTEMPTS,
+        prefer_path_subnet_candidate, renewal_delay, resolve_advertise_ip,
+        select_advertise_ip, should_accept_discovered_peer, PeerLegTracker, RedialQueue,
+        PEER_REDISCOVERY_MAX_ATTEMPTS, PEER_RELAY_RENEWAL_LEAD_SECS,
+        PEER_RELAY_RENEWAL_MIN_DELAY,
     };
     use bonded_core::auth::DeviceKeypair;
     use bonded_core::config::{ClientConfig, PeerShareMode};
     use bonded_core::peer_share::{PeerShareAdvertisement, SignedPeerShareIntroduction};
     use pnet_datalink::NetworkInterface;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    #[test]
+    fn leg_tracker_counts_overlapping_legs_per_peer() {
+        let mut tracker = PeerLegTracker::default();
+        assert!(!tracker.is_connected("peer-a"));
+
+        // First dial: connected with one leg; rediscovery signal only
+        // fires when the LAST leg closes.
+        tracker.note_dial("peer-a", 1_000);
+        assert!(tracker.is_connected("peer-a"));
+        assert_eq!(tracker.leg_count("peer-a"), 1);
+
+        // Renewal overlap: a second leg for the same peer.
+        tracker.note_dial("peer-a", 1_240);
+        assert_eq!(tracker.leg_count("peer-a"), 2);
+        assert!(!tracker.note_close("peer-a"));
+        assert!(tracker.is_connected("peer-a"));
+
+        // Last leg closing signals rediscovery.
+        assert!(tracker.note_close("peer-a"));
+        assert!(!tracker.is_connected("peer-a"));
+
+        // A close for an unknown peer still signals rediscovery (the
+        // pre-tracker behaviour for late close notices).
+        assert!(tracker.note_close("peer-never-seen"));
+    }
+
+    #[test]
+    fn leg_tracker_generations_invalidate_stale_renewal_notices() {
+        let mut tracker = PeerLegTracker::default();
+        let first = tracker.note_dial("peer-a", 1_000);
+        assert!(tracker.is_current_generation("peer-a", first));
+        assert_eq!(tracker.current_expires_at("peer-a"), Some(1_000));
+
+        // A renewal dial supersedes the first dial's schedule.
+        let second = tracker.note_dial("peer-a", 1_240);
+        assert_ne!(first, second);
+        assert!(!tracker.is_current_generation("peer-a", first));
+        assert!(tracker.is_current_generation("peer-a", second));
+        assert_eq!(tracker.current_generation("peer-a"), Some(second));
+        assert_eq!(tracker.current_expires_at("peer-a"), Some(1_240));
+    }
+
+    #[test]
+    fn renewal_delay_fires_one_lead_before_expiry() {
+        let now = 10_000;
+        let expires_at = now + 300;
+        assert_eq!(
+            renewal_delay(expires_at, now),
+            std::time::Duration::from_secs(300 - PEER_RELAY_RENEWAL_LEAD_SECS)
+        );
+        // Inside the lead window the floor applies, so renewal is
+        // attempted promptly instead of after expiry.
+        assert_eq!(
+            renewal_delay(now + 30, now),
+            PEER_RELAY_RENEWAL_MIN_DELAY
+        );
+        assert_eq!(
+            renewal_delay(now - 5, now),
+            PEER_RELAY_RENEWAL_MIN_DELAY
+        );
+    }
 
     #[test]
     fn discovered_peers_ignore_self_and_other_servers() {

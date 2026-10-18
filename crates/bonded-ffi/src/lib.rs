@@ -491,10 +491,22 @@ fn sync_transport_snapshot(
         .map(client_transport_kind)
         .unwrap_or("Unknown")
         .to_owned();
-    let peer_relay_count = transports
-        .iter()
-        .filter(|transport| matches!(transport, ClientTransport::PeerRelay { .. }))
-        .count() as u32;
+    // Count distinct peers, not legs: during a renewal overlap one peer
+    // briefly holds two legs, which must not read as two relays.
+    let peer_relay_count = {
+        let mut peer_ids = std::collections::HashSet::new();
+        let mut unscoped = 0u32;
+        for transport in transports {
+            if let ClientTransport::PeerRelay { peer_id, .. } = transport {
+                if peer_id.is_empty() {
+                    unscoped += 1;
+                } else {
+                    peer_ids.insert(peer_id.as_str());
+                }
+            }
+        }
+        peer_ids.len() as u32 + unscoped
+    };
     update_snapshot(snapshot, |session_snapshot| {
         session_snapshot.active_transport = active_transport;
         session_snapshot.transport_count = transports.len() as u32;
