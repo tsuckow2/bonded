@@ -366,38 +366,60 @@ class BondedVpnService : VpnService() {
 
         if (!nativeTunFdWriteAvailable) {
             // Fallback path: keep legacy inbound polling if native fd handoff fails.
-            inboundDrainThread =
-                    thread(name = "bonded-vpn-inbound", start = true) {
-                        val output = FileOutputStream(pfd.fileDescriptor)
-                        try {
-                            while (packetIoRunning) {
-                                val inbound = pollInboundPacket()
-                                if (inbound == null || inbound.isEmpty()) {
-                                    // If nothing was available, sleep briefly to avoid busy-spinning.
-                                    Thread.sleep(INBOUND_IDLE_SLEEP_MS)
-                                    continue
-                                }
+            startInboundDrainThreadIfNeeded(pfd)
+        }
+    }
 
-                                output.write(inbound)
-                                output.flush()
+    private fun startInboundDrainThreadIfNeeded(pfd: ParcelFileDescriptor) {
+        if (inboundDrainThread?.isAlive == true) {
+            return
+        }
+        inboundDrainThread =
+                thread(name = "bonded-vpn-inbound", start = true) {
+                    val output = FileOutputStream(pfd.fileDescriptor)
+                    try {
+                        while (packetIoRunning) {
+                            val inbound = pollInboundPacket()
+                            if (inbound == null || inbound.isEmpty()) {
+                                // If nothing was available, sleep briefly to avoid busy-spinning.
+                                Thread.sleep(INBOUND_IDLE_SLEEP_MS)
+                                continue
                             }
-                        } catch (_: InterruptedException) {
-                            // Normal shutdown signal.
-                        } catch (e: Exception) {
-                            android.util.Log.e(
-                                    "BondedVPN",
-                                    "VPN inbound drain exception: ${e.message}",
-                                    e
-                            )
-                            if (packetIoRunning) {
-                                emitEvent("error", "VPN inbound drain stopped: ${e.message}")
-                            }
-                        } finally {
-                            try {
-                                output.close()
-                            } catch (_: Exception) {}
+
+                            output.write(inbound)
+                            output.flush()
                         }
+                    } catch (_: InterruptedException) {
+                        // Normal shutdown signal.
+                    } catch (e: Exception) {
+                        android.util.Log.e(
+                                "BondedVPN",
+                                "VPN inbound drain exception: ${e.message}",
+                                e
+                        )
+                        if (packetIoRunning) {
+                            emitEvent("error", "VPN inbound drain stopped: ${e.message}")
+                        }
+                    } finally {
+                        try {
+                            output.close()
+                        } catch (_: Exception) {}
                     }
+                }
+    }
+
+    // Re-run the TUN-fd handoff after a native session restart (session
+    // recovery or network rebind). The TUN belongs to this service and
+    // outlives individual native sessions; unless the fd is handed over
+    // again, a restarted worker cannot write inbound packets directly and
+    // they queue natively with nobody draining them — the recovered
+    // session then looks connected but passes no downlink traffic
+    // (2026-10-18). If the handoff fails, fall back to the drain thread.
+    private fun rehandoffTunFdAfterSessionRestart() {
+        val pfd = vpnInterface ?: return
+        nativeTunFdWriteAvailable = configureNativeTunFd(pfd)
+        if (!nativeTunFdWriteAvailable) {
+            startInboundDrainThreadIfNeeded(pfd)
         }
     }
 
@@ -560,6 +582,7 @@ class BondedVpnService : VpnService() {
             stopNativeSession()
             val restarted = startNativeSession(server, pathCount, bindAddresses)
             if (restarted) {
+                rehandoffTunFdAfterSessionRestart()
                 emitEvent("session_status", "Native session recovered")
                 android.util.Log.i("BondedVPN", "Native session recovery succeeded")
             } else {
@@ -933,6 +956,7 @@ class BondedVpnService : VpnService() {
 
             stopNativeSession()
             if (startNativeSession(server, count, bindAddresses)) {
+                rehandoffTunFdAfterSessionRestart()
                 emitEvent(
                         "network_paths",
                         "Rebound VPN session across ${bindAddresses.size.coerceAtLeast(count)} network path(s); bindAddresses=${JSONArray(bindAddresses).toString()}, summaries=${JSONArray(pathSummaries).toString()}"

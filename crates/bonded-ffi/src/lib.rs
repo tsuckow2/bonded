@@ -535,10 +535,15 @@ fn stop_android_session() {
         }
     }
 
-    #[cfg(target_os = "android")]
-    {
-        let _ = set_android_tun_fd(-1);
-    }
+    // NOTE: the native TUN writer is deliberately NOT cleared here. It is
+    // service-lifetime state owned by the Kotlin side's explicit
+    // nativeSetTunFd calls (set when the packet-IO loop starts, cleared by
+    // stopPacketIoLoop on full VPN shutdown). Clearing it on every session
+    // stop wedged session recovery: a restarted session's worker found no
+    // TUN writer, queued every inbound frame, and the Kotlin side never
+    // drains that queue when the direct-write handoff had succeeded at
+    // startup — a healthy-looking session that passed no downlink traffic
+    // until a manual VPN toggle (2026-10-18).
 }
 
 #[cfg(any(target_os = "android", test))]
