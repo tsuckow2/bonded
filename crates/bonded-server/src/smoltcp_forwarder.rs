@@ -3011,6 +3011,383 @@ mod tests {
         assert_eq!(received_b, payload_b);
     }
 
+    // ── Churn / cross-talk harness ────────────────────────────────────────
+    //
+    // A real smoltcp client stack drives many flows through the forwarder
+    // the way a phone does after a reconnect: bursts of handshakes, a small
+    // pool of client ports reused across different destinations, flows
+    // aborted mid-flight, and ports reused immediately after close. Every
+    // server asserts that the request it received was addressed to it, and
+    // every client flow asserts its reply came from the intended server —
+    // any cross-flow mix fails the test. (Written after a production
+    // incident on 2026-10-18 where a phone received a different site's TLS
+    // certificate through the tunnel on the mapped-port forwarder build.)
+
+    const CHURN_MSG_LEN: usize = 40;
+
+    fn churn_request(flow_id: usize, dst_marker: u8) -> Vec<u8> {
+        let mut v = format!("FLOW{flow_id:03}->DST{dst_marker}").into_bytes();
+        v.resize(CHURN_MSG_LEN, b'.');
+        v
+    }
+
+    fn churn_reply(server_marker: u8, flow_id: usize) -> Vec<u8> {
+        let mut v = format!("ACK{server_marker}<-FLOW{flow_id:03}").into_bytes();
+        v.resize(CHURN_MSG_LEN, b'.');
+        v
+    }
+
+    /// Spawn an echo-check server on (ip, port) that verifies each request's
+    /// destination marker matches its own and records violations.
+    fn spawn_churn_server(
+        listener: std::net::TcpListener,
+        marker: u8,
+        violations: Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        listener
+            .set_nonblocking(true)
+            .expect("set nonblocking for accept loop");
+        tokio::spawn(async move {
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let violations = violations.clone();
+                        tokio::task::spawn_blocking(move || {
+                            use std::io::{Read, Write};
+                            let _ = stream.set_nonblocking(false);
+                            let _ = stream.set_read_timeout(Some(Duration::from_secs(20)));
+                            let mut buf = vec![0u8; CHURN_MSG_LEN];
+                            if stream.read_exact(&mut buf).is_err() {
+                                return;
+                            }
+                            let text = String::from_utf8_lossy(&buf).to_string();
+                            let addressed = text
+                                .split("->DST")
+                                .nth(1)
+                                .and_then(|rest| rest.trim_end_matches('.').parse::<u8>().ok());
+                            let flow_id = text
+                                .strip_prefix("FLOW")
+                                .and_then(|rest| rest[..3].parse::<usize>().ok())
+                                .unwrap_or(usize::MAX);
+                            if addressed != Some(marker) {
+                                violations.lock().expect("violations lock").push(format!(
+                                    "server DST{marker} received request addressed to {addressed:?}: {text}"
+                                ));
+                                return;
+                            }
+                            let reply = churn_reply(marker, flow_id);
+                            let _ = stream.write_all(&reply);
+                            // Behave like a real server: the forwarder does
+                            // not propagate a client FIN to the real stream,
+                            // so waiting for client EOF would deadlock.
+                            // Drain briefly, then close — the close is what
+                            // tears the flow down.
+                            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                            let mut sink = [0u8; 256];
+                            loop {
+                                match stream.read(&mut sink) {
+                                    Ok(0) => break,
+                                    Ok(_) => {}
+                                    Err(_) => break,
+                                }
+                            }
+                        });
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+
+    struct ChurnClient {
+        iface: Interface,
+        device: RingDevice,
+        sockets: SocketSet<'static>,
+    }
+
+    impl ChurnClient {
+        fn new() -> Self {
+            let tx_ring: Rc<RefCell<VecDeque<Vec<u8>>>> =
+                Rc::new(RefCell::new(VecDeque::new()));
+            let mut device = RingDevice {
+                rx: VecDeque::new(),
+                tx: tx_ring,
+            };
+            let config = Config::new(HardwareAddress::Ip);
+            let mut iface = Interface::new(config, &mut device, smoltcp_now());
+            iface.update_ip_addrs(|addrs| {
+                addrs
+                    .push(IpCidr::new(IpAddress::Ipv4(Ipv4Address([10, 8, 0, 2])), 8))
+                    .ok();
+            });
+            iface
+                .routes_mut()
+                .add_default_ipv4_route(Ipv4Address([10, 200, 0, 1]))
+                .ok();
+            Self {
+                iface,
+                device,
+                sockets: SocketSet::new(vec![]),
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum ChurnFlowEnd {
+        Graceful,
+        AbortAfterEstablish,
+        AbortAfterData,
+    }
+
+    struct ChurnFlow {
+        handle: SocketHandle,
+        dst_ip: Ipv4Addr,
+        dst_marker: u8,
+        flow_id: usize,
+        end: ChurnFlowEnd,
+        sent: bool,
+        received: Vec<u8>,
+        established: bool,
+        done: bool,
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn smoltcp_forwarder_churn_no_cross_talk() {
+        let ip1 = Ipv4Addr::new(127, 0, 0, 1);
+        let ip2 = Ipv4Addr::new(127, 0, 0, 2);
+        let ip3 = Ipv4Addr::new(127, 0, 0, 3);
+
+        let listener1 = std::net::TcpListener::bind((ip1, 0)).expect("bind server 1");
+        let port = listener1.local_addr().expect("server 1 addr").port();
+        let listener2 = std::net::TcpListener::bind((ip2, port)).expect("bind server 2");
+        let listener3 = std::net::TcpListener::bind((ip3, port)).expect("bind server 3");
+
+        let violations: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        spawn_churn_server(listener1, 1, violations.clone());
+        spawn_churn_server(listener2, 2, violations.clone());
+        spawn_churn_server(listener3, 3, violations.clone());
+
+        let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<SessionFrame>();
+        let forwarder = SmoltcpForwarder::new(44, outbound_tx, Arc::new(AtomicU64::new(0)));
+        let client_ip = Ipv4Addr::new(10, 8, 0, 2);
+        let mut client = ChurnClient::new();
+        let mut frame_seq = 0u64;
+
+        let mut pump = |client: &mut ChurnClient,
+                        forwarder: &SmoltcpForwarder,
+                        outbound_rx: &mut mpsc::UnboundedReceiver<SessionFrame>,
+                        frame_seq: &mut u64| {
+            while let Ok(frame) = outbound_rx.try_recv() {
+                client.device.rx.push_back(frame.payload.to_vec());
+            }
+            client
+                .iface
+                .poll(smoltcp_now(), &mut client.device, &mut client.sockets);
+            while let Some(pkt) = client.device.tx.borrow_mut().pop_front() {
+                *frame_seq += 1;
+                forwarder.ingest_packet(SessionFrame {
+                    header: SessionHeader {
+                        connection_id: 1,
+                        sequence: *frame_seq,
+                        flags: 0,
+                    },
+                    payload: pkt.into(),
+                });
+            }
+        };
+
+        let dsts = [(ip1, 1u8), (ip2, 2u8), (ip3, 3u8)];
+        // Small client-port pool, cycled: the same port is used toward
+        // different destinations concurrently — the production trigger.
+        let port_pool = [41000u16, 41001, 41002, 41003];
+        let mut flows: Vec<ChurnFlow> = Vec::new();
+        let mut next_flow_id = 0usize;
+
+        let mut start_flow =
+            |client: &mut ChurnClient, dst_ip: Ipv4Addr, marker: u8, client_port: u16, end: ChurnFlowEnd, flows: &mut Vec<ChurnFlow>| {
+                let rx_buf = stcp::SocketBuffer::new(vec![0u8; 8192]);
+                let tx_buf = stcp::SocketBuffer::new(vec![0u8; 8192]);
+                let mut socket = stcp::Socket::new(rx_buf, tx_buf);
+                let cx = client.iface.context();
+                socket
+                    .connect(
+                        cx,
+                        (Ipv4Address::from(dst_ip), port),
+                        client_port,
+                    )
+                    .expect("client connect should start");
+                let handle = client.sockets.add(socket);
+                flows.push(ChurnFlow {
+                    handle,
+                    dst_ip,
+                    dst_marker: marker,
+                    flow_id: next_flow_id,
+                    end,
+                    sent: false,
+                    received: Vec::new(),
+                    established: false,
+                    done: false,
+                });
+                next_flow_id += 1;
+            };
+
+        // Phase 1: burst of 12 flows, handshakes interleaved.
+        for i in 0..12 {
+            let (dst_ip, marker) = dsts[i % 3];
+            start_flow(
+                &mut client,
+                dst_ip,
+                marker,
+                port_pool[i % 4],
+                ChurnFlowEnd::Graceful,
+                &mut flows,
+            );
+        }
+
+        // Phase 2 is driven from the main loop: as burst flows finish, run
+        // churn iterations reusing one fixed port across destinations,
+        // mixing graceful closes and aborts.
+        let mut churn_iter = 0usize;
+        let mut phase2_ready_at: Option<std::time::Instant> = None;
+        const CHURN_ITERS: usize = 12;
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(90);
+        loop {
+            pump(&mut client, &forwarder, &mut outbound_rx, &mut frame_seq);
+
+            let mut all_done = true;
+            let mut remove_handles: Vec<SocketHandle> = Vec::new();
+            for flow in flows.iter_mut() {
+                if flow.done {
+                    continue;
+                }
+                all_done = false;
+                let socket = client.sockets.get_mut::<stcp::Socket>(flow.handle);
+                match socket.state() {
+                    stcp::State::Established => {
+                        flow.established = true;
+                        if flow.end == ChurnFlowEnd::AbortAfterEstablish && !flow.sent {
+                            socket.abort();
+                            flow.done = true;
+                            remove_handles.push(flow.handle);
+                            continue;
+                        }
+                        if !flow.sent {
+                            let req = churn_request(flow.flow_id, flow.dst_marker);
+                            if socket.can_send() {
+                                let n = socket.send_slice(&req).expect("client send");
+                                assert_eq!(n, req.len());
+                                flow.sent = true;
+                                if flow.end == ChurnFlowEnd::AbortAfterData {
+                                    socket.abort();
+                                    flow.done = true;
+                                    remove_handles.push(flow.handle);
+                                    continue;
+                                }
+                            }
+                        }
+                        if socket.can_recv() {
+                            let _ = socket.recv(|data| {
+                                flow.received.extend_from_slice(data);
+                                (data.len(), ())
+                            });
+                        }
+                        if flow.received.len() >= CHURN_MSG_LEN {
+                            let expected = churn_reply(flow.dst_marker, flow.flow_id);
+                            assert_eq!(
+                                &flow.received[..CHURN_MSG_LEN],
+                                &expected[..],
+                                "flow {} to DST{} received another flow's reply",
+                                flow.flow_id,
+                                flow.dst_marker
+                            );
+                            // Graceful close. Note the forwarder never
+                            // notifies the client when it tears a flow down
+                            // (smoltcp abort() sends no RST), so this socket
+                            // would sit in FinWait2 forever — having the full
+                            // reply and having issued close() is completion.
+                            socket.close();
+                            flow.done = true;
+                            remove_handles.push(flow.handle);
+                        }
+                    }
+                    stcp::State::Closed => {
+                        assert!(
+                            flow.established || flow.end == ChurnFlowEnd::AbortAfterEstablish,
+                            "flow {} to DST{} closed before establishing",
+                            flow.flow_id, flow.dst_marker
+                        );
+                        flow.done = true;
+                        remove_handles.push(flow.handle);
+                    }
+                    _ => {}
+                }
+            }
+            for handle in remove_handles {
+                client.sockets.remove(handle);
+            }
+
+            if all_done && churn_iter >= CHURN_ITERS {
+                break;
+            }
+            // Before the first churn iteration, let the burst flows' server-
+            // side teardown land (server drain is 2s, then the bridge death
+            // reaps the flow) so a reused tuple starts from a clean slate,
+            // as it would on a real client after TIME_WAIT.
+            if all_done && churn_iter == 0 && phase2_ready_at.is_none() {
+                phase2_ready_at = Some(std::time::Instant::now() + Duration::from_millis(3500));
+            }
+            let phase2_ready = phase2_ready_at
+                .map(|t| std::time::Instant::now() >= t)
+                .unwrap_or(false);
+            if all_done && churn_iter < CHURN_ITERS && (churn_iter > 0 || phase2_ready) {
+                // Launch the next churn iteration: cycle one client port
+                // across all three destinations before moving to the next
+                // port — the corpse pattern (a port reused toward a
+                // different destination right after its previous flow died).
+                // (port, dst) pairs never repeat within the phase.
+                let (dst_ip, marker) = dsts[churn_iter % 3];
+                let client_port = port_pool[churn_iter / 3];
+                let end = match churn_iter % 3 {
+                    0 => ChurnFlowEnd::Graceful,
+                    1 => ChurnFlowEnd::AbortAfterEstablish,
+                    _ => ChurnFlowEnd::AbortAfterData,
+                };
+                start_flow(&mut client, dst_ip, marker, client_port, end, &mut flows);
+                churn_iter += 1;
+            }
+
+            if std::time::Instant::now() >= deadline {
+                let states: Vec<String> = flows
+                    .iter()
+                    .map(|f| {
+                        let st = client
+                            .sockets
+                            .get::<stcp::Socket>(f.handle)
+                            .state();
+                        format!(
+                            "#{} dst{} sent={} est={} done={} recv={} state={:?}",
+                            f.flow_id, f.dst_marker, f.sent, f.established, f.done,
+                            f.received.len(), st
+                        )
+                    })
+                    .collect();
+                panic!("churn test timed out; flows: {}", states.join(", "));
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+
+        // Abort-ended flows never read a reply; give their server handlers a
+        // moment to observe whatever arrived, then check for violations.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let v = violations.lock().expect("violations lock");
+        assert!(v.is_empty(), "cross-talk violations: {v:?}");
+    }
+
     // ── SessionOutboundRouter failover tests ──────────────────────────────
 
     fn test_frame(seq: u64) -> SessionFrame {
