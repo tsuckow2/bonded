@@ -752,7 +752,7 @@ fn start_android_session(
             // it receives after authentication (resolve_session_binding)
             // and answers the ping with a PONG carrying the authoritative
             // session id, which the frame state below adopts. Without this
-            // exchange the session sent nothing until the 25s heartbeat,
+            // exchange the session sent nothing until the heartbeat,
             // and any teardown inside that window (e.g. the pre-129
             // peer-share failure path) closed the transports before the
             // server ever saw a frame — the server logged "failed to
@@ -834,7 +834,19 @@ fn start_android_session(
             let mut session = SessionState::new(session_id);
             let mut ping_sequence = 0u64;
             let mut last_ping_sent_ms: Option<u64> = None;
-            let mut heartbeat = tokio::time::interval(Duration::from_secs(25));
+            // Consecutive heartbeat ping failures per direct standby
+            // transport index. Indices are only stable while the
+            // transport set keeps its size, so the map is cleared
+            // whenever the count changes (checked each tick).
+            let mut standby_ping_failures: std::collections::HashMap<usize, u8> =
+                std::collections::HashMap::new();
+            let mut last_transport_count = transports.len();
+            // 10 s, not 25: the server reaps any transport it receives
+            // nothing on for 30 s, so a 25 s cadence leaves only 5 s of
+            // slack and a single doze/scheduler stall kills every idle
+            // standby path (measured 2026-10-18: median direct-transport
+            // lifetime 276 s in production logs).
+            let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
             heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             // Consume the immediate first tick so the first ping fires after 25s, not instantly.
             heartbeat.tick().await;
@@ -1039,11 +1051,16 @@ fn start_android_session(
                         // on for 30s, so an active-path-only heartbeat lets
                         // every idle path be torn down and re-dialed in a
                         // loop, leaving the session single-path in practice.
+                        if transports.len() != last_transport_count {
+                            standby_ping_failures.clear();
+                            last_transport_count = transports.len();
+                        }
                         let mut any_sent = false;
                         for (path_index, transport) in transports.iter_mut().enumerate() {
                             match transport.send(ping.clone()).await {
                                 Ok(()) => {
                                     any_sent = true;
+                                    standby_ping_failures.remove(&path_index);
                                 }
                                 Err(err) => {
                                     alog_warn!(
@@ -1051,6 +1068,20 @@ fn start_android_session(
                                         path_index,
                                         err
                                     );
+                                    // Standby direct paths only: the
+                                    // active path's failures drive
+                                    // failover directly, and peer relays
+                                    // have their own retirement below.
+                                    if path_index != active_index
+                                        && !matches!(
+                                            transport,
+                                            ClientTransport::PeerRelay { .. }
+                                        )
+                                    {
+                                        *standby_ping_failures
+                                            .entry(path_index)
+                                            .or_default() += 1;
+                                    }
                                 }
                             }
                         }
@@ -1085,19 +1116,41 @@ fn start_android_session(
                             let expired = transports[index].peer_relay_expired(now_secs);
                             let connection_closed =
                                 transports[index].peer_relay_connection_closed();
-                            if !expired && !connection_closed {
+                            // A direct standby whose heartbeat ping has
+                            // failed on two consecutive ticks is dead:
+                            // evict it so the snapshot stops counting it
+                            // and failover never promotes a corpse. (The
+                            // server reaps silently and nothing re-dials
+                            // a direct path mid-session, so an un-evicted
+                            // zombie otherwise lingers indefinitely.)
+                            let standby_dead = !matches!(
+                                transports[index],
+                                ClientTransport::PeerRelay { .. }
+                            ) && standby_ping_failures
+                                .get(&index)
+                                .copied()
+                                .unwrap_or(0)
+                                >= 2;
+                            if !expired && !connection_closed && !standby_dead {
                                 continue;
                             }
                             let mut expired_transport = transports.remove(index);
                             if index < active_index {
                                 active_index -= 1;
                             }
-                            alog_info!(
-                                "Worker: retiring peer-relay transport (was index {}, expired={}, connection_closed={})",
-                                index,
-                                expired,
-                                connection_closed
-                            );
+                            if standby_dead && !expired && !connection_closed {
+                                alog_warn!(
+                                    "Worker: retiring dead standby transport (was index {}, consecutive ping failures)",
+                                    index
+                                );
+                            } else {
+                                alog_info!(
+                                    "Worker: retiring peer-relay transport (was index {}, expired={}, connection_closed={})",
+                                    index,
+                                    expired,
+                                    connection_closed
+                                );
+                            }
                             let _ = tokio::time::timeout(
                                 ANDROID_TRANSPORT_CLOSE_TIMEOUT,
                                 expired_transport.close(),
