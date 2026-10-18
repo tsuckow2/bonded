@@ -6,10 +6,12 @@
 //! TCP (via smoltcp)
 //! ─────────────────
 //! Client raw-IPv4 packets arrive via `SmoltcpForwarder::ingest_packet()`.
-//! Before feeding them to smoltcp the destination IP is rewritten from the
-//! real internet address (e.g. 93.184.216.34) to the virtual NIC address
-//! (SMOLTCP_IP = 10.200.0.1) so smoltcp accepts the traffic. A reverse
-//! rewrite restores the original source IP in packets smoltcp emits.
+//! Before feeding them to smoltcp the destination is NAT-rewritten to the
+//! virtual NIC: the destination IP becomes SMOLTCP_IP (10.200.0.1) and the
+//! destination port becomes a unique per-flow mapped port (see
+//! `TcpFlowMap`), so every proxied flow owns a distinct smoltcp identity
+//! keyed by its full 4-tuple. A reverse rewrite restores the original
+//! source IP and port in packets smoltcp emits.
 //!
 //! smoltcp runs a TCP state machine on a dedicated OS thread (non-Tokio so its
 //! synchronous poll() never blocks async tasks). Established connections are
@@ -60,6 +62,15 @@ const TCP_SOCKET_RX_BUF: usize = 65536;
 const TCP_SOCKET_TX_BUF: usize = 65536;
 const TCP_BRIDGE_DUMP_MAX_MB_ENV: &str = "BONDED_TCP_BRIDGE_DUMP_MAX_MB";
 const TCP_BRIDGE_DUMP_PATH: &str = "/var/lib/bonded/tcp_bridge_dump.bin";
+/// Per-flow smoltcp-side mapped ports are allocated from the ephemeral
+/// range. Each proxied TCP flow owns exactly one mapped port for its whole
+/// life; the port returns to the pool when the flow is torn down.
+const MAPPED_PORT_FIRST: u32 = 49152;
+const MAPPED_PORT_LAST: u32 = 65535;
+/// A pending (not yet established) smoltcp flow is torn down when it has
+/// not established within this window, so a half-open flow whose handshake
+/// silently vanished cannot squat on its mapped port and flow record.
+const PENDING_CONN_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[repr(u8)]
 enum TcpBridgeDumpDirection {
@@ -313,6 +324,9 @@ pub struct SmoltcpForwarder {
     /// Active UDP flows keyed by (src_ip, src_port, dst_ip, dst_port).
     /// Shared with per-flow Tokio tasks so sockets are reused across packets.
     udp_flow_map: Arc<TokioMutex<HashMap<UdpFlowKey, UdpFlowHandle>>>,
+    /// Live TCP flow mappings (full tuple → smoltcp-side mapped port).
+    /// Shared with the smoltcp poll thread, which frees entries as flows die.
+    tcp_flows: SharedTcpFlowMap,
     /// Outbound channel so UDP/ICMP handlers can send frames directly.
     outbound_tx: mpsc::UnboundedSender<SessionFrame>,
     session_id: u64,
@@ -457,11 +471,13 @@ impl SmoltcpForwarder {
         let icmp_tracker = IcmpSessionTracker::default();
 
         let (cmd_tx, cmd_rx) = std::sync::mpsc::sync_channel::<PollCommand>(8192);
+        let tcp_flows: SharedTcpFlowMap = Arc::new(Mutex::new(TcpFlowMap::default()));
 
         let work_thread = work.clone();
         let tcp_stats_thread = tcp_stats.clone();
         let outbound_thread = outbound_tx.clone();
         let seq_thread = outbound_seq.clone();
+        let tcp_flows_thread = tcp_flows.clone();
         let tokio_handle = tokio::runtime::Handle::current();
 
         std::thread::Builder::new()
@@ -475,6 +491,7 @@ impl SmoltcpForwarder {
                     seq_thread,
                     tokio_handle,
                     tcp_stats_thread,
+                    tcp_flows_thread,
                 );
             })
             .expect("smoltcp poll thread should spawn");
@@ -486,6 +503,7 @@ impl SmoltcpForwarder {
             udp_tracker,
             icmp_tracker,
             udp_flow_map: Arc::new(TokioMutex::new(HashMap::new())),
+            tcp_flows,
             outbound_tx,
             session_id,
             ingested_packets: AtomicU64::new(0),
@@ -573,32 +591,90 @@ impl SmoltcpForwarder {
     fn dispatch_tcp(&self, frame: SessionFrame) {
         let payload = frame.payload.as_ref();
 
-        // Detect SYN to pre-create the smoltcp listening socket.
-        let is_syn =
-            if let Some((src_ip, src_port, dst_ip, dst_port, is_syn)) = parse_tcp_header(payload) {
-                if is_syn {
-                    let _ = self.cmd_tx.try_send(PollCommand::CreateTcpSocket {
-                        listen_port: dst_port,
-                        original_dst_ip: dst_ip,
-                        client_src_ip: src_ip,
-                        client_src_port: src_port,
-                    });
-                }
-                is_syn
-            } else {
-                false
-            };
-        let _ = is_syn; // suppress unused warning
+        let Some((src_ip, src_port, dst_ip, dst_port, is_syn)) = parse_tcp_header(payload)
+        else {
+            // Not a parseable TCP packet: keep the historical behavior of
+            // rewriting only the destination IP and letting smoltcp
+            // disposition it.
+            if let Some(rewritten) = rewrite_dst_ip_inbound(payload) {
+                self.inject_tcp_packet(rewritten);
+            }
+            return;
+        };
 
-        // Rewrite dst_ip → SMOLTCP_IP (no checksum fix needed; smoltcp configured
-        // to skip Rx checksum verification).
-        if let Some(rewritten) = rewrite_dst_ip_inbound(payload) {
-            let _ = self.cmd_tx.try_send(PollCommand::InjectPacket(rewritten));
-            let (lock, cvar) = &*self.work;
-            let mut flag = lock.lock().expect("work lock should not be poisoned");
-            *flag = true;
-            cvar.notify_one();
+        let key = TcpFlowKey {
+            client_src_ip: src_ip,
+            client_src_port: src_port,
+            dst_ip,
+            dst_port,
+        };
+
+        // Resolve (or, for a SYN, allocate) the flow's smoltcp-side mapped
+        // port. A retransmitted SYN for a live flow reuses its mapping and
+        // must NOT create a second smoltcp socket.
+        let mut create_mapped_port = None;
+        let mapped_port = {
+            let mut flows = self
+                .tcp_flows
+                .lock()
+                .expect("tcp flow map lock should not be poisoned");
+            if let Some(&existing) = flows.by_tuple.get(&key) {
+                Some(existing)
+            } else if is_syn {
+                match flows.allocate() {
+                    Some(mapped) => {
+                        flows.by_tuple.insert(key, mapped);
+                        create_mapped_port = Some(mapped);
+                        Some(mapped)
+                    }
+                    None => None,
+                }
+            } else {
+                None
+            }
+        };
+
+        if let Some(mapped) = create_mapped_port {
+            // Pre-create the smoltcp socket listening on the mapped port
+            // BEFORE injecting the SYN (same command channel, FIFO).
+            let _ = self.cmd_tx.try_send(PollCommand::CreateTcpSocket {
+                mapped_port: mapped,
+                original_dst_ip: dst_ip,
+                dst_port,
+                client_src_ip: src_ip,
+                client_src_port: src_port,
+            });
         }
+
+        match mapped_port {
+            Some(mapped) => {
+                // Rewrite dst_ip → SMOLTCP_IP and dst_port → the flow's
+                // mapped port (no TCP checksum fix needed; smoltcp is
+                // configured to skip Rx checksum verification).
+                if let Some(rewritten) = rewrite_dst_inbound(payload, mapped) {
+                    self.inject_tcp_packet(rewritten);
+                }
+            }
+            None => {
+                // No live flow for this packet (non-SYN for an unknown or
+                // already-torn-down flow, or the mapped-port pool is
+                // exhausted): preserve the historical behavior — rewrite
+                // only the destination IP and let smoltcp disposition it.
+                if let Some(rewritten) = rewrite_dst_ip_inbound(payload) {
+                    self.inject_tcp_packet(rewritten);
+                }
+            }
+        }
+    }
+
+    /// Hand one (already rewritten) inbound packet to the smoltcp poll
+    /// thread and wake it.
+    fn inject_tcp_packet(&self, pkt: Vec<u8>) {
+        let _ = self.cmd_tx.try_send(PollCommand::InjectPacket(pkt));
+        let (lock, cvar) = &*self.work;
+        let mut flag = lock.lock().expect("work lock should not be poisoned");
+        *flag = true;
+        cvar.notify_one();
     }
 
     // ── UDP dispatch ──────────────────────────────────────────────────────────
@@ -706,13 +782,73 @@ impl Device for RingDevice {
 
 // ── Poll thread commands ───────────────────────────────────────────────────────
 
+/// Full 4-tuple identifying one client TCP flow.
+///
+/// This is the ONLY key by which proxied TCP flows are identified. The
+/// forwarder previously keyed flows by the reduced tuple (client IP,
+/// client port, destination port) behind a single smoltcp identity with
+/// one listener per destination port; two flows sharing that reduced
+/// tuple with different destination IPs (ephemeral-port reuse plus a
+/// rotating destination — e.g. a speed test opening parallel flows to
+/// many CDN IPs on :443) collided, and every outbound packet for both
+/// was dropped as an "ambiguous tuple".
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct TcpFlowKey {
+    client_src_ip: Ipv4Addr,
+    client_src_port: u16,
+    dst_ip: Ipv4Addr,
+    dst_port: u16,
+}
+
+/// Live TCP flow mappings: full client tuple → unique smoltcp-side
+/// (mapped) port. Shared between the dispatch path — which allocates an
+/// entry on a flow's SYN and rewrites inbound packets to the mapped
+/// port — and the smoltcp poll thread, which frees the entry when the
+/// flow is torn down.
+#[derive(Default)]
+struct TcpFlowMap {
+    by_tuple: HashMap<TcpFlowKey, u16>,
+    next_port: u32,
+}
+
+impl TcpFlowMap {
+    /// Allocate a mapped port that no live flow is using.
+    fn allocate(&mut self) -> Option<u16> {
+        let span = MAPPED_PORT_LAST - MAPPED_PORT_FIRST + 1;
+        if self.by_tuple.len() >= span as usize {
+            return None;
+        }
+        let in_use: HashSet<u16> = self.by_tuple.values().copied().collect();
+        for i in 0..span {
+            let candidate = (MAPPED_PORT_FIRST + (self.next_port + i) % span) as u16;
+            if !in_use.contains(&candidate) {
+                self.next_port = (self.next_port + i + 1) % span;
+                return Some(candidate);
+            }
+        }
+        None
+    }
+}
+
+type SharedTcpFlowMap = Arc<Mutex<TcpFlowMap>>;
+
+/// Remove a flow's mapping (called by the poll thread as flows die).
+/// A poisoned lock must not take the poll thread down with it.
+fn free_tcp_flow(flows: &SharedTcpFlowMap, key: &TcpFlowKey) {
+    if let Ok(mut map) = flows.lock() {
+        map.by_tuple.remove(key);
+    }
+}
+
 enum PollCommand {
     /// Raw (inbound-rewritten) IPv4 packet to inject into smoltcp.
     InjectPacket(Vec<u8>),
-    /// Pre-create a TCP socket listening on `listen_port` before the SYN arrives.
+    /// Pre-create a TCP socket listening on the flow's unique mapped port
+    /// before the SYN arrives.
     CreateTcpSocket {
-        listen_port: u16,
+        mapped_port: u16,
         original_dst_ip: Ipv4Addr,
+        dst_port: u16,
         client_src_ip: Ipv4Addr,
         client_src_port: u16,
     },
@@ -722,13 +858,29 @@ enum PollCommand {
 
 struct PendingTcpConn {
     handle: SocketHandle,
+    /// Unique smoltcp-side port this flow's socket listens on.
+    mapped_port: u16,
     original_dst_ip: Ipv4Addr,
     dst_port: u16,
     client_src_ip: Ipv4Addr,
     client_src_port: u16,
+    created_at: Instant,
+}
+
+impl PendingTcpConn {
+    fn key(&self) -> TcpFlowKey {
+        TcpFlowKey {
+            client_src_ip: self.client_src_ip,
+            client_src_port: self.client_src_port,
+            dst_ip: self.original_dst_ip,
+            dst_port: self.dst_port,
+        }
+    }
 }
 
 struct ActiveTcpConn {
+    /// Unique smoltcp-side port this flow's socket is bound to.
+    mapped_port: u16,
     original_dst_ip: Ipv4Addr,
     dst_port: u16,
     client_src_ip: Ipv4Addr,
@@ -739,6 +891,17 @@ struct ActiveTcpConn {
     from_bridge: std::sync::mpsc::Receiver<Bytes>,
     /// Current bridge chunk that was only partially accepted by smoltcp.
     pending_from_bridge: Option<PendingBridgeBytes>,
+}
+
+impl ActiveTcpConn {
+    fn key(&self) -> TcpFlowKey {
+        TcpFlowKey {
+            client_src_ip: self.client_src_ip,
+            client_src_port: self.client_src_port,
+            dst_ip: self.original_dst_ip,
+            dst_port: self.dst_port,
+        }
+    }
 }
 
 struct PendingBridgeBytes {
@@ -782,6 +945,7 @@ fn smoltcp_poll_thread(
     outbound_seq: Arc<AtomicU64>,
     tokio_handle: tokio::runtime::Handle,
     tcp_stats: Arc<std::sync::RwLock<TcpStats>>,
+    tcp_flows: SharedTcpFlowMap,
 ) {
     let tx_ring: Rc<RefCell<VecDeque<Vec<u8>>>> = Rc::new(RefCell::new(VecDeque::new()));
     let mut device = RingDevice {
@@ -819,7 +983,6 @@ fn smoltcp_poll_thread(
     let mut inbound_tcp_rst_total: u64 = 0;
     let mut outbound_tcp_rst_total: u64 = 0;
     let mut outbound_tcp_rst_unmatched_total: u64 = 0;
-    let mut ambiguous_tcp_tuple_drop_total: u64 = 0;
     let mut last_rst_summary_bucket: u64 = 0;
     let tcp_bridge_dump = TcpBridgeDumpWriter::from_env();
     let mut next_poll_wait = Some(Duration::ZERO);
@@ -866,23 +1029,38 @@ fn smoltcp_poll_thread(
                     device.rx.push_back(pkt);
                 }
                 Ok(PollCommand::CreateTcpSocket {
-                    listen_port,
+                    mapped_port,
                     original_dst_ip,
+                    dst_port,
                     client_src_ip,
                     client_src_port,
                 }) => {
                     let rx_buf = stcp::SocketBuffer::new(vec![0u8; TCP_SOCKET_RX_BUF]);
                     let tx_buf = stcp::SocketBuffer::new(vec![0u8; TCP_SOCKET_TX_BUF]);
                     let mut socket = stcp::Socket::new(rx_buf, tx_buf);
-                    if socket.listen(listen_port).is_ok() {
+                    if socket.listen(mapped_port).is_ok() {
                         let handle = sockets.add(socket);
                         pending.push(PendingTcpConn {
                             handle,
+                            mapped_port,
                             original_dst_ip,
-                            dst_port: listen_port,
+                            dst_port,
                             client_src_ip,
                             client_src_port,
+                            created_at: Instant::now(),
                         });
+                    } else {
+                        // No socket will ever own this mapping; free it so
+                        // the port returns to the pool immediately.
+                        free_tcp_flow(
+                            &tcp_flows,
+                            &TcpFlowKey {
+                                client_src_ip,
+                                client_src_port,
+                                dst_ip: original_dst_ip,
+                                dst_port,
+                            },
+                        );
                     }
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
@@ -898,152 +1076,64 @@ fn smoltcp_poll_thread(
         iface.poll(ts, &mut device, &mut sockets);
         next_poll_wait = smoltcp_poll_wait_duration(&mut iface, &sockets, ts);
 
-        // ── Drain TX ring: rewrite src_ip and send to client ─────────────────
+        // ── Drain TX ring: rewrite src_ip/src_port and send to client ────────
         {
+            // Egress rewrite table: mapped (smoltcp-side) source port →
+            // (original destination IP, original destination port), built
+            // from both pending (e.g. SYN-ACKs) and active flows. Mapped
+            // ports are unique per flow, so this lookup is exact. The
+            // reduced-tuple scan this replaces could not distinguish two
+            // flows sharing (client port, dst port) across different
+            // destination IPs and dropped their packets as "ambiguous".
+            let mut egress: HashMap<u16, (Ipv4Addr, u16)> =
+                HashMap::with_capacity(active.len() + pending.len());
+            for c in active.values() {
+                egress.insert(c.mapped_port, (c.original_dst_ip, c.dst_port));
+            }
+            for p in &pending {
+                egress.insert(p.mapped_port, (p.original_dst_ip, p.dst_port));
+            }
+
             let mut tx_pkts = tx_ring.borrow_mut();
             while let Some(mut pkt) = tx_pkts.pop_front() {
-                // src_ip in smoltcp-generated packet = SMOLTCP_IP.
-                // Look up the original dst_ip for this flow.
+                // src_ip in smoltcp-generated packet = SMOLTCP_IP; src_port
+                // is the emitting flow's mapped port.
                 if pkt.len() < 20 || pkt[0] >> 4 != 4 {
                     continue;
                 }
                 let maybe_tcp_tuple_flags = parse_ipv4_tcp_tuple_flags(&pkt);
-                let smoltcp_dst_ip = Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]);
                 let smoltcp_src_port = if pkt.len() >= 22 {
                     u16::from_be_bytes([pkt[20], pkt[21]])
                 } else {
                     continue;
                 };
-                let smoltcp_dst_port = if pkt.len() >= 24 {
-                    u16::from_be_bytes([pkt[22], pkt[23]])
-                } else {
-                    continue;
-                };
 
-                // Find the original dst IP: match active conn by (dst_ip=client, dst_port=client_src_port, src_port=conn_port)
-                // smoltcp emits: src=SMOLTCP_IP:listen_port, dst=client_src_ip:client_src_port
-                let mut original_src_ip = None;
-                let mut active_tuple_ambiguous = false;
-                for c in active.values() {
-                    if c.client_src_ip == smoltcp_dst_ip
-                        && c.client_src_port == smoltcp_dst_port
-                        && c.dst_port == smoltcp_src_port
-                    {
-                        match original_src_ip {
-                            None => original_src_ip = Some(c.original_dst_ip),
-                            Some(existing) if existing == c.original_dst_ip => {}
-                            Some(_) => {
-                                active_tuple_ambiguous = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                if active_tuple_ambiguous {
-                    ambiguous_tcp_tuple_drop_total =
-                        ambiguous_tcp_tuple_drop_total.saturating_add(1);
-                    if ambiguous_tcp_tuple_drop_total <= 10
-                        || ambiguous_tcp_tuple_drop_total % 100 == 0
-                    {
-                        warn!(
-                            session_id,
-                            client_ip = %smoltcp_dst_ip,
-                            client_port = smoltcp_dst_port,
-                            server_port = smoltcp_src_port,
-                            ambiguous_tcp_tuple_drop_total,
-                            "dropping outbound packet for ambiguous active TCP tuple (possible cross-flow mix risk)"
-                        );
-                    }
-                    continue;
-                }
-
-                let Some(original_src) = original_src_ip else {
-                    // Could not find matching connection (e.g. SYN-ACK before
-                    // we moved to active).  Look in pending too.
-                    let mut original_src_pending = None;
-                    let mut pending_tuple_ambiguous = false;
-                    for p in &pending {
-                        if p.client_src_ip == smoltcp_dst_ip
-                            && p.client_src_port == smoltcp_dst_port
-                            && p.dst_port == smoltcp_src_port
-                        {
-                            match original_src_pending {
-                                None => original_src_pending = Some(p.original_dst_ip),
-                                Some(existing) if existing == p.original_dst_ip => {}
-                                Some(_) => {
-                                    pending_tuple_ambiguous = true;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-
-                    if pending_tuple_ambiguous {
-                        ambiguous_tcp_tuple_drop_total =
-                            ambiguous_tcp_tuple_drop_total.saturating_add(1);
-                        if ambiguous_tcp_tuple_drop_total <= 10
-                            || ambiguous_tcp_tuple_drop_total % 100 == 0
-                        {
-                            warn!(
-                                session_id,
-                                client_ip = %smoltcp_dst_ip,
-                                client_port = smoltcp_dst_port,
-                                server_port = smoltcp_src_port,
-                                ambiguous_tcp_tuple_drop_total,
-                                "dropping outbound packet for ambiguous pending TCP tuple (possible cross-flow mix risk)"
-                            );
-                        }
-                        continue;
-                    }
-
-                    let Some(original_src) = original_src_pending else {
-                        if let Some((src_ip, src_port, dst_ip, dst_port, flags)) =
-                            maybe_tcp_tuple_flags
-                        {
-                            if flags & 0x04 != 0 {
-                                outbound_tcp_rst_total = outbound_tcp_rst_total.saturating_add(1);
-                                outbound_tcp_rst_unmatched_total =
-                                    outbound_tcp_rst_unmatched_total.saturating_add(1);
-                                if outbound_tcp_rst_unmatched_total <= 10
-                                    || outbound_tcp_rst_unmatched_total % 100 == 0
-                                {
-                                    warn!(
-                                        session_id,
-                                        src = %format!("{}:{}", src_ip, src_port),
-                                        dst = %format!("{}:{}", dst_ip, dst_port),
-                                        outbound_tcp_rst_total,
-                                        outbound_tcp_rst_unmatched_total,
-                                        "dropping outbound TCP RST with no flow mapping"
-                                    );
-                                }
-                            }
-                        }
-                        continue;
-                    };
-                    if let Some((src_ip, src_port, dst_ip, dst_port, flags)) = maybe_tcp_tuple_flags
+                let Some(&(original_src, original_src_port)) = egress.get(&smoltcp_src_port)
+                else {
+                    // No live flow owns this packet (e.g. an RST smoltcp
+                    // generated for an unknown or already-torn-down flow):
+                    // keep the unmatched-RST accounting and drop it.
+                    if let Some((src_ip, src_port, dst_ip, dst_port, flags)) =
+                        maybe_tcp_tuple_flags
                     {
                         if flags & 0x04 != 0 {
                             outbound_tcp_rst_total = outbound_tcp_rst_total.saturating_add(1);
-                            debug!(
-                                session_id,
-                                src = %format!("{}:{}", src_ip, src_port),
-                                dst = %format!("{}:{}", dst_ip, dst_port),
-                                outbound_tcp_rst_total,
-                                "smoltcp forwarder emitted outbound TCP RST (pending flow mapping)"
-                            );
+                            outbound_tcp_rst_unmatched_total =
+                                outbound_tcp_rst_unmatched_total.saturating_add(1);
+                            if outbound_tcp_rst_unmatched_total <= 10
+                                || outbound_tcp_rst_unmatched_total % 100 == 0
+                            {
+                                warn!(
+                                    session_id,
+                                    src = %format!("{}:{}", src_ip, src_port),
+                                    dst = %format!("{}:{}", dst_ip, dst_port),
+                                    outbound_tcp_rst_total,
+                                    outbound_tcp_rst_unmatched_total,
+                                    "dropping outbound TCP RST with no flow mapping"
+                                );
+                            }
                         }
                     }
-                    rewrite_src_ip_outbound(&mut pkt, original_src);
-                    let frame = SessionFrame {
-                        header: SessionHeader {
-                            connection_id: session_id as u32,
-                            sequence: outbound_seq.fetch_add(1, Ordering::Relaxed),
-                            flags: 0,
-                        },
-                        payload: Bytes::from(pkt),
-                    };
-                    let _ = outbound_tx.send(frame);
                     continue;
                 };
 
@@ -1060,7 +1150,7 @@ fn smoltcp_poll_thread(
                     }
                 }
 
-                rewrite_src_ip_outbound(&mut pkt, original_src);
+                rewrite_src_outbound(&mut pkt, original_src, original_src_port);
                 let frame = SessionFrame {
                     header: SessionHeader {
                         connection_id: session_id as u32,
@@ -1088,25 +1178,10 @@ fn smoltcp_poll_thread(
         for &idx in newly_established.iter().rev() {
             let p = pending.remove(idx);
 
-            let tuple_conflict = active.values().any(|c| {
-                c.client_src_ip == p.client_src_ip
-                    && c.client_src_port == p.client_src_port
-                    && c.dst_port == p.dst_port
-                    && c.original_dst_ip != p.original_dst_ip
-            });
-            if tuple_conflict {
-                ambiguous_tcp_tuple_drop_total = ambiguous_tcp_tuple_drop_total.saturating_add(1);
-                warn!(
-                    session_id,
-                    client = %format!("{}:{}", p.client_src_ip, p.client_src_port),
-                    remote = %format!("{}:{}", p.original_dst_ip, p.dst_port),
-                    ambiguous_tcp_tuple_drop_total,
-                    "rejecting newly established ambiguous TCP tuple to avoid cross-flow data mix"
-                );
-                sockets.remove(p.handle);
-                promoted.remove(&p.handle);
-                continue;
-            }
+            // No tuple-conflict check is needed (or possible) here: the
+            // flow owns a unique mapped port, so it can never be confused
+            // with another flow — including one from the same client port
+            // to a different destination on the same destination port.
             promoted.insert(p.handle);
 
             let (to_bridge_tx, to_bridge_rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
@@ -1164,6 +1239,7 @@ fn smoltcp_poll_thread(
             active.insert(
                 p.handle,
                 ActiveTcpConn {
+                    mapped_port: p.mapped_port,
                     original_dst_ip: p.original_dst_ip,
                     dst_port: p.dst_port,
                     client_src_ip: p.client_src_ip,
@@ -1201,7 +1277,7 @@ fn smoltcp_poll_thread(
 
             // Data from bridge task (real server) → write into smoltcp socket.
             // `send_slice` can return partial progress; preserve unsent tails.
-            while socket.can_send() {
+            loop {
                 if conn.pending_from_bridge.is_none() {
                     match conn.from_bridge.try_recv() {
                         Ok(bytes) => {
@@ -1219,8 +1295,22 @@ fn smoltcp_poll_thread(
                                 }
                             }
                         }
-                        Err(_) => break,
+                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            // The bridge task is gone (the real-server
+                            // connection died with it): this flow can never
+                            // receive again. Abort the smoltcp socket so
+                            // the closed-connection cleanup reaps the flow
+                            // and frees its mapped port instead of leaving
+                            // a zombie connection behind.
+                            socket.abort();
+                            break;
+                        }
                     }
+                }
+
+                if !socket.can_send() {
+                    break;
                 }
 
                 let Some(pending) = conn.pending_from_bridge.as_mut() else {
@@ -1262,12 +1352,34 @@ fn smoltcp_poll_thread(
             })
             .collect();
         for h in closed {
-            active.remove(&h);
+            if let Some(conn) = active.remove(&h) {
+                free_tcp_flow(&tcp_flows, &conn.key());
+            }
             promoted.remove(&h);
             sockets.remove(h);
             if let Ok(mut stats) = tcp_stats.write() {
                 stats.flows.remove(&h);
             }
+        }
+
+        // ── Remove pending connections that will never establish ──────────
+        // A pending socket whose handshake failed sits in Closed; one whose
+        // handshake silently vanished (client gone mid-SYN) would otherwise
+        // hold its mapped port and flow record forever.
+        let now = Instant::now();
+        let mut stale_pending: Vec<usize> = Vec::new();
+        for (idx, p) in pending.iter().enumerate() {
+            let s = sockets.get::<stcp::Socket>(p.handle);
+            if s.state() == stcp::State::Closed
+                || now.duration_since(p.created_at) > PENDING_CONN_TIMEOUT
+            {
+                stale_pending.push(idx);
+            }
+        }
+        for &idx in stale_pending.iter().rev() {
+            let p = pending.remove(idx);
+            sockets.remove(p.handle);
+            free_tcp_flow(&tcp_flows, &p.key());
         }
 
         // Clean up promoted handles that are no longer in pending.
@@ -1403,9 +1515,25 @@ fn rewrite_dst_ip_inbound(packet: &[u8]) -> Option<Vec<u8>> {
     Some(pkt)
 }
 
-/// Rewrite `src_ip` in an outbound IPv4 packet back to the original destination
-/// and recompute both the IP header checksum and the transport (TCP/UDP) checksum.
-fn rewrite_src_ip_outbound(pkt: &mut [u8], original_src: Ipv4Addr) {
+/// Rewrite an inbound IPv4 packet's destination to the flow's smoltcp
+/// identity: `dst_ip` → SMOLTCP_IP (via `rewrite_dst_ip_inbound`) and the
+/// TCP destination port → the flow's unique mapped port. Does NOT
+/// recompute the TCP checksum — smoltcp is configured to skip Rx
+/// checksum verification.
+fn rewrite_dst_inbound(packet: &[u8], mapped_port: u16) -> Option<Vec<u8>> {
+    let mut pkt = rewrite_dst_ip_inbound(packet)?;
+    let ihl = (pkt[0] & 0x0f) as usize * 4;
+    if pkt.len() < ihl + 4 {
+        return None;
+    }
+    pkt[ihl + 2..ihl + 4].copy_from_slice(&mapped_port.to_be_bytes());
+    Some(pkt)
+}
+
+/// Rewrite `src_ip` and `src_port` in an outbound IPv4 packet back to the
+/// original destination (IP, port) and recompute both the IP header
+/// checksum and the transport (TCP/UDP) checksum.
+fn rewrite_src_outbound(pkt: &mut [u8], original_src: Ipv4Addr, original_src_port: u16) {
     if pkt.len() < 20 {
         return;
     }
@@ -1415,7 +1543,9 @@ fn rewrite_src_ip_outbound(pkt: &mut [u8], original_src: Ipv4Addr) {
     pkt[10..12].copy_from_slice(&[0, 0]);
     let cksum = ipv4_checksum(&pkt[..ihl]);
     pkt[10..12].copy_from_slice(&cksum.to_be_bytes());
-    // Recompute TCP/UDP checksum (pseudo-header includes src_ip).
+    // Rewrite the transport source port (first field of both the TCP and
+    // UDP headers), then recompute the transport checksum, whose
+    // pseudo-header and segment both cover it.
     let protocol = pkt[9];
     let src_ip = Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15]);
     let dst_ip = Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]);
@@ -1426,11 +1556,13 @@ fn rewrite_src_ip_outbound(pkt: &mut [u8], original_src: Ipv4Addr) {
     let transport = &mut pkt[ihl..total_len];
     match protocol {
         6 if transport.len() >= 20 => {
+            transport[0..2].copy_from_slice(&original_src_port.to_be_bytes());
             transport[16..18].copy_from_slice(&[0, 0]);
             let cksum = tcp_udp_checksum_ipv4(src_ip, dst_ip, 6, transport);
             transport[16..18].copy_from_slice(&cksum.to_be_bytes());
         }
         17 if transport.len() >= 8 => {
+            transport[0..2].copy_from_slice(&original_src_port.to_be_bytes());
             transport[6..8].copy_from_slice(&[0, 0]);
             let cksum = tcp_udp_checksum_ipv4(src_ip, dst_ip, 17, transport);
             transport[6..8].copy_from_slice(&cksum.to_be_bytes());
@@ -2368,7 +2500,37 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_src_ip_outbound_recomputes_ip_and_udp_checksum() {
+    fn rewrite_dst_inbound_rewrites_destination_ip_and_tcp_port() {
+        let src_ip = Ipv4Addr::new(1, 2, 3, 4);
+        let dst_ip = Ipv4Addr::new(5, 6, 7, 8);
+        let mut pkt = vec![0u8; 40];
+        pkt[0] = 0x45;
+        pkt[2..4].copy_from_slice(&(40u16).to_be_bytes());
+        pkt[8] = 64;
+        pkt[9] = 6;
+        pkt[12..16].copy_from_slice(&src_ip.octets());
+        pkt[16..20].copy_from_slice(&dst_ip.octets());
+        pkt[20..22].copy_from_slice(&1000u16.to_be_bytes());
+        pkt[22..24].copy_from_slice(&443u16.to_be_bytes());
+        let ip_cksum = ipv4_checksum(&pkt[..20]);
+        pkt[10..12].copy_from_slice(&ip_cksum.to_be_bytes());
+
+        let rewritten = rewrite_dst_inbound(&pkt, 51234).expect("rewrite should succeed");
+        assert_eq!(&rewritten[16..20], &SMOLTCP_IP_ARRAY);
+        assert_eq!(
+            u16::from_be_bytes([rewritten[22], rewritten[23]]),
+            51234,
+            "TCP destination port should become the mapped port"
+        );
+        assert_eq!(
+            u16::from_be_bytes([rewritten[20], rewritten[21]]),
+            1000,
+            "TCP source port should be untouched"
+        );
+    }
+
+    #[test]
+    fn rewrite_src_outbound_recomputes_ip_and_udp_checksum() {
         let smoltcp_src = Ipv4Addr::new(
             SMOLTCP_IP_ARRAY[0],
             SMOLTCP_IP_ARRAY[1],
@@ -2380,10 +2542,15 @@ mod tests {
         let mut packet =
             build_ipv4_udp_packet(smoltcp_src, client_ip, 1234, 4321, 0x2222, b"payload").unwrap();
 
-        rewrite_src_ip_outbound(&mut packet, original_src);
+        rewrite_src_outbound(&mut packet, original_src, 443);
         assert_eq!(
             Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]),
             original_src
+        );
+        assert_eq!(
+            u16::from_be_bytes([packet[20], packet[21]]),
+            443,
+            "transport source port should become the original destination port"
         );
 
         let mut header = packet[..20].to_vec();
@@ -2623,6 +2790,225 @@ mod tests {
             .expect("server task should complete")
             .expect("server task should not panic");
         assert_eq!(server_received, client_payload);
+    }
+
+    /// Regression test: two concurrent flows from the SAME client port to
+    /// DIFFERENT destination IPs on the SAME destination port must not
+    /// collide. The forwarder originally keyed proxied flows by the reduced
+    /// tuple (client ip, client port, dst port) behind a single smoltcp
+    /// identity with one listener per destination port, so the second flow's
+    /// packets were dropped as an "ambiguous tuple" and both flows
+    /// blackholed. Production evidence (2026-10-17): hundreds of dropped
+    /// packets on real sessions; FAST-style clients — many parallel flows to
+    /// many CDN IPs on :443 with ephemeral-port reuse — hit it constantly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn smoltcp_tcp_bridge_same_client_port_different_destinations() {
+        let ip_a = Ipv4Addr::LOCALHOST;
+        let ip_b = Ipv4Addr::new(127, 0, 0, 2);
+
+        let listener_a = TcpListener::bind((ip_a, 0))
+            .await
+            .expect("test TCP server A should bind");
+        let server_port = listener_a
+            .local_addr()
+            .expect("listener A should have local addr")
+            .port();
+        let listener_b = TcpListener::bind((ip_b, server_port))
+            .await
+            .expect("test TCP server B should bind on the same port");
+
+        let payload_a: Vec<u8> = (0..256).map(|i| (i % 251) as u8).collect();
+        let payload_b: Vec<u8> = (0..256)
+            .map(|i| 255u8.wrapping_sub((i % 251) as u8))
+            .collect();
+        let reply_a: Vec<u8> = vec![0xA5; 128];
+        let reply_b: Vec<u8> = vec![0x5A; 128];
+
+        let expect_a = payload_a.clone();
+        let send_a = reply_a.clone();
+        let server_task_a = tokio::spawn(async move {
+            let (mut socket, _) = listener_a.accept().await.expect("server A should accept");
+            let mut buf = vec![0u8; expect_a.len()];
+            socket
+                .read_exact(&mut buf)
+                .await
+                .expect("server A should read client payload");
+            assert_eq!(buf, expect_a, "server A received the wrong flow's payload");
+            socket
+                .write_all(&send_a)
+                .await
+                .expect("server A should write response");
+            buf
+        });
+
+        let expect_b = payload_b.clone();
+        let send_b = reply_b.clone();
+        let server_task_b = tokio::spawn(async move {
+            let (mut socket, _) = listener_b.accept().await.expect("server B should accept");
+            let mut buf = vec![0u8; expect_b.len()];
+            socket
+                .read_exact(&mut buf)
+                .await
+                .expect("server B should read client payload");
+            assert_eq!(buf, expect_b, "server B received the wrong flow's payload");
+            socket
+                .write_all(&send_b)
+                .await
+                .expect("server B should write response");
+            buf
+        });
+
+        let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<SessionFrame>();
+        let forwarder = SmoltcpForwarder::new(43, outbound_tx, Arc::new(AtomicU64::new(0)));
+
+        let client_ip = Ipv4Addr::new(10, 8, 0, 2);
+        // SAME client source port for both flows — the collision condition.
+        let client_port = 40000u16;
+        let mut frame_seq = 0u64;
+        let mut ingest = |forwarder: &SmoltcpForwarder, payload: Vec<u8>| {
+            frame_seq += 1;
+            forwarder.ingest_packet(SessionFrame {
+                header: SessionHeader {
+                    connection_id: 1,
+                    sequence: frame_seq,
+                    flags: 0,
+                },
+                payload: payload.into(),
+            });
+        };
+
+        // ── Handshake flow A (client ISN 1000) ──
+        let isn_a = 1000u32;
+        ingest(
+            &forwarder,
+            build_ipv4_tcp_packet(
+                client_ip, ip_a, client_port, server_port, isn_a, 0, TCP_SYN, &[],
+            ),
+        );
+        let syn_ack_a = recv_matching_tcp_packet(
+            &mut outbound_rx,
+            client_ip,
+            client_port,
+            ip_a,
+            server_port,
+            Duration::from_secs(3),
+        )
+        .await;
+        assert_eq!(syn_ack_a.flags & (TCP_SYN | TCP_ACK), TCP_SYN | TCP_ACK);
+        assert_eq!(syn_ack_a.ack, isn_a.wrapping_add(1));
+        let server_isn_a = syn_ack_a.seq;
+
+        // ── Handshake flow B (same client port, different dst IP) ──
+        let isn_b = 7000u32;
+        ingest(
+            &forwarder,
+            build_ipv4_tcp_packet(
+                client_ip, ip_b, client_port, server_port, isn_b, 0, TCP_SYN, &[],
+            ),
+        );
+        let syn_ack_b = recv_matching_tcp_packet(
+            &mut outbound_rx,
+            client_ip,
+            client_port,
+            ip_b,
+            server_port,
+            Duration::from_secs(3),
+        )
+        .await;
+        assert_eq!(syn_ack_b.flags & (TCP_SYN | TCP_ACK), TCP_SYN | TCP_ACK);
+        assert_eq!(syn_ack_b.ack, isn_b.wrapping_add(1));
+        let server_isn_b = syn_ack_b.seq;
+
+        // ── Complete both handshakes ──
+        ingest(
+            &forwarder,
+            build_ipv4_tcp_packet(
+                client_ip,
+                ip_a,
+                client_port,
+                server_port,
+                isn_a.wrapping_add(1),
+                server_isn_a.wrapping_add(1),
+                TCP_ACK,
+                &[],
+            ),
+        );
+        ingest(
+            &forwarder,
+            build_ipv4_tcp_packet(
+                client_ip,
+                ip_b,
+                client_port,
+                server_port,
+                isn_b.wrapping_add(1),
+                server_isn_b.wrapping_add(1),
+                TCP_ACK,
+                &[],
+            ),
+        );
+
+        // ── Data on flow A only; collect A's reply ──
+        ingest(
+            &forwarder,
+            build_ipv4_tcp_packet(
+                client_ip,
+                ip_a,
+                client_port,
+                server_port,
+                isn_a.wrapping_add(1),
+                server_isn_a.wrapping_add(1),
+                TCP_PSH | TCP_ACK,
+                &payload_a,
+            ),
+        );
+        let (got_reply_a, _, _) = recv_payload_bytes(
+            &mut outbound_rx,
+            client_ip,
+            client_port,
+            ip_a,
+            server_port,
+            reply_a.len(),
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(got_reply_a, reply_a, "flow A received the wrong reply");
+
+        // ── Data on flow B only; collect B's reply ──
+        ingest(
+            &forwarder,
+            build_ipv4_tcp_packet(
+                client_ip,
+                ip_b,
+                client_port,
+                server_port,
+                isn_b.wrapping_add(1),
+                server_isn_b.wrapping_add(1),
+                TCP_PSH | TCP_ACK,
+                &payload_b,
+            ),
+        );
+        let (got_reply_b, _, _) = recv_payload_bytes(
+            &mut outbound_rx,
+            client_ip,
+            client_port,
+            ip_b,
+            server_port,
+            reply_b.len(),
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(got_reply_b, reply_b, "flow B received the wrong reply");
+
+        let received_a = timeout(Duration::from_secs(3), server_task_a)
+            .await
+            .expect("server A task should complete")
+            .expect("server A task should not panic");
+        assert_eq!(received_a, payload_a);
+        let received_b = timeout(Duration::from_secs(3), server_task_b)
+            .await
+            .expect("server B task should complete")
+            .expect("server B task should not panic");
+        assert_eq!(received_b, payload_b);
     }
 
     // ── SessionOutboundRouter failover tests ──────────────────────────────
