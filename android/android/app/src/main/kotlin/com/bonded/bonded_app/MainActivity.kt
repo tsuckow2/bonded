@@ -2,6 +2,7 @@ package com.bonded.bonded_app
 
 import android.app.Activity
 import android.content.Intent
+import android.net.Uri
 import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
@@ -264,6 +265,27 @@ class MainActivity : FlutterActivity() {
         startActivityForResult(prepareIntent, REQUEST_CODE_VPN_PREPARE)
     }
 
+    private fun openPlayListing() {
+        val marketIntent =
+                Intent(Intent.ACTION_VIEW, Uri.parse("market://details?id=$packageName"))
+        try {
+            startActivity(marketIntent)
+        } catch (_: Exception) {
+            try {
+                startActivity(
+                        Intent(
+                                Intent.ACTION_VIEW,
+                                Uri.parse(
+                                        "https://play.google.com/store/apps/details?id=$packageName"
+                                ),
+                        )
+                )
+            } catch (_: Exception) {
+                // No store and no browser: nothing more we can do.
+            }
+        }
+    }
+
     private fun readClientLogs(maxLines: Int): List<String> {
         val cap = maxLines.coerceIn(50, 2000)
         return try {
@@ -333,7 +355,11 @@ class MainActivity : FlutterActivity() {
                         "checkAppUpdate" -> {
                             // Best-effort: any failure (no Play Store,
                             // sideloaded build) reports "no update" so the
-                            // dashboard simply shows no banner.
+                            // dashboard simply shows no banner. Every
+                            // outcome is logged: until build 147 this check
+                            // failed silently in the field (updates never
+                            // surfaced in-app), which made the failure
+                            // impossible to diagnose after the fact.
                             val noUpdate =
                                     mapOf<String, Any>(
                                             "updateAvailable" to false,
@@ -343,13 +369,23 @@ class MainActivity : FlutterActivity() {
                                 val manager = AppUpdateManagerFactory.create(this)
                                 manager.appUpdateInfo
                                         .addOnSuccessListener { info ->
+                                            val availability = info.updateAvailability()
+                                            // The banner gates on availability
+                                            // alone. Requiring IMMEDIATE here
+                                            // (the pre-147 behavior) hid real
+                                            // updates whenever Play disallowed
+                                            // that one flow type.
                                             val available =
-                                                    info.updateAvailability() ==
+                                                    availability ==
                                                             UpdateAvailability
-                                                                    .UPDATE_AVAILABLE &&
-                                                            info.isUpdateTypeAllowed(
-                                                                    AppUpdateType.IMMEDIATE
-                                                            )
+                                                                    .UPDATE_AVAILABLE ||
+                                                            availability ==
+                                                                    UpdateAvailability
+                                                                            .DEVELOPER_TRIGGERED_UPDATE_IN_PROGRESS
+                                            android.util.Log.i(
+                                                    "BondedUpdate",
+                                                    "bonded update check: availability=$availability immediate=${info.isUpdateTypeAllowed(AppUpdateType.IMMEDIATE)} flexible=${info.isUpdateTypeAllowed(AppUpdateType.FLEXIBLE)} availableVersion=${info.availableVersionCode()}",
+                                            )
                                             result.success(
                                                     mapOf<String, Any>(
                                                             "updateAvailable" to available,
@@ -358,8 +394,18 @@ class MainActivity : FlutterActivity() {
                                                     )
                                             )
                                         }
-                                        .addOnFailureListener { result.success(noUpdate) }
+                                        .addOnFailureListener { e ->
+                                            android.util.Log.w(
+                                                    "BondedUpdate",
+                                                    "bonded update check failed: ${e.message}",
+                                            )
+                                            result.success(noUpdate)
+                                        }
                             } catch (e: Exception) {
+                                android.util.Log.w(
+                                        "BondedUpdate",
+                                        "bonded update check threw: ${e.message}",
+                                )
                                 result.success(noUpdate)
                             }
                         }
@@ -368,21 +414,53 @@ class MainActivity : FlutterActivity() {
                                 val manager = AppUpdateManagerFactory.create(this)
                                 manager.appUpdateInfo
                                         .addOnSuccessListener { info ->
-                                            if (info.updateAvailability() ==
+                                            val availability = info.updateAvailability()
+                                            val available =
+                                                    availability ==
                                                             UpdateAvailability
-                                                                    .UPDATE_AVAILABLE &&
-                                                    info.isUpdateTypeAllowed(
-                                                            AppUpdateType.IMMEDIATE
-                                                    )) {
-                                                manager.startUpdateFlowForResult(
-                                                        info,
-                                                        AppUpdateType.IMMEDIATE,
-                                                        this,
-                                                        appUpdateRequestCode,
-                                                )
-                                                result.success(true)
-                                            } else {
-                                                result.success(false)
+                                                                    .UPDATE_AVAILABLE ||
+                                                            availability ==
+                                                                    UpdateAvailability
+                                                                            .DEVELOPER_TRIGGERED_UPDATE_IN_PROGRESS
+                                            when {
+                                                available &&
+                                                        info.isUpdateTypeAllowed(
+                                                                AppUpdateType.IMMEDIATE
+                                                        ) -> {
+                                                    manager.startUpdateFlowForResult(
+                                                            info,
+                                                            AppUpdateType.IMMEDIATE,
+                                                            this,
+                                                            appUpdateRequestCode,
+                                                    )
+                                                    result.success(true)
+                                                }
+                                                available &&
+                                                        info.isUpdateTypeAllowed(
+                                                                AppUpdateType.FLEXIBLE
+                                                        ) -> {
+                                                    manager.startUpdateFlowForResult(
+                                                            info,
+                                                            AppUpdateType.FLEXIBLE,
+                                                            this,
+                                                            appUpdateRequestCode,
+                                                    )
+                                                    result.success(true)
+                                                }
+                                                available -> {
+                                                    // Play reports an update but
+                                                    // allows neither flow (seen on
+                                                    // test tracks): send the user
+                                                    // to the store listing, which
+                                                    // always works.
+                                                    android.util.Log.i(
+                                                            "BondedUpdate",
+                                                            "bonded update: no flow allowed, opening Play listing",
+                                                    )
+                                                    openPlayListing()
+                                                    result.success(true)
+                                                }
+                                                else -> result.success(false)
                                             }
                                         }
                                         .addOnFailureListener { result.success(false) }
