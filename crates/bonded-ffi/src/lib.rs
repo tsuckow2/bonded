@@ -128,6 +128,103 @@ fn alog(priority: i32, msg: &str) {
             __android_log_write(priority, tag.as_ptr(), text.as_ptr());
         }
     }
+    log_ring_append(priority, msg);
+}
+
+/// On-device diagnostic log ring. When diagnostics upload is enabled,
+/// `alog` tees every line into a bounded file in app storage so the
+/// periodic uploader has something durable to send (logcat alone is a
+/// rotating buffer that loses exactly the evidence that matters).
+#[cfg(target_os = "android")]
+struct LogRing {
+    path: std::path::PathBuf,
+    lock: std::sync::Mutex<()>,
+}
+
+#[cfg(target_os = "android")]
+static LOG_RING: std::sync::OnceLock<LogRing> = std::sync::OnceLock::new();
+
+#[cfg(target_os = "android")]
+const LOG_RING_MAX_BYTES: u64 = 2 * 1024 * 1024;
+#[cfg(target_os = "android")]
+const LOG_RING_KEEP_BYTES: usize = 1024 * 1024;
+
+#[cfg(target_os = "android")]
+fn init_log_ring(storage_dir: &str) {
+    let path = std::path::Path::new(storage_dir)
+        .join("diagnostics")
+        .join("client.log");
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    // The path is identical across sessions; a second set() just fails.
+    let _ = LOG_RING.set(LogRing {
+        path,
+        lock: std::sync::Mutex::new(()),
+    });
+}
+
+#[cfg(target_os = "android")]
+fn log_ring_append(priority: i32, msg: &str) {
+    let Some(ring) = LOG_RING.get() else {
+        return;
+    };
+    let Ok(_guard) = ring.lock.lock() else {
+        return;
+    };
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let line = format!("{now_ms} {priority} {msg}\n");
+    use std::io::Write as _;
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&ring.path)
+    {
+        let _ = file.write_all(line.as_bytes());
+    }
+    if std::fs::metadata(&ring.path)
+        .map(|meta| meta.len())
+        .unwrap_or(0)
+        > LOG_RING_MAX_BYTES
+    {
+        rotate_log_ring(&ring.path);
+    }
+}
+
+/// Trim the ring to its newest [`LOG_RING_KEEP_BYTES`], starting at a
+/// line boundary, via a temp file + rename.
+#[cfg(target_os = "android")]
+fn rotate_log_ring(path: &std::path::Path) {
+    let Ok(contents) = std::fs::read(path) else {
+        return;
+    };
+    if contents.len() <= LOG_RING_KEEP_BYTES {
+        return;
+    }
+    let mut start = contents.len() - LOG_RING_KEEP_BYTES;
+    while start < contents.len() && contents[start] != b'\n' {
+        start += 1;
+    }
+    let tail = &contents[start.min(contents.len())..];
+    let tmp_path = path.with_extension("log.tmp");
+    if std::fs::write(&tmp_path, tail).is_ok() {
+        let _ = std::fs::rename(&tmp_path, path);
+    }
+}
+
+/// Current ring contents for the diagnostics uploader.
+#[cfg(target_os = "android")]
+fn log_ring_read() -> Option<String> {
+    let ring = LOG_RING.get()?;
+    let contents = std::fs::read_to_string(&ring.path).ok()?;
+    if contents.is_empty() {
+        None
+    } else {
+        Some(contents)
+    }
 }
 
 /// Convenience macros that route to `alog` on Android and `eprintln!` elsewhere.
@@ -571,8 +668,15 @@ fn start_android_session(
     peer_share_advertise_ip: &str,
     peer_share_max_consumers: u32,
     peer_share_relay_bandwidth_kbps: u64,
+    diagnostics_upload_enabled: bool,
+    diagnostics_upload_period_secs: u64,
+    app_version_code: u64,
     storage_dir: &str,
 ) -> anyhow::Result<()> {
+    #[cfg(target_os = "android")]
+    if diagnostics_upload_enabled {
+        init_log_ring(storage_dir);
+    }
     alog_info!(
         "Starting Android session: server={} resolved={} protocols={} paths={} bind={}",
         server_address,
@@ -626,6 +730,9 @@ fn start_android_session(
     config.client.peer_share_enabled = peer_share_enabled;
     config.client.peer_share_max_consumers = peer_share_max_consumers.max(1);
     config.client.peer_share_relay_bandwidth_kbps = peer_share_relay_bandwidth_kbps;
+    config.client.diagnostics_upload_enabled = diagnostics_upload_enabled;
+    config.client.diagnostics_upload_period_secs = diagnostics_upload_period_secs;
+    let diagnostics_client_build = app_version_code.to_string();
     if let Some(bind_address) = normalize_optional_string(peer_share_bind_address) {
         config.client.peer_share_bind_address = bind_address;
     }
@@ -660,6 +767,20 @@ fn start_android_session(
 
         let catch_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             runtime.block_on(async move {
+            // Periodic diagnostics upload: silent on success by design;
+            // only failures surface here as warnings (and those warnings
+            // themselves land in the ring for the next upload).
+            #[cfg(target_os = "android")]
+            if config.client.diagnostics_upload_enabled {
+                let _diagnostics_task = bonded_client::diagnostics::spawn_diagnostics_uploader(
+                    config.clone(),
+                    diagnostics_client_build.clone(),
+                    std::sync::Arc::new(|| log_ring_read()),
+                    std::sync::Arc::new(|message: String| {
+                        alog_warn!("{message}");
+                    }),
+                );
+            }
             alog_info!("Worker: establishing transport paths");
             let mut transports = match tokio::time::timeout(
                 ANDROID_PATH_ESTABLISH_TIMEOUT,
@@ -1428,6 +1549,9 @@ pub extern "system" fn Java_com_bonded_bonded_1app_BondedVpnService_nativeStartS
     peer_share_max_consumers: jni::sys::jint,
     peer_share_relay_bandwidth_kbps: jni::sys::jlong,
     storage_dir: jni::objects::JString,
+    diagnostics_upload_enabled: jni::sys::jboolean,
+    diagnostics_upload_period_secs: jni::sys::jlong,
+    app_version_code: jni::sys::jlong,
 ) -> jni::sys::jboolean {
     // Store global ref to the service so protect_fd can call back into Java.
     if let Ok(global_ref) = env.new_global_ref(&obj) {
@@ -1481,6 +1605,9 @@ pub extern "system" fn Java_com_bonded_bonded_1app_BondedVpnService_nativeStartS
         &peer_share_advertise_ip,
         peer_share_max_consumers.max(1) as u32,
         peer_share_relay_bandwidth_kbps.max(0) as u64,
+        diagnostics_upload_enabled != 0,
+        diagnostics_upload_period_secs.max(0) as u64,
+        app_version_code.max(0) as u64,
         &storage_dir,
     )
     .is_ok()

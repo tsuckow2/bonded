@@ -39,6 +39,8 @@ class MainActivity : FlutterActivity() {
         private const val EXTRA_PEER_SHARE_ENABLED = "peer_share_enabled"
         private const val EXTRA_PEER_SHARE_BIND_ADDRESS = "peer_share_bind_address"
         private const val EXTRA_PEER_SHARE_ADVERTISE_IP = "peer_share_advertise_ip"
+        private const val EXTRA_DIAGNOSTICS_UPLOAD_ENABLED = "diagnostics_upload_enabled"
+        private const val EXTRA_DIAGNOSTICS_UPLOAD_PERIOD_SECS = "diagnostics_upload_period_secs"
         private var nativeLoaded = false
 
         init {
@@ -103,6 +105,11 @@ class MainActivity : FlutterActivity() {
                     intent.getStringExtra(EXTRA_PEER_SHARE_BIND_ADDRESS)?.trim().orEmpty()
                 val peerShareAdvertiseIp =
                     intent.getStringExtra(EXTRA_PEER_SHARE_ADVERTISE_IP)?.trim().orEmpty()
+                val diagnosticsUploadEnabled =
+                    intent.getBooleanExtra(EXTRA_DIAGNOSTICS_UPLOAD_ENABLED, false)
+                val diagnosticsUploadPeriodSecs =
+                    intent.getStringExtra(EXTRA_DIAGNOSTICS_UPLOAD_PERIOD_SECS)?.toLongOrNull()
+                        ?: intent.getLongExtra(EXTRA_DIAGNOSTICS_UPLOAD_PERIOD_SECS, 900)
 
                 if (serverAddress.isEmpty() || serverIdentityPublicKey.isEmpty() || inviteToken.isEmpty()) {
                     android.util.Log.e(
@@ -132,6 +139,8 @@ class MainActivity : FlutterActivity() {
             peerShareEnabled,
             peerShareBindAddress,
             peerShareAdvertiseIp,
+            diagnosticsUploadEnabled = diagnosticsUploadEnabled,
+            diagnosticsUploadPeriodSecs = diagnosticsUploadPeriodSecs,
         )
                 android.util.Log.i(
                         "BondedMain",
@@ -206,6 +215,8 @@ class MainActivity : FlutterActivity() {
             peerShareAdvertiseIp: String = "",
             peerShareMaxConsumers: Int = 4,
             peerShareRelayBandwidthKbps: Long = 0,
+            diagnosticsUploadEnabled: Boolean = false,
+            diagnosticsUploadPeriodSecs: Long = 900,
     ) {
         PairedServerStore.save(
                 this,
@@ -220,6 +231,8 @@ class MainActivity : FlutterActivity() {
                 peerShareMaxConsumers = peerShareMaxConsumers,
                 peerShareRelayBandwidthKbps = peerShareRelayBandwidthKbps,
                         pairedAt = Instant.now().toString(),
+                diagnosticsUploadEnabled = diagnosticsUploadEnabled,
+                diagnosticsUploadPeriodSecs = diagnosticsUploadPeriodSecs,
                 ),
         )
     }
@@ -566,6 +579,10 @@ class MainActivity : FlutterActivity() {
                                     (args?.get("peerShareMaxConsumers") as? Number)?.toInt() ?: 4
                                 val peerShareRelayBandwidthKbps =
                                     (args?.get("peerShareRelayBandwidthKbps") as? Number)?.toLong() ?: 0
+                                val diagnosticsUploadEnabled =
+                                    args?.get("diagnosticsUploadEnabled") as? Boolean ?: false
+                                val diagnosticsUploadPeriodSecs =
+                                    (args?.get("diagnosticsUploadPeriodSecs") as? Number)?.toLong() ?: 900
 
                             if (deviceId.isNullOrBlank() ||
                                             publicAddress.isNullOrBlank() ||
@@ -587,6 +604,8 @@ class MainActivity : FlutterActivity() {
                                         peerShareAdvertiseIp,
                                         peerShareMaxConsumers,
                                         peerShareRelayBandwidthKbps,
+                                        diagnosticsUploadEnabled,
+                                        diagnosticsUploadPeriodSecs,
                                     )
                                 result.success(null)
                             }
@@ -605,6 +624,8 @@ class MainActivity : FlutterActivity() {
                                                 "peerShareAdvertiseIp" to server.peerShareAdvertiseIp,
                                                 "peerShareMaxConsumers" to server.peerShareMaxConsumers,
                                                 "peerShareRelayBandwidthKbps" to server.peerShareRelayBandwidthKbps,
+                                                "diagnosticsUploadEnabled" to server.diagnosticsUploadEnabled,
+                                                "diagnosticsUploadPeriodSecs" to server.diagnosticsUploadPeriodSecs,
                                                 "pairedAt" to server.pairedAt,
                                         )
                                     }
@@ -631,6 +652,10 @@ class MainActivity : FlutterActivity() {
                                     (args?.get("peerShareMaxConsumers") as? Number)?.toInt() ?: 4
                                 val peerShareRelayBandwidthKbps =
                                     (args?.get("peerShareRelayBandwidthKbps") as? Number)?.toLong() ?: 0
+                                val diagnosticsUploadEnabled =
+                                    args?.get("diagnosticsUploadEnabled") as? Boolean ?: false
+                                val diagnosticsUploadPeriodSecs =
+                                    (args?.get("diagnosticsUploadPeriodSecs") as? Number)?.toLong() ?: 900
 
                             val existing = deviceId?.let { PairedServerStore.findById(this, it) }
                             if (deviceId.isNullOrBlank() ||
@@ -657,6 +682,9 @@ class MainActivity : FlutterActivity() {
                                             peerShareMaxConsumers = peerShareMaxConsumers,
                                             peerShareRelayBandwidthKbps = peerShareRelayBandwidthKbps,
                                                 pairedAt = existing.pairedAt,
+                                            lastResolvedAddress = existing.lastResolvedAddress,
+                                            diagnosticsUploadEnabled = diagnosticsUploadEnabled,
+                                            diagnosticsUploadPeriodSecs = diagnosticsUploadPeriodSecs,
                                         ),
                                 )
                                 result.success(null)

@@ -276,6 +276,10 @@ async fn main() -> anyhow::Result<()> {
         wireguard_public_addr: cfg.server.wireguard_public_addr(),
         wireguard_peer_lease_secs: cfg.server.wireguard_peer_lease_secs,
         authorized_keys: authorized_keys.clone(),
+        diagnostics_dir: std::path::Path::new(&cfg.server.authorized_keys_file)
+            .parent()
+            .map(|parent| parent.join("diagnostics"))
+            .unwrap_or_else(|| std::path::PathBuf::from("diagnostics")),
     });
     if let (Some(wireguard_bind), Some(wireguard_keypair), Some(wireguard_peers)) = (
         cfg.server.wireguard_bind.clone(),

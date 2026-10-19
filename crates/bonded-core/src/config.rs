@@ -280,6 +280,18 @@ pub struct ClientSection {
     /// Bandwidth cap per peer relay in kilobits per second. 0 = unlimited.
     #[serde(default)]
     pub peer_share_relay_bandwidth_kbps: u64,
+    /// Periodically upload the on-device diagnostic log to the server
+    /// (signed with the device key). Opt-in; off by default.
+    #[serde(default)]
+    pub diagnostics_upload_enabled: bool,
+    /// Diagnostics upload cadence in seconds (clamped to 60–3600 at
+    /// use). Defaults to 900.
+    #[serde(default = "default_diagnostics_upload_period_secs")]
+    pub diagnostics_upload_period_secs: u64,
+}
+
+fn default_diagnostics_upload_period_secs() -> u64 {
+    crate::diagnostics::DEFAULT_DIAGNOSTICS_PERIOD_SECS
 }
 
 fn default_peer_share_max_consumers() -> u32 {
@@ -309,6 +321,8 @@ impl Default for ClientSection {
             peer_share_advertise_ip: String::new(),
             peer_share_max_consumers: default_peer_share_max_consumers(),
             peer_share_relay_bandwidth_kbps: 0,
+            diagnostics_upload_enabled: false,
+            diagnostics_upload_period_secs: default_diagnostics_upload_period_secs(),
         }
     }
 }

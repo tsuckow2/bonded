@@ -80,6 +80,8 @@ class PairingService {
         'peerShareAdvertiseIp': server.peerShareAdvertiseIp,
         'peerShareMaxConsumers': server.peerShareMaxConsumers,
         'peerShareRelayBandwidthKbps': server.peerShareRelayBandwidthKbps,
+        'diagnosticsUploadEnabled': server.diagnosticsUploadEnabled,
+        'diagnosticsUploadPeriodSecs': server.diagnosticsUploadPeriodSecs,
       });
     } on PlatformException catch (e) {
       throw PairingException('Failed to update paired server: ${e.message}');

@@ -704,12 +704,24 @@ class BondedVpnService : VpnService() {
             peerShareMaxConsumers: Int,
             peerShareRelayBandwidthKbps: Long,
             storageDir: String,
+            diagnosticsUploadEnabled: Boolean,
+            diagnosticsUploadPeriodSecs: Long,
+            appVersionCode: Long,
     ): Boolean
 
     private external fun nativeStopSession()
 
     // Resolve a "host:port" address to "ip:port" using system DNS, before the VPN is
     // active. Returns the original string unchanged on any error or if already an IP.
+    private fun appVersionCode(): Long {
+        return try {
+            @Suppress("DEPRECATION")
+            packageManager.getPackageInfo(packageName, 0).versionCode.toLong()
+        } catch (_: Exception) {
+            0
+        }
+    }
+
     private fun resolveServerAddressEarly(rawAddress: String): String {
         android.util.Log.i("BondedVPN", "resolveServerAddressEarly() called with: $rawAddress")
         val lastColon = rawAddress.lastIndexOf(':')
@@ -857,6 +869,9 @@ class BondedVpnService : VpnService() {
                             server.peerShareMaxConsumers,
                             server.peerShareRelayBandwidthKbps,
                             filesDir.absolutePath,
+                            server.diagnosticsUploadEnabled,
+                            server.diagnosticsUploadPeriodSecs,
+                            appVersionCode(),
                     )
             android.util.Log.i("BondedVPN", "nativeStartSession returned: $started")
             if (started) {

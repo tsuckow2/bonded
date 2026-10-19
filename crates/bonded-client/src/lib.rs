@@ -41,6 +41,7 @@ use tracing::{debug, error, info, warn};
 use tun::Configuration;
 
 pub mod cert_proof;
+pub mod diagnostics;
 pub mod peer_discovery;
 pub mod peer_listener;
 pub mod peer_runtime;

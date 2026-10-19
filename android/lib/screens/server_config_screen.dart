@@ -20,6 +20,8 @@ class _ServerConfigScreenState extends State<ServerConfigScreen> {
   late TextEditingController _peerShareRelayBandwidthController;
   late List<String> _selectedProtocols;
   late bool _peerShareEnabled;
+  late bool _diagnosticsUploadEnabled;
+  late TextEditingController _diagnosticsUploadPeriodController;
   bool _isSaving = false;
 
   @override
@@ -45,6 +47,10 @@ class _ServerConfigScreenState extends State<ServerConfigScreen> {
     );
     _selectedProtocols = List.from(widget.server.supportedProtocols);
     _peerShareEnabled = widget.server.peerShareEnabled;
+    _diagnosticsUploadEnabled = widget.server.diagnosticsUploadEnabled;
+    _diagnosticsUploadPeriodController = TextEditingController(
+      text: widget.server.diagnosticsUploadPeriodSecs.toString(),
+    );
   }
 
   @override
@@ -55,6 +61,7 @@ class _ServerConfigScreenState extends State<ServerConfigScreen> {
     _peerShareAdvertiseIpController.dispose();
     _peerShareMaxConsumersController.dispose();
     _peerShareRelayBandwidthController.dispose();
+    _diagnosticsUploadPeriodController.dispose();
     super.dispose();
   }
 
@@ -71,6 +78,9 @@ class _ServerConfigScreenState extends State<ServerConfigScreen> {
           int.tryParse(_peerShareMaxConsumersController.text.trim()) ?? 4,
       peerShareRelayBandwidthKbps:
           int.tryParse(_peerShareRelayBandwidthController.text.trim()) ?? 0,
+      diagnosticsUploadEnabled: _diagnosticsUploadEnabled,
+      diagnosticsUploadPeriodSecs:
+          int.tryParse(_diagnosticsUploadPeriodController.text.trim()) ?? 900,
       pairedAt: widget.server.pairedAt,
     );
 
@@ -340,6 +350,46 @@ class _ServerConfigScreenState extends State<ServerConfigScreen> {
               decoration: InputDecoration(
                 hintText: '0 = unlimited',
                 helperText: 'Per-relay bandwidth limit, kilobits per second',
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                filled: true,
+                fillColor: Colors.grey[100],
+              ),
+            ),
+            const SizedBox(height: 32),
+            const Text(
+              'Diagnostics',
+              style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold),
+            ),
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('Upload diagnostic logs'),
+              subtitle: const Text(
+                'Periodically send this device\'s diagnostic log to the server, signed with the device key. Successful uploads are silent; only failures are logged.',
+              ),
+              value: _diagnosticsUploadEnabled,
+              onChanged:
+                  _isSaving
+                      ? null
+                      : (value) {
+                        setState(() {
+                          _diagnosticsUploadEnabled = value;
+                        });
+                      },
+            ),
+            const SizedBox(height: 12),
+            const Text(
+              'Upload interval (seconds)',
+              style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 8),
+            TextField(
+              controller: _diagnosticsUploadPeriodController,
+              keyboardType: TextInputType.number,
+              decoration: InputDecoration(
+                hintText: '900',
+                helperText: 'How often the log uploads (60–3600 seconds)',
                 border: OutlineInputBorder(
                   borderRadius: BorderRadius.circular(8),
                 ),

@@ -21,6 +21,10 @@ data class PairedServerRecord(
     // resolve the hostname — DNS routes into the dead tunnel — so they fall
     // back to this. Empty until the first successful resolution.
     val lastResolvedAddress: String = "",
+    // Opt-in periodic upload of the on-device diagnostic log to this
+    // server, signed with the device key. Off by default.
+    val diagnosticsUploadEnabled: Boolean = false,
+    val diagnosticsUploadPeriodSecs: Long = 900,
 ) {
     val serverPublicKey: String
     get() = serverIdentityPublicKey
@@ -119,7 +123,9 @@ object PairedServerStore {
                             .put("peerShareMaxConsumers", record.peerShareMaxConsumers)
                             .put("peerShareRelayBandwidthKbps", record.peerShareRelayBandwidthKbps)
                             .put("pairedAt", record.pairedAt)
-                            .put("lastResolvedAddress", record.lastResolvedAddress),
+                            .put("lastResolvedAddress", record.lastResolvedAddress)
+                            .put("diagnosticsUploadEnabled", record.diagnosticsUploadEnabled)
+                            .put("diagnosticsUploadPeriodSecs", record.diagnosticsUploadPeriodSecs),
             )
         }
 
@@ -184,6 +190,10 @@ object PairedServerStore {
                                 item.optLong("peerShareRelayBandwidthKbps", 0),
                                 pairedAt = item.optString("pairedAt", Instant.now().toString()),
                             lastResolvedAddress = item.optString("lastResolvedAddress", ""),
+                            diagnosticsUploadEnabled =
+                                item.optBoolean("diagnosticsUploadEnabled", false),
+                            diagnosticsUploadPeriodSecs =
+                                item.optLong("diagnosticsUploadPeriodSecs", 900),
                         ),
                 )
             }

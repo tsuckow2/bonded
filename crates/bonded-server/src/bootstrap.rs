@@ -12,6 +12,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -19,6 +20,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::Context as _;
 use bonded_core::auth::verify_signature;
 use bonded_core::auth::{sign_bytes, DeviceKeypair};
+use bonded_core::diagnostics::{
+    diagnostics_device_dir_name, DiagnosticsUploadRequest, DIAGNOSTICS_FILES_PER_DEVICE,
+    MAX_DIAGNOSTICS_LOG_BYTES,
+};
 use bonded_core::peer_share::{
     PeerShareIntroductionClaims, PeerShareIntroductionRequest, SignedPeerShareIntroduction,
 };
@@ -86,6 +91,10 @@ pub struct BootstrapContext {
     /// Authorized device store used when the server vouches for peer-sharing
     /// introductions.
     pub authorized_keys: AuthorizedKeysStore,
+
+    /// Root directory for uploaded client diagnostics, one subdirectory
+    /// per device key. Created on first upload.
+    pub diagnostics_dir: PathBuf,
 }
 
 impl BootstrapContext {
@@ -487,6 +496,7 @@ pub(crate) fn route_bootstrap_request(
         ("POST", "/v1/bootstrap/peer-share/introduction") => {
             peer_share_introduction_response(ctx, body)
         }
+        ("POST", "/v1/bootstrap/diagnostics") => diagnostics_upload_response(ctx, body),
         _ => (StatusCode::NOT_FOUND, r#"{"error":"not found"}"#.to_owned()),
     }
 }
@@ -635,6 +645,123 @@ fn wireguard_peer_response(ctx: &BootstrapContext, body: &str) -> (StatusCode, S
     })
     .to_string();
     (StatusCode::OK, body)
+}
+
+/// Store one device-signed diagnostics upload. Quiet on success (the
+/// client's rule for this feature is that routine uploads leave no log
+/// noise on either side); rejects and storage failures are logged.
+fn diagnostics_upload_response(ctx: &BootstrapContext, body: &str) -> (StatusCode, String) {
+    let request: DiagnosticsUploadRequest = match serde_json::from_str(body.trim()) {
+        Ok(request) => request,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                r#"{"error":"invalid JSON body"}"#.to_owned(),
+            )
+        }
+    };
+
+    if request.device_public_key.is_empty()
+        || request.log_text.is_empty()
+        || request.signature.is_empty()
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            r#"{"error":"device_public_key, log_text, and signature are required"}"#.to_owned(),
+        );
+    }
+    if request.log_text.len() > MAX_DIAGNOSTICS_LOG_BYTES {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            r#"{"error":"log_text exceeds the diagnostics size limit"}"#.to_owned(),
+        );
+    }
+    if !ctx.authorized_keys.is_authorized(&request.device_public_key) {
+        warn!(
+            device = %request.device_public_key,
+            "diagnostics upload from unauthorized device"
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            r#"{"error":"device is not authorized"}"#.to_owned(),
+        );
+    }
+    let signed_payload = match request.signed_payload() {
+        Ok(payload) => payload,
+        Err(err) => {
+            error!(error = %err, "failed to serialize diagnostics upload payload");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                r#"{"error":"failed to serialize diagnostics payload"}"#.to_owned(),
+            );
+        }
+    };
+    if let Err(err) = verify_signature(
+        &request.device_public_key,
+        &signed_payload,
+        &request.signature,
+    ) {
+        warn!(error = %err, "diagnostics upload signature verification failed");
+        return (
+            StatusCode::UNAUTHORIZED,
+            r#"{"error":"invalid device signature"}"#.to_owned(),
+        );
+    }
+
+    match store_diagnostics_upload(&ctx.diagnostics_dir, &request) {
+        Ok(()) => (StatusCode::OK, r#"{"status":"ok"}"#.to_owned()),
+        Err(err) => {
+            error!(error = %err, "failed to store diagnostics upload");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                r#"{"error":"failed to store diagnostics upload"}"#.to_owned(),
+            )
+        }
+    }
+}
+
+fn store_diagnostics_upload(
+    root: &std::path::Path,
+    request: &DiagnosticsUploadRequest,
+) -> std::io::Result<()> {
+    let device_dir = root.join(diagnostics_device_dir_name(&request.device_public_key));
+    std::fs::create_dir_all(&device_dir)?;
+    let build: String = request
+        .client_build
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let stem = format!("{}_{}", request.captured_at_unix, build);
+    let mut path = device_dir.join(format!("{stem}.log"));
+    let mut suffix = 2;
+    while path.exists() {
+        path = device_dir.join(format!("{stem}-{suffix}.log"));
+        suffix += 1;
+    }
+    std::fs::write(&path, &request.log_text)?;
+    prune_diagnostics_dir(&device_dir)
+}
+
+/// Keep only the newest [`DIAGNOSTICS_FILES_PER_DEVICE`] uploads in a
+/// device directory. File names start with the capture timestamp, so a
+/// lexicographic sort is chronological.
+fn prune_diagnostics_dir(device_dir: &std::path::Path) -> std::io::Result<()> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(device_dir)?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.extension().is_some_and(|ext| ext == "log"))
+        .collect();
+    files.sort();
+    while files.len() > DIAGNOSTICS_FILES_PER_DEVICE {
+        let oldest = files.remove(0);
+        let _ = std::fs::remove_file(oldest);
+    }
+    Ok(())
 }
 
 fn peer_share_introduction_response(ctx: &BootstrapContext, body: &str) -> (StatusCode, String) {
@@ -1015,6 +1142,9 @@ mod tests {
     use super::*;
     use crate::authorized_keys::{authorize_device_key, AuthorizedKeysStore};
     use bonded_core::auth::{sign_bytes, verify_signature, DeviceKeypair};
+    use bonded_core::diagnostics::{
+        DiagnosticsUploadRequest, DIAGNOSTICS_FILES_PER_DEVICE, MAX_DIAGNOSTICS_LOG_BYTES,
+    };
     use bonded_core::peer_share::{PeerShareIntroductionRequest, SignedPeerShareIntroduction};
     use std::collections::HashMap;
     use std::fs;
@@ -1034,6 +1164,7 @@ mod tests {
             wireguard_public_addr: None,
             wireguard_peer_lease_secs: 3600,
             authorized_keys: AuthorizedKeysStore::default(),
+            diagnostics_dir: std::env::temp_dir().join("bonded-diagnostics-test"),
         })
     }
 
@@ -1172,6 +1303,7 @@ mod tests {
             wireguard_public_addr: None,
             wireguard_peer_lease_secs: 3600,
             authorized_keys: AuthorizedKeysStore::default(),
+            diagnostics_dir: std::env::temp_dir().join("bonded-diagnostics-test"),
         });
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1255,6 +1387,154 @@ mod tests {
         assert_eq!(status, StatusCode::FORBIDDEN);
     }
 
+    fn diagnostics_test_ctx(
+        authorized: &[&DeviceKeypair],
+        name: &str,
+    ) -> (Arc<BootstrapContext>, PathBuf) {
+        let auth_path = temp_auth_file(name);
+        for device in authorized {
+            authorize_device_key(&auth_path, &device.public_key_b64)
+                .expect("device key should authorize");
+        }
+        let authorized_keys =
+            AuthorizedKeysStore::load(&auth_path).expect("authorized keys store should load");
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        let diagnostics_dir = std::env::temp_dir().join(format!("bonded-diag-{name}-{stamp}"));
+        let ctx = Arc::new(BootstrapContext {
+            server_identity: Arc::new(DeviceKeypair::generate()),
+            tls_cert_der: None,
+            server_public_address: "127.0.0.1:8443".to_owned(),
+            wireguard_keypair: None,
+            wireguard_peers: None,
+            wireguard_public_addr: None,
+            wireguard_peer_lease_secs: 3600,
+            authorized_keys,
+            diagnostics_dir: diagnostics_dir.clone(),
+        });
+        (ctx, diagnostics_dir)
+    }
+
+    fn signed_diagnostics_request(
+        device: &DeviceKeypair,
+        captured_at_unix: u64,
+        log_text: &str,
+    ) -> DiagnosticsUploadRequest {
+        let mut request = DiagnosticsUploadRequest {
+            device_public_key: device.public_key_b64.clone(),
+            client_build: "146".to_owned(),
+            captured_at_unix,
+            log_text: log_text.to_owned(),
+            signature: String::new(),
+        };
+        request.signature = sign_bytes(
+            device,
+            &request.signed_payload().expect("payload should serialize"),
+        )
+        .expect("request should sign");
+        request
+    }
+
+    fn post_diagnostics(
+        ctx: &BootstrapContext,
+        request: &DiagnosticsUploadRequest,
+    ) -> StatusCode {
+        route_bootstrap_request(
+            "POST",
+            "/v1/bootstrap/diagnostics",
+            &serde_json::to_string(request).expect("request should serialize"),
+            ctx,
+            None,
+        )
+        .0
+    }
+
+    #[test]
+    fn diagnostics_upload_stores_authorized_signed_log() {
+        let device = DeviceKeypair::generate();
+        let (ctx, dir) = diagnostics_test_ctx(&[&device], "diag-ok");
+        let request = signed_diagnostics_request(&device, 1_760_000_000, "hello diagnostics\n");
+
+        assert_eq!(post_diagnostics(&ctx, &request), StatusCode::OK);
+
+        let device_dir = dir.join(bonded_core::diagnostics::diagnostics_device_dir_name(
+            &device.public_key_b64,
+        ));
+        let stored = fs::read_to_string(device_dir.join("1760000000_146.log"))
+            .expect("upload should be stored under the device directory");
+        assert_eq!(stored, "hello diagnostics\n");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn diagnostics_upload_rejects_unauthorized_device() {
+        let device = DeviceKeypair::generate();
+        let (ctx, dir) = diagnostics_test_ctx(&[], "diag-unauth");
+        let request = signed_diagnostics_request(&device, 1_760_000_000, "nope\n");
+
+        assert_eq!(post_diagnostics(&ctx, &request), StatusCode::FORBIDDEN);
+        assert!(!dir.exists(), "rejected uploads must not be stored");
+    }
+
+    #[test]
+    fn diagnostics_upload_rejects_bad_signature() {
+        let device = DeviceKeypair::generate();
+        let (ctx, dir) = diagnostics_test_ctx(&[&device], "diag-badsig");
+        let mut request = signed_diagnostics_request(&device, 1_760_000_000, "original\n");
+        request.log_text = "tampered\n".to_owned();
+
+        assert_eq!(post_diagnostics(&ctx, &request), StatusCode::UNAUTHORIZED);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn diagnostics_upload_rejects_oversized_log() {
+        let device = DeviceKeypair::generate();
+        let (ctx, dir) = diagnostics_test_ctx(&[&device], "diag-big");
+        let oversized = "x".repeat(MAX_DIAGNOSTICS_LOG_BYTES + 1);
+        let request = signed_diagnostics_request(&device, 1_760_000_000, &oversized);
+
+        assert_eq!(
+            post_diagnostics(&ctx, &request),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn diagnostics_store_prunes_to_retention_cap() {
+        let device = DeviceKeypair::generate();
+        let dir = std::env::temp_dir().join(format!(
+            "bonded-diag-prune-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        ));
+        for index in 0..(DIAGNOSTICS_FILES_PER_DEVICE + 3) {
+            let request =
+                signed_diagnostics_request(&device, 1_760_000_000 + index as u64, "log\n");
+            store_diagnostics_upload(&dir, &request).expect("store should succeed");
+        }
+        let device_dir = dir.join(bonded_core::diagnostics::diagnostics_device_dir_name(
+            &device.public_key_b64,
+        ));
+        let mut names: Vec<String> = fs::read_dir(&device_dir)
+            .expect("device dir should exist")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names.len(), DIAGNOSTICS_FILES_PER_DEVICE);
+        assert!(
+            names[0].starts_with("1760000003_"),
+            "the three oldest uploads should be pruned, got {names:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn peer_share_introduction_returns_server_signed_claims() {
         let consumer = DeviceKeypair::generate();
@@ -1276,6 +1556,7 @@ mod tests {
             wireguard_public_addr: None,
             wireguard_peer_lease_secs: 3600,
             authorized_keys,
+            diagnostics_dir: std::env::temp_dir().join("bonded-diagnostics-test"),
         });
 
         let unsigned = serde_json::json!({
