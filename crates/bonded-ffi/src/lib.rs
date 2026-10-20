@@ -38,6 +38,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(any(target_os = "android", test))]
 use tokio_util::sync::CancellationToken;
 
+mod path_supervisor;
+use path_supervisor::{spawn_path_supervisor, PathIndexMap, RedialOutcome};
+
 // Per-path connect attempts inside establish_transport_paths each carry an 8s
 // timeout.  With two paths and a bind-aware attempt first, path 0 can take close
 // to 16s before the inner layer reports a failure.  Give the outer wrapper 30s so
@@ -782,9 +785,10 @@ fn start_android_session(
                 );
             }
             alog_info!("Worker: establishing transport paths");
+            let requested_paths = path_count.max(1);
             let mut transports = match tokio::time::timeout(
                 ANDROID_PATH_ESTABLISH_TIMEOUT,
-                establish_transport_paths_with_observer(&config, path_count.max(1), |message| {
+                establish_transport_paths_with_observer(&config, requested_paths, |message| {
                     alog_info!("Worker: {message}");
                 }),
             )
@@ -879,6 +883,10 @@ fn start_android_session(
             // server ever saw a frame — the server logged "failed to
             // receive initial session frame" and no session ever bound.
             let mut session_id: u32 = 0;
+            // Path index of each transports[i], in lockstep: session
+            // start establishes a path-order prefix, and every removal
+            // below removes from both vectors.
+            let mut candidate_paths: Vec<usize> = (0..transports.len()).collect();
             let mut path_index = 0_usize;
             while path_index < transports.len() {
                 let ping = SessionFrame {
@@ -895,6 +903,7 @@ fn start_android_session(
                         path_index, err
                     );
                     transports.remove(path_index);
+                    candidate_paths.remove(path_index);
                     continue;
                 }
                 match tokio::time::timeout(
@@ -930,6 +939,7 @@ fn start_android_session(
                             path_index, err
                         );
                         transports.remove(path_index);
+                        candidate_paths.remove(path_index);
                     }
                     Err(_) => {
                         alog_warn!(
@@ -937,6 +947,7 @@ fn start_android_session(
                             path_index
                         );
                         transports.remove(path_index);
+                        candidate_paths.remove(path_index);
                     }
                 }
             }
@@ -951,6 +962,37 @@ fn start_android_session(
                 return;
             }
             sync_transport_snapshot(&worker_snapshot, &transports, 0);
+            // F4: give every direct path a durable identity and an
+            // owner. candidate_paths[i] is the path index of
+            // transports[i]; the map keeps that association across the
+            // worker loop's inserts/removals, and the supervisor
+            // re-dials any path that is missing now or lost later.
+            let mut path_index_map = PathIndexMap::new();
+            for (vec_index, path_index) in candidate_paths.iter().enumerate() {
+                path_index_map.insert(vec_index, *path_index);
+            }
+            let (path_lost_tx, path_lost_rx) =
+                tokio::sync::mpsc::unbounded_channel::<usize>();
+            let (redial_outcome_tx, mut redial_outcome_rx) =
+                tokio::sync::mpsc::unbounded_channel::<RedialOutcome>();
+            let _path_supervisor = if requested_paths >= 2 {
+                let supervisor_log: Arc<dyn Fn(String) + Send + Sync> =
+                    Arc::new(|message: String| {
+                        alog_info!("PathSupervisor: {message}");
+                    });
+                Some(spawn_path_supervisor(
+                    config.clone(),
+                    requested_paths,
+                    candidate_paths.clone(),
+                    session_id,
+                    worker_cancel_token.clone(),
+                    path_lost_rx,
+                    redial_outcome_tx,
+                    supervisor_log,
+                ))
+            } else {
+                None
+            };
             let mut active_index = 0_usize;
             let mut session = SessionState::new(session_id);
             let mut ping_sequence = 0u64;
@@ -991,6 +1033,50 @@ fn start_android_session(
                             );
                         }
                     }
+                    redial_outcome = redial_outcome_rx.recv() => {
+                        match redial_outcome {
+                            Some(RedialOutcome::Bound { path_index, transport }) => {
+                                if path_index_map.contains_path(path_index) {
+                                    // Raced with another restore of the
+                                    // same path; keep the one already in
+                                    // the vec and drop the duplicate.
+                                    let mut duplicate = transport;
+                                    let _ = duplicate.close().await;
+                                    alog_warn!(
+                                        "Worker: path {} already present; closed duplicate re-dial",
+                                        path_index
+                                    );
+                                } else {
+                                    transports.push(transport);
+                                    path_index_map
+                                        .insert(transports.len() - 1, path_index);
+                                    sync_transport_snapshot(
+                                        &worker_snapshot,
+                                        &transports,
+                                        active_index,
+                                    );
+                                    alog_info!(
+                                        "Worker: path {} restored by supervisor total={}",
+                                        path_index,
+                                        transports.len()
+                                    );
+                                }
+                            }
+                            Some(RedialOutcome::SessionDead { reason }) => {
+                                alog_error!(
+                                    "Worker: path supervisor reports the session is dead: {}",
+                                    reason
+                                );
+                                update_snapshot(&worker_snapshot, |session_snapshot| {
+                                    session_snapshot.state = "error".to_owned();
+                                    session_snapshot.last_error = Some(reason);
+                                });
+                                close_client_transports(&mut transports).await;
+                                break;
+                            }
+                            None => {}
+                        }
+                    }
                     maybe_packet = outbound_rx.recv() => {
                         match maybe_packet {
                             Some(packet) => {
@@ -1012,8 +1098,14 @@ fn start_android_session(
                                         break;
                                     }
 
+                                    if let Some(lost_path) =
+                                        path_index_map.path_of(active_index)
+                                    {
+                                        let _ = path_lost_tx.send(lost_path);
+                                    }
                                     let old_index = active_index;
                                     transports.remove(active_index);
+                                    path_index_map.on_remove(active_index);
                                     if active_index >= transports.len() {
                                         active_index = 0;
                                     }
@@ -1143,8 +1235,14 @@ fn start_android_session(
                                     break;
                                 }
 
+                                if let Some(lost_path) =
+                                    path_index_map.path_of(active_index)
+                                {
+                                    let _ = path_lost_tx.send(lost_path);
+                                }
                                 let old_index = active_index;
                                 transports.remove(active_index);
+                                path_index_map.on_remove(active_index);
                                 if active_index >= transports.len() {
                                     active_index = 0;
                                 }
@@ -1241,9 +1339,11 @@ fn start_android_session(
                             // failed on two consecutive ticks is dead:
                             // evict it so the snapshot stops counting it
                             // and failover never promotes a corpse. (The
-                            // server reaps silently and nothing re-dials
-                            // a direct path mid-session, so an un-evicted
-                            // zombie otherwise lingers indefinitely.)
+                            // server reaps silently, so an un-evicted
+                            // zombie otherwise lingers indefinitely; the
+                            // removal below also notifies the F4 path
+                            // supervisor, which re-dials the path in
+                            // place.)
                             let standby_dead = !matches!(
                                 transports[index],
                                 ClientTransport::PeerRelay { .. }
@@ -1255,7 +1355,11 @@ fn start_android_session(
                             if !expired && !connection_closed && !standby_dead {
                                 continue;
                             }
+                            if let Some(lost_path) = path_index_map.path_of(index) {
+                                let _ = path_lost_tx.send(lost_path);
+                            }
                             let mut expired_transport = transports.remove(index);
+                            path_index_map.on_remove(index);
                             if index < active_index {
                                 active_index -= 1;
                             }
@@ -1835,8 +1939,19 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// The session tests drive a process-global session slot; serialize
+    /// them so they cannot interleave workers and snapshots.
+    static SESSION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn session_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        SESSION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[test]
     fn android_session_runtime_can_pair_and_exchange_packets() {
+        let _guard = session_test_lock();
         let runtime = tokio::runtime::Runtime::new().expect("runtime should build");
         let storage_dir = temp_dir_path("android-session-runtime");
         fs::create_dir_all(&storage_dir).expect("storage dir should be created");
@@ -1944,6 +2059,9 @@ mod tests {
             "",
             4,
             0,
+            false,
+            900,
+            0,
             storage_dir.to_string_lossy().as_ref(),
         )
         .expect("android session should start");
@@ -1965,6 +2083,259 @@ mod tests {
             })
             .expect("inbound packet should be echoed back");
         assert_eq!(echoed, b"android-smoke");
+
+        stop_android_session();
+        runtime
+            .block_on(server_task)
+            .expect("server task should join");
+        let _ = fs::remove_dir_all(storage_dir);
+    }
+
+    /// F4 proof: when a standby direct path dies silently (the server
+    /// drops its connection; no network change for the OS to react
+    /// to), the worker must evict it and the path supervisor must
+    /// re-dial it in place — same session, same connected-at stamp,
+    /// data plane on the surviving path never interrupted.
+    #[test]
+    fn android_session_supervisor_restores_a_killed_standby_path() {
+        let _guard = session_test_lock();
+        let runtime = tokio::runtime::Runtime::new().expect("runtime should build");
+        let storage_dir = temp_dir_path("android-session-supervisor");
+        fs::create_dir_all(&storage_dir).expect("storage dir should be created");
+
+        let listener = runtime
+            .block_on(TcpListener::bind("127.0.0.1:0"))
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("local addr should resolve");
+
+        let (kill_tx, kill_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let server_task = runtime.spawn(async move {
+            // The client establishes both paths (auth handshakes)
+            // before its discovery exchange starts, so accept and
+            // authenticate both first, then answer discovery pings.
+            let (stream0, _) = listener.accept().await.expect("path 0 accept");
+            let (public_key, stream0) =
+                handshake_server_connection(stream0, None, "").await;
+            let (stream1, _) = listener.accept().await.expect("path 1 accept");
+            let (_, stream1) =
+                handshake_server_connection(stream1, Some(&public_key), "").await;
+            let mut transport0 = NaiveTcpTransport::from_stream(stream0);
+            let mut transport1 = NaiveTcpTransport::from_stream(stream1);
+            for transport in [&mut transport0, &mut transport1] {
+                let ping = transport.recv().await.expect("discovery ping");
+                assert!(
+                    ping.header.flags & FLAG_PING != 0,
+                    "expected PING as the session's first frame"
+                );
+                transport
+                    .send(SessionFrame {
+                        header: SessionHeader {
+                            connection_id: 3,
+                            sequence: ping.header.sequence,
+                            flags: FLAG_PONG,
+                        },
+                        payload: Bytes::new(),
+                    })
+                    .await
+                    .expect("discovery pong should send");
+            }
+
+            // Active path pump: echo data frames, answer heartbeat
+            // pings, for the rest of the test.
+            let pump0 = tokio::spawn(async move {
+                loop {
+                    match transport0.recv().await {
+                        Ok(frame) => {
+                            if frame.header.flags & FLAG_PING != 0 {
+                                let pong = SessionFrame {
+                                    header: SessionHeader {
+                                        connection_id: 3,
+                                        sequence: frame.header.sequence,
+                                        flags: FLAG_PONG,
+                                    },
+                                    payload: Bytes::new(),
+                                };
+                                if transport0.send(pong).await.is_err() {
+                                    break;
+                                }
+                            } else if !frame.payload.is_empty()
+                                && transport0.send(frame).await.is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+
+            // Standby: answer its heartbeat pings until told to drop
+            // the connection — the silent-death case the supervisor
+            // exists for.
+            tokio::select! {
+                _ = kill_rx => {}
+                _ = async {
+                    loop {
+                        match transport1.recv().await {
+                            Ok(frame) => {
+                                if frame.header.flags & FLAG_PING != 0 {
+                                    let pong = SessionFrame {
+                                        header: SessionHeader {
+                                            connection_id: 3,
+                                            sequence: frame.header.sequence,
+                                            flags: FLAG_PONG,
+                                        },
+                                        payload: Bytes::new(),
+                                    };
+                                    if transport1.send(pong).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                } => {}
+            }
+            drop(transport1);
+
+            // The supervisor must re-dial path 1: a fresh connection
+            // from the same bind, a fresh auth handshake, and a
+            // binding ping that gets the SAME session id back.
+            let (stream1b, _) = tokio::time::timeout(
+                std::time::Duration::from_secs(120),
+                listener.accept(),
+            )
+            .await
+            .expect("redial accept should not time out")
+            .expect("redial accept should succeed");
+            let (_, stream1b) =
+                handshake_server_connection(stream1b, Some(&public_key), "").await;
+            let mut transport1b = NaiveTcpTransport::from_stream(stream1b);
+            let ping = transport1b.recv().await.expect("redial binding ping");
+            assert!(
+                ping.header.flags & FLAG_PING != 0,
+                "expected PING as the re-dialed path's first frame"
+            );
+            transport1b
+                .send(SessionFrame {
+                    header: SessionHeader {
+                        connection_id: 3,
+                        sequence: ping.header.sequence,
+                        flags: FLAG_PONG,
+                    },
+                    payload: Bytes::new(),
+                })
+                .await
+                .expect("redial binding pong should send");
+            // Hold the restored path open until the client goes away.
+            let _ = transport1b.recv().await;
+            drop(pump0);
+        });
+
+        start_android_session(
+            &addr.to_string(),
+            "",
+            "",
+            "naive_tcp",
+            2,
+            "[\"127.0.0.2\",\"127.0.0.3\"]",
+            false,
+            "",
+            "",
+            4,
+            0,
+            false,
+            900,
+            0,
+            storage_dir.to_string_lossy().as_ref(),
+        )
+        .expect("android session should start");
+
+        fn snapshot_connected_at(snapshot: &str) -> Option<u64> {
+            snapshot
+                .split("\"connectedAtMs\":")
+                .nth(1)
+                .and_then(|rest| rest.split(',').next())
+                .and_then(|value| value.trim().parse::<u64>().ok())
+        }
+
+        // Wait for the two-path connected state and remember the
+        // session's connected-at stamp: F4 must restore the path
+        // WITHOUT the session ever restarting.
+        let mut connected_at_ms = None;
+        for _ in 0..100 {
+            std::thread::sleep(Duration::from_millis(200));
+            if let Some(snapshot) = get_session_snapshot_json() {
+                if snapshot.contains("\"state\":\"connected\"")
+                    && snapshot.contains("\"transportCount\":2")
+                {
+                    connected_at_ms = snapshot_connected_at(&snapshot);
+                    break;
+                }
+            }
+        }
+        let connected_at_ms =
+            connected_at_ms.expect("session should connect with two transports");
+
+        // Data plane works before the kill.
+        queue_outbound_packet(b"f4-before".to_vec());
+        let echoed = (0..50)
+            .find_map(|_| {
+                std::thread::sleep(Duration::from_millis(100));
+                poll_inbound_packet()
+            })
+            .expect("inbound packet should echo before the kill");
+        assert_eq!(echoed, b"f4-before");
+
+        // Kill the standby server-side.
+        let _ = kill_tx.send(());
+
+        // The worker must evict the dead standby (transport count
+        // 2 -> 1) and the supervisor must restore it (1 -> 2), with
+        // the session state and connected-at stamp unmoved throughout.
+        let mut saw_single_path = false;
+        let mut restored = false;
+        for _ in 0..300 {
+            std::thread::sleep(Duration::from_millis(500));
+            if let Some(snapshot) = get_session_snapshot_json() {
+                assert!(
+                    snapshot.contains("\"state\":\"connected\""),
+                    "session must stay connected throughout: {snapshot}"
+                );
+                assert_eq!(
+                    snapshot_connected_at(&snapshot),
+                    Some(connected_at_ms),
+                    "session must not restart: {snapshot}"
+                );
+                if snapshot.contains("\"transportCount\":1") {
+                    saw_single_path = true;
+                }
+                if saw_single_path && snapshot.contains("\"transportCount\":2") {
+                    restored = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            saw_single_path,
+            "the killed standby should have been evicted"
+        );
+        assert!(
+            restored,
+            "the supervisor should have restored the standby in place"
+        );
+
+        // Data plane still works after the restore.
+        queue_outbound_packet(b"f4-after".to_vec());
+        let echoed = (0..50)
+            .find_map(|_| {
+                std::thread::sleep(Duration::from_millis(100));
+                poll_inbound_packet()
+            })
+            .expect("inbound packet should echo after the restore");
+        assert_eq!(echoed, b"f4-after");
 
         stop_android_session();
         runtime

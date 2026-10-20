@@ -276,11 +276,6 @@ pub async fn establish_transport_paths_with_observer<F>(
 where
     F: FnMut(String),
 {
-    let protocols = sanitize_preferred_protocols(
-        &config.client.preferred_protocols,
-        config.client.allow_insecure_debug_transports,
-    );
-
     let target = count.max(1);
 
     // Session-start identity gate: when a paired server key is configured,
@@ -292,7 +287,6 @@ where
     // applies, and a bound path may reach the server when the default route
     // cannot.
     let (gate_host, gate_port) = bootstrap_host_port(config);
-    let mut identity_error: Option<String> = None;
     if !config.client.server_public_key.is_empty() {
         let dial_override = (!config.client.server_resolved_address.trim().is_empty())
             .then_some(config.client.server_resolved_address.as_str());
@@ -336,7 +330,67 @@ where
 
     let mut paths = Vec::with_capacity(target);
     for path_index in 0..target {
-        let mut attempt_errors: Vec<String> = Vec::new();
+        match establish_single_transport_path(config, path_index, target, &mut observer)
+            .await?
+        {
+            SinglePathResult::Connected(path) => paths.push(path),
+            SinglePathResult::Failed(reason) => {
+                if path_index == 0 {
+                    anyhow::bail!(
+                        "failed to establish path {path_index} with configured protocols: {reason}"
+                    );
+                }
+                warn!(
+                    path_index,
+                    requested_paths = target,
+                    established_paths = paths.len(),
+                    reason = %reason,
+                    "failed to establish additional path; continuing with available paths"
+                );
+                break;
+            }
+        }
+    }
+
+    Ok(paths)
+}
+
+/// Outcome of one path's establishment attempts.
+pub enum SinglePathResult {
+    /// A transport was established for the path.
+    Connected(ClientTransport),
+    /// Every protocol attempt failed (non-fatally). The string is the
+    /// joined per-protocol errors, for logging.
+    Failed(String),
+}
+
+/// Establish one transport path: try the configured protocols (rotated
+/// by `path_index`, as session start does) against the path's bind
+/// address. Extracted from [`establish_transport_paths_with_observer`]
+/// so the Android path supervisor can re-dial a single lost path
+/// mid-session with exactly the session-start behavior.
+///
+/// Returns `Err` only for a server-identity failure, which is fatal and
+/// fail-closed: a well-formed cert proof that does not verify can only
+/// come from a real bonded server holding a different key (or a relay
+/// of one), never from a merely broken network.
+pub async fn establish_single_transport_path<F>(
+    config: &ClientConfig,
+    path_index: usize,
+    requested_paths: usize,
+    observer: &mut F,
+) -> anyhow::Result<SinglePathResult>
+where
+    F: FnMut(String),
+{
+    let protocols = sanitize_preferred_protocols(
+        &config.client.preferred_protocols,
+        config.client.allow_insecure_debug_transports,
+    );
+    let target = requested_paths.max(1);
+    let (gate_host, gate_port) = bootstrap_host_port(config);
+    let mut identity_error: Option<String> = None;
+    let mut attempt_errors: Vec<String> = Vec::new();
 
         let bind_address = config
             .client
@@ -455,31 +509,14 @@ where
             return Err(server_identity_failure(&gate_host, gate_port, detail));
         }
 
-        let Some(path) = connected else {
-            let reason = if attempt_errors.is_empty() {
+        Ok(match connected {
+            Some(path) => SinglePathResult::Connected(path),
+            None => SinglePathResult::Failed(if attempt_errors.is_empty() {
                 "no matching protocols configured".to_owned()
             } else {
                 attempt_errors.join(" | ")
-            };
-            if path_index == 0 {
-                anyhow::bail!(
-                    "failed to establish path {path_index} with configured protocols: {reason}"
-                );
-            }
-
-            warn!(
-                path_index,
-                requested_paths = target,
-                established_paths = paths.len(),
-                reason = %reason,
-                "failed to establish additional path; continuing with available paths"
-            );
-            break;
-        };
-        paths.push(path);
-    }
-
-    Ok(paths)
+            }),
+        })
 }
 
 /// Derive the bootstrap endpoint (host, port) from the client config,
