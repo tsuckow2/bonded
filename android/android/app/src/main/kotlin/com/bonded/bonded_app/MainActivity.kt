@@ -360,10 +360,21 @@ class MainActivity : FlutterActivity() {
                             // failed silently in the field (updates never
                             // surfaced in-app), which made the failure
                             // impossible to diagnose after the fact.
+                            val currentVersionCode =
+                                    try {
+                                        val pkgInfo =
+                                                packageManager.getPackageInfo(packageName, 0)
+                                        if (android.os.Build.VERSION.SDK_INT >= 28)
+                                                pkgInfo.longVersionCode.toInt()
+                                        else @Suppress("DEPRECATION") pkgInfo.versionCode
+                                    } catch (e: Exception) {
+                                        0
+                                    }
                             val noUpdate =
                                     mapOf<String, Any>(
                                             "updateAvailable" to false,
                                             "availableVersionCode" to 0,
+                                            "currentVersionCode" to currentVersionCode,
                                     )
                             try {
                                 val manager = AppUpdateManagerFactory.create(this)
@@ -391,6 +402,8 @@ class MainActivity : FlutterActivity() {
                                                             "updateAvailable" to available,
                                                             "availableVersionCode" to
                                                                     info.availableVersionCode(),
+                                                            "currentVersionCode" to
+                                                                    currentVersionCode,
                                                     )
                                             )
                                         }

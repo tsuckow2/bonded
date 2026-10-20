@@ -38,6 +38,7 @@ class _DashboardScreenState extends State<DashboardScreen>
   String? _lastError;
   String? _peerShareError;
   int? _updateAvailableVersionCode;
+  bool _checkingForUpdate = false;
   DateTime? _lastUpdateCheckAt;
   PairedServer? _pairedServer;
 
@@ -70,24 +71,57 @@ class _DashboardScreenState extends State<DashboardScreen>
   }
 
   /// Ask the native side whether Play has a newer build for this install.
-  /// Best-effort: on any failure (sideload, no Play Store) nothing shows.
-  Future<void> _checkForUpdate() async {
+  /// The automatic checks (dashboard open, foreground return) stay
+  /// silent and only drive the banner. A manual check from the
+  /// "Check for Updates" button reports every outcome to the user —
+  /// available, none, or failed — because the silent version of this
+  /// check hid real updates for three builds in a row.
+  Future<void> _checkForUpdate({bool manual = false}) async {
     _lastUpdateCheckAt = DateTime.now();
+    if (manual && mounted) {
+      setState(() {
+        _checkingForUpdate = true;
+      });
+    }
+    var outcome = 'failed';
+    int? availableVersionCode;
+    int? currentVersionCode;
     try {
       final result = await _channel.invokeMapMethod<String, dynamic>(
         'checkAppUpdate',
       );
-      if (!mounted || result == null) {
-        return;
-      }
-      if (result['updateAvailable'] == true) {
-        setState(() {
-          _updateAvailableVersionCode =
+      if (result != null) {
+        currentVersionCode = (result['currentVersionCode'] as num?)?.toInt();
+        if (result['updateAvailable'] == true) {
+          outcome = 'available';
+          availableVersionCode =
               (result['availableVersionCode'] as num?)?.toInt();
-        });
+        } else {
+          outcome = 'none';
+        }
       }
     } catch (_) {
       // Update checks must never disrupt the dashboard.
+    }
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _checkingForUpdate = false;
+      if (outcome == 'available') {
+        _updateAvailableVersionCode = availableVersionCode;
+      }
+    });
+    if (manual) {
+      final message = switch (outcome) {
+        'available' => 'Update available: build $availableVersionCode',
+        'none' =>
+          'No update available${currentVersionCode != null ? ' — build $currentVersionCode is current for this install' : ''}',
+        _ => "Couldn't check for updates — Play didn't answer",
+      };
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(message)));
     }
   }
 
@@ -354,6 +388,22 @@ class _DashboardScreenState extends State<DashboardScreen>
                       onTap: _toggleVpn,
                     ),
                     const SizedBox(height: 16),
+                    OutlinedButton.icon(
+                      onPressed: _checkingForUpdate
+                          ? null
+                          : () => _checkForUpdate(manual: true),
+                      icon: _checkingForUpdate
+                          ? const SizedBox(
+                              width: 16,
+                              height: 16,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : const Icon(Icons.system_update_outlined),
+                      label: Text(
+                        _checkingForUpdate ? 'Checking…' : 'Check for Updates',
+                      ),
+                    ),
+                    const SizedBox(height: 8),
                     OutlinedButton.icon(
                       onPressed: () =>
                           Navigator.of(context).pushNamed('/client-logs'),
