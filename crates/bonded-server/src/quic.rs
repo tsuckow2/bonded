@@ -121,7 +121,7 @@ pub async fn run_quic_server(
             let remote = incoming.remote_address();
             match incoming.await {
                 Err(err) => {
-                    warn!(peer = %remote, error = %err, "QUIC handshake failed");
+                    warn!(peer = %remote, error = ?err, "QUIC handshake failed");
                 }
                 Ok(connection) => {
                     let protocol = negotiated_alpn(&connection);
@@ -139,7 +139,7 @@ pub async fn run_quic_server(
                         .await
                     };
                     if let Err(err) = result {
-                        warn!(peer = %remote, error = %err, "QUIC session error");
+                        warn!(peer = %remote, error = ?err, "QUIC session error");
                     }
                 }
             }
@@ -400,3 +400,4 @@ async fn handle_quic_connection(
     }
     Ok(())
 }
+

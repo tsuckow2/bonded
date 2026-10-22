@@ -1215,35 +1215,33 @@ async fn perform_quic_auth_handshake(
     keypair: &DeviceKeypair,
     invite_token: &str,
 ) -> anyhow::Result<()> {
-    // Send hello (same as WebSocket path).
+    // Send hello — byte-for-byte the same schema as the WebSocket path
+    // ({public_key_b64, invite_token}); the server's ClientHello parser
+    // requires public_key_b64. (This fn previously sent {type, public_key},
+    // which the real server rejected as invalid hello JSON on every QUIC
+    // attempt; the integration-test mock had codified the wrong schema,
+    // which is why the divergence survived.)
     let hello = json!({
-        "type": "hello",
-        "public_key": keypair.public_key_b64,
+        "public_key_b64": keypair.public_key_b64,
         "invite_token": invite_token,
     });
     transport.send_text(&hello.to_string()).await?;
 
-    // Receive challenge.
+    // Receive challenge (an auth result with a status field means the
+    // hello was rejected instead).
     let challenge_line = transport.recv_text().await?;
-    let challenge: serde_json::Value = serde_json::from_str(challenge_line.trim())?;
-    if challenge.get("type").and_then(|v| v.as_str()) == Some("error") {
-        anyhow::bail!(
-            "server rejected hello: {}",
-            challenge
-                .get("message")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown error")
-        );
+    let challenge_value: serde_json::Value = serde_json::from_str(challenge_line.trim_end())
+        .map_err(|e| anyhow::anyhow!("server sent invalid JSON: {e}"))?;
+    if let Some(status) = challenge_value.get("status").and_then(|v| v.as_str()) {
+        anyhow::bail!("server rejected QUIC authentication: status={status}");
     }
-    let challenge_b64 = challenge
-        .get("challenge_b64")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("server sent invalid challenge: {challenge_line}"))?;
+    let challenge: ServerChallenge = serde_json::from_value(challenge_value).map_err(|e| {
+        anyhow::anyhow!("server sent unexpected JSON (expected challenge_b64): {e}")
+    })?;
 
-    // Sign and respond.
-    let signature_b64 = sign_auth_challenge(keypair, challenge_b64)?;
+    // Sign and respond (same proof schema as the WebSocket path).
+    let signature_b64 = sign_auth_challenge(keypair, &challenge.challenge_b64)?;
     let response = json!({
-        "type": "auth_response",
         "signature_b64": signature_b64,
     });
     transport.send_text(&response.to_string()).await?;

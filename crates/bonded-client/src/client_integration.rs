@@ -203,8 +203,11 @@ async fn quic_server_handshake(
         .expect("QUIC hello should be readable");
     let hello: serde_json::Value =
         serde_json::from_str(hello_line.trim_end()).expect("QUIC hello should parse");
+    // Assert the REAL server's schema (auth_handshake::ClientHello requires
+    // public_key_b64). This mock previously asserted "public_key", which
+    // codified the client's divergent hello and let it ship broken.
     assert_eq!(
-        hello["public_key"].as_str().unwrap_or_default(),
+        hello["public_key_b64"].as_str().unwrap_or_default(),
         expected_public_key
     );
 
