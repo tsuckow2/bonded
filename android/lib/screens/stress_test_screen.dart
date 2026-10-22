@@ -31,6 +31,12 @@ class _StressTestScreenState extends State<StressTestScreen> {
   final TextEditingController _roundsController = TextEditingController(
     text: '5',
   );
+  final TextEditingController _udpHostController = TextEditingController(
+    text: 'charter.codingwell.net',
+  );
+  final TextEditingController _udpPortController = TextEditingController(
+    text: '443',
+  );
 
   String _lastResult = 'No stress runs started.';
   bool _running = false;
@@ -137,6 +143,40 @@ class _StressTestScreenState extends State<StressTestScreen> {
     }
   }
 
+  Future<void> _runUdpProbe() async {
+    final port = int.tryParse(_udpPortController.text.trim()) ?? 443;
+    setState(() {
+      _running = true;
+      _lastResult = 'Starting UDP probe...';
+    });
+
+    try {
+      await _channel.invokeMethod<String>('runNetworkTest', {
+        'action': 'com.bonded.bonded_app.TEST_UDP_PROBE',
+        'host': _udpHostController.text.trim(),
+        'port': port,
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 350));
+      await _refreshLogs();
+      if (!mounted) return;
+      setState(() {
+        _lastResult =
+            'Started UDP probe of ${_udpHostController.text.trim()}:$port at ${DateTime.now().toIso8601String()} — verdict lands in the logs below';
+      });
+    } on PlatformException catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _lastResult = 'Failed to start UDP probe: ${e.code} ${e.message ?? ''}';
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _running = false;
+        });
+      }
+    }
+  }
+
   @override
   void dispose() {
     _logRefreshTimer?.cancel();
@@ -146,6 +186,8 @@ class _StressTestScreenState extends State<StressTestScreen> {
     _httpsUrlController.dispose();
     _http3UrlController.dispose();
     _roundsController.dispose();
+    _udpHostController.dispose();
+    _udpPortController.dispose();
     super.dispose();
   }
 
@@ -221,6 +263,50 @@ class _StressTestScreenState extends State<StressTestScreen> {
             onPressed: _running ? null : _runStressTest,
             icon: const Icon(Icons.bolt),
             label: const Text('Run Simultaneous Stress Test'),
+          ),
+          const SizedBox(height: 24),
+          const Divider(),
+          Text(
+            'UDP Probe',
+            style: Theme.of(context).textTheme.titleMedium,
+          ),
+          const SizedBox(height: 4),
+          Text(
+            'UDP only: sends a QUIC version-negotiation packet to the host/port below and reports what (if anything) answers. Compare a known-good QUIC host (e.g. www.google.com, port 443) with the server to find where UDP dies.',
+            style: Theme.of(context).textTheme.bodyMedium,
+          ),
+          const SizedBox(height: 12),
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Expanded(
+                flex: 2,
+                child: TextField(
+                  controller: _udpHostController,
+                  decoration: const InputDecoration(
+                    labelText: 'UDP host',
+                    border: OutlineInputBorder(),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: TextField(
+                  controller: _udpPortController,
+                  keyboardType: TextInputType.number,
+                  decoration: const InputDecoration(
+                    labelText: 'UDP port',
+                    border: OutlineInputBorder(),
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          FilledButton.icon(
+            onPressed: _running ? null : _runUdpProbe,
+            icon: const Icon(Icons.radar),
+            label: const Text('Run UDP Probe'),
           ),
           const SizedBox(height: 20),
           Row(

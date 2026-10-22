@@ -38,7 +38,8 @@ import kotlin.concurrent.thread
  * com.bonded.bonded_app.TEST_HTTP_CODINGWELL adb shell am broadcast -a
  * com.bonded.bonded_app.TEST_PROTOCOL_STRESS -e host cloudflare.com -e resolver 1.1.1.1 -e http_url
  * http://httpforever.com/ -e https_url https://example.com/ -e http3_url
- * https://cloudflare-quic.com/ -e rounds 5
+ * https://cloudflare-quic.com/ -e rounds 5 adb shell am broadcast -a
+ * com.bonded.bonded_app.TEST_UDP_PROBE -e host charter.codingwell.net -e port 443
  */
 class NetworkTestReceiver : BroadcastReceiver() {
     companion object {
@@ -109,6 +110,7 @@ class NetworkTestReceiver : BroadcastReceiver() {
                         action == "com.bonded.bonded_app.TEST_HTTP" ||
                         action == "com.bonded.bonded_app.TEST_HTTP_CODINGWELL" ||
                         action == "com.bonded.bonded_app.TEST_PROTOCOL_STRESS" ||
+                        action == "com.bonded.bonded_app.TEST_UDP_PROBE" ||
                         action == "com.bonded.bonded_app.TEST_ALL"
 
         if (isAsyncAction) {
@@ -155,6 +157,16 @@ class NetworkTestReceiver : BroadcastReceiver() {
                                             ),
                                     logI = ::logI,
                                     logD = ::logD,
+                                    logW = ::logW,
+                                    logE = ::logE,
+                            )
+                        }
+                        "com.bonded.bonded_app.TEST_UDP_PROBE" -> {
+                            UdpProbeTester.run(
+                                    host = intent.getStringExtra("host")
+                                                    ?: "charter.codingwell.net",
+                                    port = intent.getIntExtra("port", 443),
+                                    logI = ::logI,
                                     logW = ::logW,
                                     logE = ::logE,
                             )

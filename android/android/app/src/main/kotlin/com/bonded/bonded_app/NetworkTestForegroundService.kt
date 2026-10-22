@@ -118,6 +118,17 @@ class NetworkTestForegroundService : Service() {
                         logE = ::logE,
                 )
             }
+            "com.bonded.bonded_app.TEST_UDP_PROBE" -> {
+                val host = intent.getStringExtra(EXTRA_HOST) ?: "charter.codingwell.net"
+                val port = intent.getIntExtra(EXTRA_PORT, 443)
+                UdpProbeTester.run(
+                        host = host,
+                        port = port,
+                        logI = ::logI,
+                        logW = ::logW,
+                        logE = ::logE,
+                )
+            }
             "com.bonded.bonded_app.TEST_ALL" -> {
                 testVpnStatus()
                 testDnsResolution(DEFAULT_DNS_HOST, DEFAULT_DNS_EXPECTED_IP)
