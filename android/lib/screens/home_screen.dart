@@ -3,6 +3,7 @@ import 'package:flutter/services.dart';
 import '../services/pairing_service.dart';
 import '../models/pairing_model.dart';
 import '../services/background_service.dart';
+import '../widgets/app_update_checker.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -139,68 +140,88 @@ class _HomeScreenState extends State<HomeScreen> {
           ),
         ],
       ),
-      body: FutureBuilder<List<Map<String, dynamic>>>(
-        future: _pairedServersFuture,
-        builder: (context, snapshot) {
-          if (snapshot.connectionState == ConnectionState.waiting) {
-            return const Center(child: CircularProgressIndicator());
-          }
+      body: Column(
+        children: [
+          // The app update check lives on the first page (build 178):
+          // banner when Play has a newer build, plus the manual check
+          // button. It used to be buried on the per-server dashboard.
+          const AppUpdateChecker(),
+          Expanded(
+            child: FutureBuilder<List<Map<String, dynamic>>>(
+              future: _pairedServersFuture,
+              builder: (context, snapshot) {
+                if (snapshot.connectionState == ConnectionState.waiting) {
+                  return const Center(child: CircularProgressIndicator());
+                }
 
-          final pairedServers = snapshot.data ?? [];
+                final pairedServers = snapshot.data ?? [];
 
-          if (pairedServers.isEmpty) {
-            return Center(
-              child: Column(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  const Icon(Icons.security, size: 64, color: Colors.grey),
-                  const SizedBox(height: 16),
-                  const Text(
-                    'No paired servers',
-                    style: TextStyle(fontSize: 18, fontWeight: FontWeight.w500),
-                  ),
-                  const SizedBox(height: 8),
-                  Text(
-                    'Scan a server QR code to get started',
-                    style: TextStyle(fontSize: 14, color: Colors.grey[600]),
-                  ),
-                  const SizedBox(height: 32),
-                  ElevatedButton.icon(
-                    onPressed: _openQrScanner,
-                    icon: const Icon(Icons.qr_code_2),
-                    label: const Text('Scan QR Code'),
-                    style: ElevatedButton.styleFrom(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 32,
-                        vertical: 16,
-                      ),
+                if (pairedServers.isEmpty) {
+                  return Center(
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        const Icon(
+                          Icons.security,
+                          size: 64,
+                          color: Colors.grey,
+                        ),
+                        const SizedBox(height: 16),
+                        const Text(
+                          'No paired servers',
+                          style: TextStyle(
+                            fontSize: 18,
+                            fontWeight: FontWeight.w500,
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                        Text(
+                          'Scan a server QR code to get started',
+                          style: TextStyle(
+                            fontSize: 14,
+                            color: Colors.grey[600],
+                          ),
+                        ),
+                        const SizedBox(height: 32),
+                        ElevatedButton.icon(
+                          onPressed: _openQrScanner,
+                          icon: const Icon(Icons.qr_code_2),
+                          label: const Text('Scan QR Code'),
+                          style: ElevatedButton.styleFrom(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 32,
+                              vertical: 16,
+                            ),
+                          ),
+                        ),
+                      ],
                     ),
-                  ),
-                ],
-              ),
-            );
-          }
+                  );
+                }
 
-          return ListView.builder(
-            padding: const EdgeInsets.all(16),
-            itemCount: pairedServers.length + 1,
-            itemBuilder: (context, index) {
-              if (index == pairedServers.length) {
-                return Padding(
-                  padding: const EdgeInsets.symmetric(vertical: 16),
-                  child: ElevatedButton.icon(
-                    onPressed: _openQrScanner,
-                    icon: const Icon(Icons.add),
-                    label: const Text('Add Server'),
-                  ),
+                return ListView.builder(
+                  padding: const EdgeInsets.all(16),
+                  itemCount: pairedServers.length + 1,
+                  itemBuilder: (context, index) {
+                    if (index == pairedServers.length) {
+                      return Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 16),
+                        child: ElevatedButton.icon(
+                          onPressed: _openQrScanner,
+                          icon: const Icon(Icons.add),
+                          label: const Text('Add Server'),
+                        ),
+                      );
+                    }
+
+                    final server = pairedServers[index];
+                    return _buildServerCard(context, server);
+                  },
                 );
-              }
-
-              final server = pairedServers[index];
-              return _buildServerCard(context, server);
-            },
-          );
-        },
+              },
+            ),
+          ),
+        ],
       ),
     );
   }
