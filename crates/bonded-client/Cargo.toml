@@ -12,6 +12,7 @@ base64.workspace = true
 bonded-core = { path = "../bonded-core" }
 boringtun.workspace = true
 bytes.workspace = true
+futures-util.workspace = true
 h3.workspace = true
 h3-quinn.workspace = true
 mdns-sd.workspace = true

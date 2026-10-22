@@ -29,7 +29,9 @@ use bonded_client::{
     establish_single_transport_path, ClientTransport, SinglePathResult,
 };
 use bonded_core::config::ClientConfig;
-use bonded_core::session::{SessionFrame, SessionHeader, FLAG_PING, FLAG_PONG};
+use bonded_core::session::{
+    SessionFrame, SessionHeader, FLAG_MULTIPATH_RECV, FLAG_PING, FLAG_PONG,
+};
 use bytes::Bytes;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -237,7 +239,7 @@ async fn bind_redialed_transport(
         header: SessionHeader {
             connection_id: 0,
             sequence: 0,
-            flags: FLAG_PING,
+            flags: FLAG_PING | FLAG_MULTIPATH_RECV,
         },
         payload: Bytes::new(),
     };

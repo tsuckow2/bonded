@@ -355,6 +355,12 @@ pub struct SessionOutboundRouter {
 struct RouterInner {
     transports: HashMap<u64, mpsc::UnboundedSender<SessionFrame>>,
     last_active: Option<u64>,
+    /// Set once any frame from this session's client carries
+    /// FLAG_MULTIPATH_RECV (the client receives on all its transports).
+    /// Until then, downlink delivery keeps the pre-multipath
+    /// last-active-only behavior, because an old client only reads its
+    /// active transport and would lose frames sent anywhere else.
+    multipath_capable: bool,
 }
 
 impl SessionOutboundRouter {
@@ -364,6 +370,7 @@ impl SessionOutboundRouter {
             inner: Arc::new(RwLock::new(RouterInner {
                 transports: HashMap::new(),
                 last_active: None,
+                multipath_capable: false,
             })),
         };
         let task_router = router.clone();
@@ -397,6 +404,29 @@ impl SessionOutboundRouter {
         inner.last_active = Some(id);
     }
 
+    /// Record a received frame's flags. A frame carrying
+    /// FLAG_MULTIPATH_RECV marks the session multipath-capable: the
+    /// client is advertising that it receives on all of its transports,
+    /// so `deliver` may spread downlink flows across them per-flow.
+    /// Sticky: once set it stays set for the session's life (a client
+    /// build does not change mid-session).
+    pub fn note_frame_flags(&self, flags: u32) {
+        if flags & bonded_core::session::FLAG_MULTIPATH_RECV != 0 {
+            let mut inner = self.inner.write().expect("router lock poisoned");
+            if !inner.multipath_capable {
+                tracing::info!("router: session is multipath-capable, downlink flow spreading enabled");
+                inner.multipath_capable = true;
+            }
+        }
+    }
+
+    /// `mark_active` plus `note_frame_flags`, for data-frame sites that
+    /// have both the transport id and the frame in hand.
+    pub fn note_frame(&self, id: u64, flags: u32) {
+        self.note_frame_flags(flags);
+        self.mark_active(id);
+    }
+
     pub fn transport_count(&self) -> usize {
         self.inner
             .read()
@@ -406,21 +436,54 @@ impl SessionOutboundRouter {
     }
 
     fn deliver(&self, frame: SessionFrame) {
-        // Build an ordered candidate list: preferred (last_active) first,
-        // then every other live transport. If the preferred sender is
-        // closed we retry the SAME frame immediately on the next live
-        // sender instead of dropping it.
+        // Build an ordered candidate list. For a multipath-capable
+        // session with more than one live transport, the first candidate
+        // is this flow's pinned transport — the flow hash over the
+        // downlink packet picks deterministically from the sorted
+        // transport ids, so a flow stays on one path while the set is
+        // stable — followed by last_active and then the rest in sorted
+        // order. Otherwise the list is the pre-multipath order:
+        // last_active first, then every other live transport. Either
+        // way, if a candidate's sender is closed we retry the SAME
+        // frame immediately on the next live sender instead of
+        // dropping it (which also re-pins the flow after a path death).
         let candidates: Vec<(u64, mpsc::UnboundedSender<SessionFrame>)> = {
             let inner = self.inner.read().expect("router lock poisoned");
-            let mut v = Vec::with_capacity(inner.transports.len());
-            if let Some(id) = inner.last_active {
-                if let Some(tx) = inner.transports.get(&id) {
-                    v.push((id, tx.clone()));
+            let mut v: Vec<(u64, mpsc::UnboundedSender<SessionFrame>)> =
+                Vec::with_capacity(inner.transports.len());
+            if inner.multipath_capable && inner.transports.len() > 1 {
+                let mut sorted_ids: Vec<u64> = inner.transports.keys().copied().collect();
+                sorted_ids.sort_unstable();
+                let pick = sorted_ids[bonded_core::flow::pick_index(
+                    bonded_core::flow::flow_hash(&frame.payload),
+                    sorted_ids.len(),
+                )];
+                let mut ordered = vec![pick];
+                if let Some(last) = inner.last_active {
+                    if last != pick && inner.transports.contains_key(&last) {
+                        ordered.push(last);
+                    }
                 }
-            }
-            for (id, tx) in inner.transports.iter() {
-                if Some(*id) != inner.last_active {
-                    v.push((*id, tx.clone()));
+                for id in sorted_ids {
+                    if !ordered.contains(&id) {
+                        ordered.push(id);
+                    }
+                }
+                for id in ordered {
+                    if let Some(tx) = inner.transports.get(&id) {
+                        v.push((id, tx.clone()));
+                    }
+                }
+            } else {
+                if let Some(id) = inner.last_active {
+                    if let Some(tx) = inner.transports.get(&id) {
+                        v.push((id, tx.clone()));
+                    }
+                }
+                for (id, tx) in inner.transports.iter() {
+                    if Some(*id) != inner.last_active {
+                        v.push((*id, tx.clone()));
+                    }
                 }
             }
             v
@@ -3490,6 +3553,279 @@ mod tests {
             .expect("rx2 closed");
         assert_eq!(got.header.sequence, 30);
         // Dead transport should have been pruned.
+        assert_eq!(router.transport_count(), 1);
+    }
+
+    /// Build a downlink frame whose payload is a real UDP packet for
+    /// the given client-side destination port — a distinct flow tuple
+    /// per port, so `flow_hash` pins it deterministically.
+    fn flow_frame(seq: u64, dst_port: u16) -> SessionFrame {
+        let pkt = build_ipv4_udp_packet(
+            Ipv4Addr::new(93, 184, 216, 34),
+            Ipv4Addr::new(10, 8, 0, 2),
+            53,
+            dst_port,
+            seq as u16,
+            b"flow",
+        )
+        .expect("build flow packet");
+        SessionFrame {
+            header: SessionHeader {
+                connection_id: 0,
+                sequence: seq,
+                flags: 0,
+            },
+            payload: pkt.into(),
+        }
+    }
+
+    /// Find a destination port whose flow hashes to pick `want` out of
+    /// the two sorted transport ids [1, 2].
+    fn flow_port_for_pick(want: usize) -> u16 {
+        (40000..50000u16)
+            .find(|&port| {
+                bonded_core::flow::pick_index(
+                    bonded_core::flow::flow_hash(&flow_frame(0, port).payload),
+                    2,
+                ) == want
+            })
+            .expect("some port should hash to each pick")
+    }
+
+    #[tokio::test]
+    async fn router_multipath_capable_spreads_flows_by_hash() {
+        let (router, fwd_tx) = SessionOutboundRouter::new();
+        let (tx1, mut rx1) = mpsc::unbounded_channel::<SessionFrame>();
+        let (tx2, mut rx2) = mpsc::unbounded_channel::<SessionFrame>();
+        router.add_transport(1, tx1);
+        router.add_transport(2, tx2);
+
+        // Transport 1 is the last-active path: pre-multipath behavior
+        // would send everything there. The capability flag turns on
+        // per-flow spreading instead.
+        router.mark_active(1);
+        router.note_frame_flags(bonded_core::session::FLAG_MULTIPATH_RECV);
+
+        // A flow pinned to transport 2 must arrive there even though
+        // transport 1 is last-active.
+        fwd_tx
+            .send(flow_frame(40, flow_port_for_pick(1)))
+            .expect("send to router");
+        let got = timeout(Duration::from_secs(2), rx2.recv())
+            .await
+            .expect("rx2 timeout")
+            .expect("rx2 closed");
+        assert_eq!(got.header.sequence, 40);
+        assert!(
+            rx1.try_recv().is_err(),
+            "flow pinned to transport 2 must not arrive on transport 1"
+        );
+
+        // And a flow pinned to transport 1 stays there (per-flow
+        // stability, not round-robin).
+        fwd_tx
+            .send(flow_frame(41, flow_port_for_pick(0)))
+            .expect("send to router");
+        let got = timeout(Duration::from_secs(2), rx1.recv())
+            .await
+            .expect("rx1 timeout")
+            .expect("rx1 closed");
+        assert_eq!(got.header.sequence, 41);
+        assert!(rx2.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn router_without_capability_keeps_last_active_for_all_flows() {
+        let (router, fwd_tx) = SessionOutboundRouter::new();
+        let (tx1, mut rx1) = mpsc::unbounded_channel::<SessionFrame>();
+        let (tx2, mut rx2) = mpsc::unbounded_channel::<SessionFrame>();
+        router.add_transport(1, tx1);
+        router.add_transport(2, tx2);
+
+        // No FLAG_MULTIPATH_RECV is ever noted: even a flow whose hash
+        // would pin it to transport 1 must follow last_active (2),
+        // because an old client only reads its active transport.
+        router.mark_active(2);
+        fwd_tx
+            .send(flow_frame(42, flow_port_for_pick(0)))
+            .expect("send to router");
+        let got = timeout(Duration::from_secs(2), rx2.recv())
+            .await
+            .expect("rx2 timeout")
+            .expect("rx2 closed");
+        assert_eq!(got.header.sequence, 42);
+        assert!(
+            rx1.try_recv().is_err(),
+            "non-capable session must not spread by flow hash"
+        );
+    }
+
+    #[tokio::test]
+    async fn router_multipath_dead_hashed_pick_falls_back_with_same_frame() {
+        let (router, fwd_tx) = SessionOutboundRouter::new();
+        let (tx1, rx1) = mpsc::unbounded_channel::<SessionFrame>();
+        let (tx2, mut rx2) = mpsc::unbounded_channel::<SessionFrame>();
+        router.add_transport(1, tx1);
+        router.add_transport(2, tx2);
+        router.mark_active(2);
+        router.note_frame_flags(bonded_core::session::FLAG_MULTIPATH_RECV);
+
+        // The flow's hashed pick is transport 1, but its receiver is
+        // gone (transport died without explicit remove_transport).
+        drop(rx1);
+
+        fwd_tx
+            .send(flow_frame(43, flow_port_for_pick(0)))
+            .expect("send to router");
+        // The same frame must arrive on transport 2 via immediate
+        // retry — the flow re-pins instead of dropping the packet.
+        let got = timeout(Duration::from_secs(2), rx2.recv())
+            .await
+            .expect("rx2 timeout")
+            .expect("rx2 closed");
+        assert_eq!(got.header.sequence, 43);
+        assert_eq!(router.transport_count(), 1);
+    }
+
+    /// Build a downlink frame whose payload is a UDP packet for the flow
+    /// 10.9.0.2:<src_port> -> 127.0.0.1:40001, so tests can choose which
+    /// transport the flow hash pins it to.
+    fn test_udp_flow_frame(seq: u64, src_port: u16) -> SessionFrame {
+        let packet = build_ipv4_udp_packet(
+            Ipv4Addr::new(10, 9, 0, 2),
+            Ipv4Addr::new(127, 0, 0, 1),
+            src_port,
+            40001,
+            1234,
+            b"flow",
+        )
+        .expect("build udp packet");
+        SessionFrame {
+            header: SessionHeader {
+                connection_id: 0,
+                sequence: seq,
+                flags: 0,
+            },
+            payload: Bytes::from(packet),
+        }
+    }
+
+    /// Two source ports whose flows pin to different transports of the
+    /// sorted id set [1, 2] under the shared flow hash.
+    fn two_ports_pinned_apart() -> (u16, u16) {
+        let mut on_first: Option<u16> = None;
+        let mut on_second: Option<u16> = None;
+        for port in 20000..20100u16 {
+            let frame = test_udp_flow_frame(0, port);
+            let pick = bonded_core::flow::pick_index(
+                bonded_core::flow::flow_hash(&frame.payload),
+                2,
+            );
+            match pick {
+                0 => on_first = on_first.or(Some(port)),
+                _ => on_second = on_second.or(Some(port)),
+            }
+            if on_first.is_some() && on_second.is_some() {
+                break;
+            }
+        }
+        (
+            on_first.expect("a port should pin to transport 1"),
+            on_second.expect("a port should pin to transport 2"),
+        )
+    }
+
+    #[tokio::test]
+    async fn router_multipath_capable_spreads_flows_across_transports() {
+        let (router, fwd_tx) = SessionOutboundRouter::new();
+        let (tx1, mut rx1) = mpsc::unbounded_channel::<SessionFrame>();
+        let (tx2, mut rx2) = mpsc::unbounded_channel::<SessionFrame>();
+        router.add_transport(1, tx1);
+        router.add_transport(2, tx2);
+        // last_active says 1, but a capable client reads every transport,
+        // so flow pinning — not last_active — chooses per flow.
+        router.mark_active(1);
+        router.note_frame_flags(bonded_core::session::FLAG_MULTIPATH_RECV);
+
+        let (port_on_1, port_on_2) = two_ports_pinned_apart();
+        fwd_tx
+            .send(test_udp_flow_frame(40, port_on_2))
+            .expect("send to router");
+        let got = timeout(Duration::from_secs(2), rx2.recv())
+            .await
+            .expect("rx2 timeout")
+            .expect("rx2 closed");
+        assert_eq!(got.header.sequence, 40);
+        assert!(rx1.try_recv().is_err(), "flow pinned to 2 must not use 1");
+
+        fwd_tx
+            .send(test_udp_flow_frame(41, port_on_1))
+            .expect("send to router");
+        let got = timeout(Duration::from_secs(2), rx1.recv())
+            .await
+            .expect("rx1 timeout")
+            .expect("rx1 closed");
+        assert_eq!(got.header.sequence, 41);
+
+        // The pin is stable: the same flow keeps choosing transport 2.
+        fwd_tx
+            .send(test_udp_flow_frame(42, port_on_2))
+            .expect("send to router");
+        let got = timeout(Duration::from_secs(2), rx2.recv())
+            .await
+            .expect("rx2 timeout")
+            .expect("rx2 closed");
+        assert_eq!(got.header.sequence, 42);
+    }
+
+    #[tokio::test]
+    async fn router_without_capability_keeps_last_active_delivery() {
+        let (router, fwd_tx) = SessionOutboundRouter::new();
+        let (tx1, mut rx1) = mpsc::unbounded_channel::<SessionFrame>();
+        let (tx2, mut rx2) = mpsc::unbounded_channel::<SessionFrame>();
+        router.add_transport(1, tx1);
+        router.add_transport(2, tx2);
+        router.mark_active(1);
+        // No FLAG_MULTIPATH_RECV noted (old client): even a flow whose
+        // hash pins to transport 2 must be delivered on last_active (1),
+        // because the old client only reads its active transport.
+
+        let (_port_on_1, port_on_2) = two_ports_pinned_apart();
+        fwd_tx
+            .send(test_udp_flow_frame(50, port_on_2))
+            .expect("send to router");
+        let got = timeout(Duration::from_secs(2), rx1.recv())
+            .await
+            .expect("rx1 timeout")
+            .expect("rx1 closed");
+        assert_eq!(got.header.sequence, 50);
+        assert!(rx2.try_recv().is_err(), "old client must not be spread");
+    }
+
+    #[tokio::test]
+    async fn router_multipath_dead_pick_falls_back_with_same_frame() {
+        let (router, fwd_tx) = SessionOutboundRouter::new();
+        let (tx1, mut rx1) = mpsc::unbounded_channel::<SessionFrame>();
+        let (tx2, rx2) = mpsc::unbounded_channel::<SessionFrame>();
+        router.add_transport(1, tx1);
+        router.add_transport(2, tx2);
+        router.mark_active(1);
+        router.note_frame_flags(bonded_core::session::FLAG_MULTIPATH_RECV);
+
+        // Transport 2 dies silently (receiver dropped, no remove call).
+        drop(rx2);
+
+        let (_port_on_1, port_on_2) = two_ports_pinned_apart();
+        fwd_tx
+            .send(test_udp_flow_frame(60, port_on_2))
+            .expect("send to router");
+        // The pinned transport is dead: the same frame must be retried
+        // on the survivor (re-pinning the flow), not dropped.
+        let got = timeout(Duration::from_secs(2), rx1.recv())
+            .await
+            .expect("rx1 timeout")
+            .expect("rx1 closed");
+        assert_eq!(got.header.sequence, 60);
         assert_eq!(router.transport_count(), 1);
     }
 

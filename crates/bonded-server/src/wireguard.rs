@@ -823,6 +823,9 @@ async fn handle_decoded_frames(
         maybe_log_tunnel_packet(tunnel_pcap, &frame.payload);
 
         if frame.header.flags & FLAG_PING != 0 && frame.payload.is_empty() {
+            if let Some(ctx) = &peer.session_ctx {
+                ctx.router.note_frame_flags(frame.header.flags);
+            }
             info!(
                 session_id = peer.session_id,
                 public_key = %peer.public_key,
@@ -873,7 +876,7 @@ async fn handle_decoded_frames(
 
         if let Some(forwarder) = &peer.forwarder {
             if let Some(ctx) = &peer.session_ctx {
-                ctx.router.mark_active(peer.transport_id);
+                ctx.router.note_frame(peer.transport_id, frame.header.flags);
             }
             forwarder.ingest_packet(frame);
         }

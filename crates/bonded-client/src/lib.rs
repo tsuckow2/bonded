@@ -3,7 +3,9 @@ use async_trait::async_trait;
 use bonded_core::auth::{sign_auth_challenge, DeviceKeypair};
 use bonded_core::config::ClientConfig;
 #[cfg(target_os = "linux")]
-use bonded_core::session::{SessionFrame, SessionHeader, SessionState, FLAG_PING, FLAG_PONG};
+use bonded_core::session::{
+    SessionFrame, SessionHeader, SessionState, FLAG_MULTIPATH_RECV, FLAG_PING, FLAG_PONG,
+};
 use bonded_core::transport::{
     NaiveTcpTransport, QuicTransport, Transport, WebSocketTlsTransport, WireGuardTransport,
 };
@@ -2317,6 +2319,58 @@ fn build_tun_config(tun_name: &str) -> Configuration {
     config
 }
 
+/// Indices of the direct (non-peer-relay) transports, in vec order.
+/// These are the paths eligible for multipath flow spreading; relay
+/// transports keep active/standby semantics. (Mirror of the helper in
+/// bonded-ffi's Android worker.)
+#[cfg(target_os = "linux")]
+fn direct_transport_indices(transports: &[ClientTransport]) -> Vec<usize> {
+    transports
+        .iter()
+        .enumerate()
+        .filter(|(_, transport)| {
+            !matches!(transport, ClientTransport::PeerRelay { .. })
+        })
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// Poll every transport's `recv()` concurrently and return the frames
+/// that complete: the first one awaited, plus whatever else is already
+/// buffered (bounded drain, no waiting). Every transport impl's `recv()`
+/// is cancel-safe (persistent read buffers / datagram atomicity), so
+/// dropping the still-pending futures when the caller's `select!` picks
+/// another branch loses nothing. (Mirror of the helper in bonded-ffi's
+/// Android worker.)
+#[cfg(target_os = "linux")]
+async fn recv_batch(
+    transports: &mut [ClientTransport],
+) -> Vec<(usize, anyhow::Result<SessionFrame>)> {
+    use futures_util::future::FutureExt;
+    use futures_util::stream::{FuturesUnordered, StreamExt};
+
+    if transports.is_empty() {
+        std::future::pending::<()>().await;
+        unreachable!("recv_batch resumed with no transports");
+    }
+    let mut set: FuturesUnordered<_> = transports
+        .iter_mut()
+        .enumerate()
+        .map(|(index, transport)| async move { (index, transport.recv().await) })
+        .collect();
+    let mut events = Vec::new();
+    if let Some(first) = set.next().await {
+        events.push(first);
+    }
+    while events.len() < 64 {
+        match set.next().now_or_never() {
+            Some(Some(event)) => events.push(event),
+            _ => break,
+        }
+    }
+    events
+}
+
 #[cfg(target_os = "linux")]
 async fn run_linux_packet_loop(
     tun_name: &str,
@@ -2338,7 +2392,7 @@ async fn run_linux_packet_loop(
             header: SessionHeader {
                 connection_id: 0,
                 sequence: 0,
-                flags: FLAG_PING,
+                flags: FLAG_PING | FLAG_MULTIPATH_RECV,
             },
             payload: Bytes::new(),
         };
@@ -2372,12 +2426,17 @@ async fn run_linux_packet_loop(
     }
     let mut state = SessionState::new(session_id);
     let mut tun_buf = vec![0_u8; 8192];
-    // Path liveness: send periodic PINGs; if no PONG arrives within the
-    // timeout, the path is blackholed (send() may still return Ok while the
-    // kernel buffers into Send-Q). Fail over to the next path.
+    // Path liveness: send periodic PINGs on every path; if a path's PONG
+    // has been silent past the timeout, that path is blackholed (send()
+    // may still return Ok while the kernel buffers into Send-Q). Drop it
+    // and fail over. Per-index pong times are reseeded whenever the
+    // transport count changes, since removals shift indices (the same
+    // discipline the Android worker uses for its per-index counters).
     let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut last_pong = Instant::now();
+    let mut last_pong_by_index: std::collections::HashMap<usize, Instant> =
+        (0..transports.len()).map(|i| (i, Instant::now())).collect();
+    let mut last_transport_count = transports.len();
     // Skip the immediate first tick; we just completed binding.
     heartbeat.tick().await;
 
@@ -2390,61 +2449,117 @@ async fn run_linux_packet_loop(
                     continue;
                 }
 
-                let frame = state.create_outbound_frame(Bytes::copy_from_slice(&tun_buf[..read]), 0);
-                // Deep-dive: log data frame sends on peer transports to trace HTTP SYN path.
-                let kind = transports[active_index].kind();
-                if matches!(kind, bonded_core::transport::TransportKind::Quic) {
-                    debug!(active_path = active_index, kind = ?kind, payload_len = read, seq = frame.header.sequence, "sending TUN data frame on peer path");
-                }
-                match transports[active_index].send(frame).await {
-                    Ok(()) => {}
-                    Err(err) => {
-                        if transports.len() == 1 {
-                            return Err(err);
-                        }
-
-                        transports.remove(active_index);
-                        if active_index >= transports.len() {
-                            active_index = 0;
-                        }
-                        info!(active_path = active_index, remaining_paths = transports.len(), "switched active path after send failure");
+                let packet = Bytes::copy_from_slice(&tun_buf[..read]);
+                let frame = state.create_outbound_frame(packet.clone(), 0);
+                // Multipath spreading: pin the flow to a direct
+                // transport by hash (see the Android worker in
+                // bonded-ffi for the full rationale). Candidates are
+                // the hashed pick first, then the other direct
+                // transports, then the active transport as a last
+                // resort. A failed candidate is removed and the next
+                // one is tried with the same frame; failing the last
+                // remaining transport ends the session, as before.
+                let flow = bonded_core::flow::flow_hash(&packet);
+                let mut candidates = direct_transport_indices(&transports);
+                if candidates.is_empty() {
+                    candidates.push(active_index);
+                } else {
+                    let pick = bonded_core::flow::pick_index(flow, candidates.len());
+                    candidates.rotate_left(pick);
+                    if !candidates.contains(&active_index) {
+                        candidates.push(active_index);
                     }
+                }
+                let mut send_queue: std::collections::VecDeque<usize> = candidates.into();
+                let mut sent = false;
+                while let Some(index) = send_queue.pop_front() {
+                    match transports[index].send(frame.clone()).await {
+                        Ok(()) => {
+                            sent = true;
+                            break;
+                        }
+                        Err(err) => {
+                            if transports.len() == 1 {
+                                return Err(err);
+                            }
+                            transports.remove(index);
+                            if index < active_index {
+                                active_index -= 1;
+                            } else if index == active_index
+                                && active_index >= transports.len()
+                            {
+                                active_index = 0;
+                            }
+                            for queued in send_queue.iter_mut() {
+                                if *queued > index {
+                                    *queued -= 1;
+                                }
+                            }
+                            info!(active_path = active_index, remaining_paths = transports.len(), "switched path after send failure");
+                        }
+                    }
+                }
+                if !sent {
+                    // Every candidate failed but transports remain: drop
+                    // the packet (IP tolerates loss).
+                    debug!("dropped TUN packet after all send candidates failed");
                 }
             }
             _ = heartbeat.tick() => {
-                // Liveness check: if no PONG since the timeout, the active
-                // path is blackholed. Drop it and fail over.
-                if last_pong.elapsed() > Duration::from_secs(15) {
-                    warn!(active_path = active_index, "heartbeat timeout: no PONG in 15s, dropping blackholed path");
-                    transports.remove(active_index);
-                    if transports.is_empty() {
-                        anyhow::bail!("all paths lost liveness");
-                    }
-                    if active_index >= transports.len() {
-                        active_index = 0;
-                    }
-                    last_pong = Instant::now();
-                    continue;
+                // Reseed per-index pong times whenever the transport set
+                // changed size since the last tick (indices shifted).
+                if transports.len() != last_transport_count {
+                    last_pong_by_index = (0..transports.len())
+                        .map(|i| (i, Instant::now()))
+                        .collect();
+                    last_transport_count = transports.len();
                 }
-                // Send PING on the active path.
+                // PING every path, not just the active one: the server
+                // reaps transports it receives nothing on for 30s.
                 let ping = SessionFrame {
                     header: SessionHeader {
                         connection_id: session_id,
                         sequence: 0,
-                        flags: FLAG_PING,
+                        flags: FLAG_PING | FLAG_MULTIPATH_RECV,
                     },
                     payload: Bytes::new(),
                 };
-                if let Err(err) = transports[active_index].send(ping).await {
-                    warn!(active_path = active_index, error = %err, "heartbeat ping send failed, dropping path");
-                    transports.remove(active_index);
-                    if transports.is_empty() {
-                        anyhow::bail!("all paths failed");
+                let mut failed: Vec<usize> = Vec::new();
+                for index in 0..transports.len() {
+                    if let Err(err) = transports[index].send(ping.clone()).await {
+                        warn!(path = index, error = %err, "heartbeat ping send failed, dropping path");
+                        failed.push(index);
                     }
-                    if active_index >= transports.len() {
+                }
+                // A path whose PONG has been silent for 15s is
+                // blackholed even if its sends still succeed.
+                let now = Instant::now();
+                for index in 0..transports.len() {
+                    if failed.contains(&index) {
+                        continue;
+                    }
+                    let silent = last_pong_by_index
+                        .get(&index)
+                        .map(|pong| now.duration_since(*pong) > Duration::from_secs(15))
+                        .unwrap_or(false);
+                    if silent {
+                        warn!(path = index, "heartbeat timeout: no PONG in 15s, dropping blackholed path");
+                        failed.push(index);
+                    }
+                }
+                // Descending order: removals leave lower indices valid.
+                failed.sort_unstable_by(|a, b| b.cmp(a));
+                failed.dedup();
+                for index in failed {
+                    transports.remove(index);
+                    if transports.is_empty() {
+                        anyhow::bail!("all paths lost");
+                    }
+                    if index < active_index {
+                        active_index -= 1;
+                    } else if index == active_index && active_index >= transports.len() {
                         active_index = 0;
                     }
-                    last_pong = Instant::now();
                 }
             }
             peer_transport = peer_transport_rx.recv() => {
@@ -2454,35 +2569,42 @@ async fn run_linux_packet_loop(
                     info!(kind = ?kind, total_paths = transports.len(), "added peer-share transport path");
                 }
             }
-            frame_result = transports[active_index].recv() => {
-                match frame_result {
-                    Ok(frame) => {
-                        // Heartbeat pongs are liveness replies, not TUN data: keep them
-                        // out of the session reorder buffer and off the TUN device.
-                        if frame.header.flags & FLAG_PONG != 0 {
-                            last_pong = Instant::now();
-                            continue;
+            recv_events = recv_batch(&mut transports) => {
+                // Receive on every transport (multipath). Data frames
+                // first; errors afterwards in descending index order so
+                // removals leave the remaining error indices valid.
+                let mut errors: Vec<(usize, anyhow::Error)> = Vec::new();
+                for (index, result) in recv_events {
+                    match result {
+                        Ok(frame) => {
+                            // Heartbeat pongs are liveness replies, not TUN data: keep them
+                            // out of the session reorder buffer and off the TUN device.
+                            if frame.header.flags & FLAG_PONG != 0 {
+                                last_pong_by_index.insert(index, Instant::now());
+                                continue;
+                            }
+                            let ready = state.ingest_inbound(frame)?;
+                            for packet in ready {
+                                let _ = device.send(&packet.payload).await?;
+                            }
                         }
-                        let ready = state.ingest_inbound(frame)?;
-                        for packet in ready {
-                            let _ = device.send(&packet.payload).await?;
-                        }
+                        Err(err) => errors.push((index, err)),
                     }
-                    Err(err) => {
-                        // Deep-dive: log the actual recv error and which transport kind failed.
-                        // This is critical for diagnosing the peer QUIC path dying on HTTP data.
-                        let kind = transports[active_index].kind();
-                        warn!(active_path = active_index, kind = ?kind, error = %err, "recv failed on active path");
-                        if transports.len() == 1 {
-                            return Err(err);
-                        }
-
-                        transports.remove(active_index);
-                        if active_index >= transports.len() {
-                            active_index = 0;
-                        }
-                        info!(active_path = active_index, remaining_paths = transports.len(), "switched active path after recv failure");
+                }
+                errors.sort_by_key(|(index, _)| std::cmp::Reverse(*index));
+                for (index, err) in errors {
+                    let kind = transports[index].kind();
+                    warn!(path = index, kind = ?kind, error = %err, "recv failed on path");
+                    if transports.len() == 1 {
+                        return Err(err);
                     }
+                    transports.remove(index);
+                    if index < active_index {
+                        active_index -= 1;
+                    } else if index == active_index && active_index >= transports.len() {
+                        active_index = 0;
+                    }
+                    info!(active_path = active_index, remaining_paths = transports.len(), "switched active path after recv failure");
                 }
             }
         }

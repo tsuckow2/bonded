@@ -1013,6 +1013,7 @@ async fn handle_transport_session<T: Transport>(
         if let Some(frame) = pending_frame.take() {
             log_tunnel_packet(&tunnel_pcap, &frame.payload);
             if frame.header.flags & FLAG_PING != 0 && frame.payload.is_empty() {
+                session_ctx.router.note_frame_flags(frame.header.flags);
                 let pong = SessionFrame {
                     header: SessionHeader {
                         connection_id: handle.session_id as u32,
@@ -1027,7 +1028,7 @@ async fn handle_transport_session<T: Transport>(
                     break;
                 }
             } else {
-                session_ctx.router.mark_active(transport_id);
+                session_ctx.router.note_frame(transport_id, frame.header.flags);
                 forwarder.ingest_packet(frame);
             }
             continue;
@@ -1070,6 +1071,7 @@ async fn handle_transport_session<T: Transport>(
                         }
                         log_tunnel_packet(&tunnel_pcap, &frame.payload);
                         if frame.header.flags & FLAG_PING != 0 && frame.payload.is_empty() {
+                            session_ctx.router.note_frame_flags(frame.header.flags);
                             let pong = SessionFrame {
                                 header: SessionHeader {
                                     connection_id: handle.session_id as u32,
@@ -1085,7 +1087,7 @@ async fn handle_transport_session<T: Transport>(
                             }
                             continue;
                         }
-                        session_ctx.router.mark_active(transport_id);
+                        session_ctx.router.note_frame(transport_id, frame.header.flags);
                         forwarder.ingest_packet(frame);
                     }
                     Err(err) => {

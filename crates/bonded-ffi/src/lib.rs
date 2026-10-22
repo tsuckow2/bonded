@@ -11,7 +11,9 @@ use bonded_core::config::SocketNetworkBindFn;
 use bonded_core::config::SocketProtectFn;
 use bonded_core::session::SessionFrame;
 #[cfg(any(target_os = "android", test))]
-use bonded_core::session::{SessionHeader, SessionState, FLAG_PING, FLAG_PONG};
+use bonded_core::session::{
+    SessionHeader, SessionState, FLAG_MULTIPATH_RECV, FLAG_PING, FLAG_PONG,
+};
 #[cfg(any(target_os = "android", test))]
 use bonded_core::transport::{NaiveTcpTransport, Transport};
 #[cfg(any(target_os = "android", test))]
@@ -580,6 +582,60 @@ fn client_transport_kind(transport: &ClientTransport) -> &'static str {
     }
 }
 
+/// Indices of the direct (non-peer-relay) transports, in vec order.
+/// These are the paths eligible for multipath flow spreading; relay
+/// transports keep active/standby semantics.
+#[cfg(any(target_os = "android", test))]
+fn direct_transport_indices(transports: &[ClientTransport]) -> Vec<usize> {
+    transports
+        .iter()
+        .enumerate()
+        .filter(|(_, transport)| {
+            !matches!(transport, ClientTransport::PeerRelay { .. })
+        })
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// Poll every transport's `recv()` concurrently and return the frames
+/// that complete: the first one awaited, plus whatever else is already
+/// buffered (bounded drain, no waiting). Every transport impl's `recv()`
+/// is cancel-safe (persistent read buffers / datagram atomicity), so
+/// dropping the still-pending futures when the caller's `select!` picks
+/// another branch loses nothing.
+///
+/// Events carry their transport's vec index at poll time. Callers must
+/// process removals carefully (errors in descending index order) because
+/// removing a transport shifts the indices above it.
+#[cfg(any(target_os = "android", test))]
+async fn recv_batch(
+    transports: &mut [ClientTransport],
+) -> Vec<(usize, anyhow::Result<SessionFrame>)> {
+    use futures_util::future::FutureExt;
+    use futures_util::stream::{FuturesUnordered, StreamExt};
+
+    if transports.is_empty() {
+        std::future::pending::<()>().await;
+        unreachable!("recv_batch resumed with no transports");
+    }
+    let mut set: FuturesUnordered<_> = transports
+        .iter_mut()
+        .enumerate()
+        .map(|(index, transport)| async move { (index, transport.recv().await) })
+        .collect();
+    let mut events = Vec::new();
+    if let Some(first) = set.next().await {
+        events.push(first);
+    }
+    while events.len() < 64 {
+        match set.next().now_or_never() {
+            Some(Some(event)) => events.push(event),
+            _ => break,
+        }
+    }
+    events
+}
+
 #[cfg(any(target_os = "android", test))]
 fn sync_transport_snapshot(
     snapshot: &Arc<Mutex<AndroidSessionSnapshot>>,
@@ -893,7 +949,7 @@ fn start_android_session(
                     header: SessionHeader {
                         connection_id: 0,
                         sequence: 0,
-                        flags: FLAG_PING,
+                        flags: FLAG_PING | FLAG_MULTIPATH_RECV,
                     },
                     payload: Bytes::new(),
                 };
@@ -1086,37 +1142,106 @@ fn start_android_session(
                                 }
 
                                 let packet_len = packet.len() as u64;
+                                // Multipath spreading: pin this packet's
+                                // flow to a direct transport by hash, so
+                                // every direct path carries real traffic
+                                // instead of only the active one. Candidates
+                                // are the hashed pick first, then the other
+                                // direct transports, then the active
+                                // transport as a last resort (which also
+                                // covers the relay-only case). With a
+                                // single direct transport this reduces to
+                                // exactly the pre-multipath behavior.
+                                let flow = bonded_core::flow::flow_hash(&packet);
                                 let frame = session.create_outbound_frame(Bytes::from(packet), 0);
-                                if let Err(err) = transports[active_index].send(frame).await {
-                                    alog_warn!("Worker: send on transport[{}] failed: {}", active_index, err);
-                                    if transports.len() == 1 {
-                                        alog_error!("Worker: only one transport available, cannot failover");
-                                        update_snapshot(&worker_snapshot, |session_snapshot| {
-                                            session_snapshot.state = "error".to_owned();
-                                            session_snapshot.last_error = Some(err.to_string());
-                                        });
-                                        break;
+                                let mut candidates =
+                                    direct_transport_indices(&transports);
+                                if candidates.is_empty() {
+                                    candidates.push(active_index);
+                                } else {
+                                    let pick = bonded_core::flow::pick_index(
+                                        flow,
+                                        candidates.len(),
+                                    );
+                                    candidates.rotate_left(pick);
+                                    if !candidates.contains(&active_index) {
+                                        candidates.push(active_index);
                                     }
-
-                                    if let Some(lost_path) =
-                                        path_index_map.path_of(active_index)
-                                    {
-                                        let _ = path_lost_tx.send(lost_path);
-                                    }
-                                    let old_index = active_index;
-                                    transports.remove(active_index);
-                                    path_index_map.on_remove(active_index);
-                                    if active_index >= transports.len() {
-                                        active_index = 0;
-                                    }
-                                    sync_transport_snapshot(&worker_snapshot, &transports, active_index);
-                                    alog_warn!("Worker: failover from transport[{}] to transport[{}]", old_index, active_index);
-                                    continue;
                                 }
-                                update_snapshot(&worker_snapshot, |session_snapshot| {
-                                    session_snapshot.outbound_packets = session_snapshot.outbound_packets.saturating_add(1);
-                                    session_snapshot.outbound_bytes = session_snapshot.outbound_bytes.saturating_add(packet_len);
-                                });
+                                let mut send_queue: std::collections::VecDeque<usize> =
+                                    candidates.into();
+                                let mut sent = false;
+                                let mut fatal_error: Option<String> = None;
+                                while let Some(index) = send_queue.pop_front() {
+                                    match transports[index].send(frame.clone()).await {
+                                        Ok(()) => {
+                                            sent = true;
+                                            break;
+                                        }
+                                        Err(err) => {
+                                            alog_warn!(
+                                                "Worker: send on transport[{}] failed: {}",
+                                                index, err
+                                            );
+                                            if transports.len() == 1 {
+                                                fatal_error = Some(err.to_string());
+                                                break;
+                                            }
+                                            if let Some(lost_path) =
+                                                path_index_map.path_of(index)
+                                            {
+                                                let _ = path_lost_tx.send(lost_path);
+                                            }
+                                            transports.remove(index);
+                                            path_index_map.on_remove(index);
+                                            if index < active_index {
+                                                active_index -= 1;
+                                            } else if index == active_index
+                                                && active_index >= transports.len()
+                                            {
+                                                active_index = 0;
+                                            }
+                                            // The removal shifts every
+                                            // queued candidate above the
+                                            // removed index down by one.
+                                            for queued in send_queue.iter_mut() {
+                                                if *queued > index {
+                                                    *queued -= 1;
+                                                }
+                                            }
+                                            sync_transport_snapshot(
+                                                &worker_snapshot,
+                                                &transports,
+                                                active_index,
+                                            );
+                                        }
+                                    }
+                                }
+                                if let Some(message) = fatal_error {
+                                    alog_error!(
+                                        "Worker: only one transport available, cannot failover"
+                                    );
+                                    update_snapshot(&worker_snapshot, |session_snapshot| {
+                                        session_snapshot.state = "error".to_owned();
+                                        session_snapshot.last_error = Some(message);
+                                    });
+                                    break;
+                                }
+                                if sent {
+                                    update_snapshot(&worker_snapshot, |session_snapshot| {
+                                        session_snapshot.outbound_packets = session_snapshot.outbound_packets.saturating_add(1);
+                                        session_snapshot.outbound_bytes = session_snapshot.outbound_bytes.saturating_add(packet_len);
+                                    });
+                                } else {
+                                    // Every candidate failed but other
+                                    // transports remain: drop the frame
+                                    // (the inner IP protocols tolerate
+                                    // loss) and let the supervisor restore
+                                    // the direct paths.
+                                    alog_warn!(
+                                        "Worker: dropped outbound frame after all send candidates failed"
+                                    );
+                                }
                             }
                             None => {
                                 alog_info!("Worker: outbound channel closed");
@@ -1124,79 +1249,47 @@ fn start_android_session(
                             }
                         }
                     }
-                    frame_result = transports[active_index].recv() => {
-                        // Log which transport is receiving.
-                        match frame_result {
-                            Ok(frame) => {
-                                // Handle heartbeat pong — don't feed it to the session reorder buffer.
-                                if frame.header.flags & FLAG_PONG != 0 {
-                                    let now_ms = SystemTime::now()
-                                        .duration_since(UNIX_EPOCH)
-                                        .map(|d| d.as_millis() as u64)
-                                        .unwrap_or(0);
-                                    let rtt_ms = last_ping_sent_ms
-                                        .map(|sent| now_ms.saturating_sub(sent));
-                                    if let Some(rtt) = rtt_ms {
-                                        alog_info!(
-                                            "Heartbeat pong received: seq={} rtt={}ms",
-                                            frame.header.sequence, rtt
-                                        );
-                                    } else {
-                                        alog_info!(
-                                            "Heartbeat pong received: seq={}",
-                                            frame.header.sequence
-                                        );
-                                    }
-                                    continue;
-                                }
-
-                                // Deliver the response payload immediately without reordering.
-                                // At the raw-IP VPN layer the Android kernel handles its own
-                                // TCP reordering; forcing in-order delivery here causes inbound
-                                // to stall whenever the server drops a response (e.g. UDP timeout).
-                                if !frame.payload.is_empty() {
-                                    let payload = frame.payload.to_vec();
-                                    let payload_len = payload.len() as u64;
-                                    let delivered_to_tun = {
-                                        #[cfg(target_os = "android")]
-                                        {
-                                            write_inbound_packet_to_tun(&payload)
+                    recv_events = recv_batch(&mut transports) => {
+                        // Receive on EVERY transport (multipath): downlink
+                        // flows may arrive on any path now that the server
+                        // spreads them per-flow for clients that advertise
+                        // FLAG_MULTIPATH_RECV. Data/pong frames are handled
+                        // first since they change no structure; recv errors
+                        // are handled afterwards in DESCENDING index order
+                        // so each removal leaves the remaining error
+                        // indices valid.
+                        let mut errors: Vec<(usize, anyhow::Error)> = Vec::new();
+                        for (_index, result) in recv_events {
+                            match result {
+                                Ok(frame) => {
+                                    // Handle heartbeat pong — don't feed it to the session reorder buffer.
+                                    if frame.header.flags & FLAG_PONG != 0 {
+                                        let now_ms = SystemTime::now()
+                                            .duration_since(UNIX_EPOCH)
+                                            .map(|d| d.as_millis() as u64)
+                                            .unwrap_or(0);
+                                        let rtt_ms = last_ping_sent_ms
+                                            .map(|sent| now_ms.saturating_sub(sent));
+                                        if let Some(rtt) = rtt_ms {
+                                            alog_info!(
+                                                "Heartbeat pong received: seq={} rtt={}ms",
+                                                frame.header.sequence, rtt
+                                            );
+                                        } else {
+                                            alog_info!(
+                                                "Heartbeat pong received: seq={}",
+                                                frame.header.sequence
+                                            );
                                         }
-                                        #[cfg(not(target_os = "android"))]
-                                        {
-                                            false
-                                        }
-                                    };
-                                    if !delivered_to_tun {
-                                        worker_inbound_queue
-                                            .lock()
-                                            .expect("android inbound queue lock poisoned")
-                                            .push_back(payload);
-                                    }
-                                    update_snapshot(&worker_snapshot, |session_snapshot| {
-                                        session_snapshot.inbound_packets = session_snapshot.inbound_packets.saturating_add(1);
-                                        session_snapshot.inbound_bytes = session_snapshot.inbound_bytes.saturating_add(payload_len);
-                                    });
-                                }
-
-                                // Drain all frames already buffered in the transport without
-                                // yielding back to tokio::select!. Each select! iteration has
-                                // scheduler overhead, so processing one frame per iteration
-                                // limits download throughput when the server bursts many frames.
-                                // timeout(ZERO) polls recv() once: if a full frame is already in
-                                // the read buffer it completes immediately; otherwise it times out
-                                // and we yield back to select! for fairness with outbound traffic.
-                                while let Ok(Ok(next_frame)) = tokio::time::timeout(
-                                    Duration::ZERO,
-                                    transports[active_index].recv(),
-                                )
-                                .await
-                                {
-                                    if next_frame.header.flags & FLAG_PONG != 0 {
                                         continue;
                                     }
-                                    if !next_frame.payload.is_empty() {
-                                        let payload = next_frame.payload.to_vec();
+
+                                    // Deliver the response payload immediately without reordering.
+                                    // At the raw-IP VPN layer the Android kernel handles its own
+                                    // TCP reordering; forcing in-order delivery here causes inbound
+                                    // to stall whenever the server drops a response (e.g. UDP timeout).
+                                    if !frame.payload.is_empty() {
+                                        let payload = frame.payload.to_vec();
                                         let payload_len = payload.len() as u64;
                                         let delivered_to_tun = {
                                             #[cfg(target_os = "android")]
@@ -1214,41 +1307,49 @@ fn start_android_session(
                                                 .expect("android inbound queue lock poisoned")
                                                 .push_back(payload);
                                         }
-                                        update_snapshot(
-                                            &worker_snapshot,
-                                            |session_snapshot| {
-                                                session_snapshot.inbound_packets = session_snapshot.inbound_packets.saturating_add(1);
-                                                session_snapshot.inbound_bytes = session_snapshot.inbound_bytes.saturating_add(payload_len);
-                                            },
-                                        );
+                                        update_snapshot(&worker_snapshot, |session_snapshot| {
+                                            session_snapshot.inbound_packets = session_snapshot.inbound_packets.saturating_add(1);
+                                            session_snapshot.inbound_bytes = session_snapshot.inbound_bytes.saturating_add(payload_len);
+                                        });
                                     }
                                 }
+                                Err(err) => errors.push((_index, err)),
                             }
-                            Err(err) => {
-                                alog_warn!("Worker: recv on transport[{}] failed: {}", active_index, err);
-                                if transports.len() == 1 {
-                                    alog_error!("Worker: only one transport, cannot failover");
-                                    update_snapshot(&worker_snapshot, |session_snapshot| {
-                                        session_snapshot.state = "error".to_owned();
-                                        session_snapshot.last_error = Some(err.to_string());
-                                    });
-                                    break;
-                                }
+                        }
+                        errors.sort_by_key(|(index, _)| std::cmp::Reverse(*index));
+                        let mut session_failed = false;
+                        for (index, err) in errors {
+                            alog_warn!("Worker: recv on transport[{}] failed: {}", index, err);
+                            if transports.len() == 1 {
+                                alog_error!("Worker: only one transport, cannot failover");
+                                update_snapshot(&worker_snapshot, |session_snapshot| {
+                                    session_snapshot.state = "error".to_owned();
+                                    session_snapshot.last_error = Some(err.to_string());
+                                });
+                                session_failed = true;
+                                break;
+                            }
 
-                                if let Some(lost_path) =
-                                    path_index_map.path_of(active_index)
-                                {
-                                    let _ = path_lost_tx.send(lost_path);
-                                }
-                                let old_index = active_index;
-                                transports.remove(active_index);
-                                path_index_map.on_remove(active_index);
-                                if active_index >= transports.len() {
-                                    active_index = 0;
-                                }
-                                sync_transport_snapshot(&worker_snapshot, &transports, active_index);
-                                alog_warn!("Worker: failover from recv error on transport[{}] to transport[{}]", old_index, active_index);
+                            if let Some(lost_path) =
+                                path_index_map.path_of(index)
+                            {
+                                let _ = path_lost_tx.send(lost_path);
                             }
+                            let was_active = index == active_index;
+                            transports.remove(index);
+                            path_index_map.on_remove(index);
+                            if index < active_index {
+                                active_index -= 1;
+                            } else if was_active && active_index >= transports.len() {
+                                active_index = 0;
+                            }
+                            sync_transport_snapshot(&worker_snapshot, &transports, active_index);
+                            if was_active {
+                                alog_warn!("Worker: failover from recv error on transport[{}] to transport[{}]", index, active_index);
+                            }
+                        }
+                        if session_failed {
+                            break;
                         }
                     }
                     _ = heartbeat.tick() => {
@@ -1260,7 +1361,7 @@ fn start_android_session(
                             header: bonded_core::session::SessionHeader {
                                 connection_id: 0,
                                 sequence: ping_sequence,
-                                flags: FLAG_PING,
+                                flags: FLAG_PING | FLAG_MULTIPATH_RECV,
                             },
                             payload: Bytes::new(),
                         };
@@ -1831,7 +1932,9 @@ mod tests {
     };
     use bonded_client::ClientTransport;
     use bonded_core::auth::{create_auth_challenge, verify_auth_challenge};
-    use bonded_core::session::{SessionFrame, SessionHeader, FLAG_PING, FLAG_PONG};
+    use bonded_core::session::{
+        SessionFrame, SessionHeader, FLAG_MULTIPATH_RECV, FLAG_PING, FLAG_PONG,
+    };
     use bonded_core::transport::{NaiveTcpTransport, Transport};
     use bytes::Bytes;
     use serde_json::json;
@@ -2170,9 +2273,12 @@ mod tests {
                 }
             });
 
-            // Standby: answer its heartbeat pings until told to drop
-            // the connection — the silent-death case the supervisor
-            // exists for.
+            // Standby: answer its heartbeat pings and echo data
+            // frames (the real server forwards data arriving on ANY
+            // transport; since the multipath client spreads flows
+            // across both paths, the mock must too) until told to
+            // drop the connection — the silent-death case the
+            // supervisor exists for.
             tokio::select! {
                 _ = kill_rx => {}
                 _ = async {
@@ -2191,6 +2297,10 @@ mod tests {
                                     if transport1.send(pong).await.is_err() {
                                         break;
                                     }
+                                } else if !frame.payload.is_empty()
+                                    && transport1.send(frame).await.is_err()
+                                {
+                                    break;
                                 }
                             }
                             Err(_) => break,
@@ -2229,8 +2339,32 @@ mod tests {
                 })
                 .await
                 .expect("redial binding pong should send");
-            // Hold the restored path open until the client goes away.
-            let _ = transport1b.recv().await;
+            // Serve the restored path (pongs + data echo, like every
+            // other path) until the client goes away.
+            loop {
+                match transport1b.recv().await {
+                    Ok(frame) => {
+                        if frame.header.flags & FLAG_PING != 0 {
+                            let pong = SessionFrame {
+                                header: SessionHeader {
+                                    connection_id: 3,
+                                    sequence: frame.header.sequence,
+                                    flags: FLAG_PONG,
+                                },
+                                payload: Bytes::new(),
+                            };
+                            if transport1b.send(pong).await.is_err() {
+                                break;
+                            }
+                        } else if !frame.payload.is_empty()
+                            && transport1b.send(frame).await.is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
             drop(pump0);
         });
 
@@ -2336,6 +2470,383 @@ mod tests {
             })
             .expect("inbound packet should echo after the restore");
         assert_eq!(echoed, b"f4-after");
+
+        stop_android_session();
+        runtime
+            .block_on(server_task)
+            .expect("server task should join");
+        let _ = fs::remove_dir_all(storage_dir);
+    }
+
+    /// Build a raw IPv4/UDP packet (10.8.0.2:<src_port> ->
+    /// 203.0.113.7:443) carrying `marker`. Only the header fields feed
+    /// the flow hash; checksums are left zero because neither the
+    /// worker nor the mock server validates them.
+    fn mp_udp_packet(src_port: u16, marker: &[u8]) -> Vec<u8> {
+        let total_len = 20 + 8 + marker.len();
+        let mut packet = Vec::with_capacity(total_len);
+        packet.push(0x45); // IPv4, IHL 20
+        packet.push(0);
+        packet.extend_from_slice(&(total_len as u16).to_be_bytes());
+        packet.extend_from_slice(&[0, 0, 0, 0]); // id + flags/fragment
+        packet.push(64); // TTL
+        packet.push(17); // UDP
+        packet.extend_from_slice(&[0, 0]); // header checksum
+        packet.extend_from_slice(&[10, 8, 0, 2]);
+        packet.extend_from_slice(&[203, 0, 113, 7]);
+        packet.extend_from_slice(&src_port.to_be_bytes());
+        packet.extend_from_slice(&443u16.to_be_bytes());
+        packet.extend_from_slice(&((8 + marker.len()) as u16).to_be_bytes());
+        packet.extend_from_slice(&[0, 0]); // UDP checksum
+        packet.extend_from_slice(marker);
+        packet
+    }
+
+    #[test]
+    fn android_session_spreads_flows_across_both_paths() {
+        let _guard = session_test_lock();
+        let runtime = tokio::runtime::Runtime::new().expect("runtime should build");
+        let storage_dir = temp_dir_path("android-session-multipath");
+        fs::create_dir_all(&storage_dir).expect("storage dir should be created");
+
+        let listener = runtime
+            .block_on(TcpListener::bind("127.0.0.1:0"))
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("local addr should resolve");
+
+        // Two flows pinned to different paths by the shared flow hash
+        // (candidate order = transports vec order = bind order).
+        let (mut port_on_0, mut port_on_1) = (None, None);
+        for port in 21000..21100u16 {
+            let packet = mp_udp_packet(port, b"x");
+            let pick = bonded_core::flow::pick_index(
+                bonded_core::flow::flow_hash(&packet),
+                2,
+            );
+            match pick {
+                0 => port_on_0 = port_on_0.or(Some(port)),
+                _ => port_on_1 = port_on_1.or(Some(port)),
+            }
+            if port_on_0.is_some() && port_on_1.is_some() {
+                break;
+            }
+        }
+        let packet_a = mp_udp_packet(port_on_0.expect("port pinning to path 0"), b"flow-a");
+        let packet_b = mp_udp_packet(port_on_1.expect("port pinning to path 1"), b"flow-b");
+        let packet_b2 = mp_udp_packet(
+            port_on_1.expect("port pinning to path 1"),
+            b"flow-b-after-kill",
+        );
+        let downlink_marker = b"mp-downlink-on-standby".to_vec();
+
+        // Server-side record of which connection each data frame
+        // arrived on: (connection index, payload).
+        let arrivals: std::sync::Arc<
+            std::sync::Mutex<Vec<(usize, Vec<u8>)>>,
+        > = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let arrivals_server = arrivals.clone();
+        let (kill_tx, kill_rx) = tokio::sync::oneshot::channel::<()>();
+        let packet_b_server = packet_b.clone();
+        let downlink_server = downlink_marker.clone();
+
+        let server_task = runtime.spawn(async move {
+            // The client completes each path's auth handshake before
+            // opening the next path, so accept + handshake must
+            // interleave per connection (accepting both first would
+            // deadlock). Identify the paths afterwards by the client's
+            // bind address (127.0.0.2 = path 0, 127.0.0.3 = path 1);
+            // both handshakes belong to the same device key, so the
+            // streams can be labeled after the fact.
+            let (stream_a, peer_a) = listener.accept().await.expect("first accept");
+            let (public_key, stream_a) =
+                handshake_server_connection(stream_a, None, "").await;
+            let (stream_b, _peer_b) = listener.accept().await.expect("second accept");
+            let (_, stream_b) =
+                handshake_server_connection(stream_b, Some(&public_key), "").await;
+            let (stream0, stream1) = if peer_a.ip().to_string() == "127.0.0.3" {
+                (stream_b, stream_a)
+            } else {
+                (stream_a, stream_b)
+            };
+            let mut transport0 = NaiveTcpTransport::from_stream(stream0);
+            let mut transport1 = NaiveTcpTransport::from_stream(stream1);
+            for transport in [&mut transport0, &mut transport1] {
+                let ping = transport.recv().await.expect("discovery ping");
+                assert!(
+                    ping.header.flags & FLAG_PING != 0,
+                    "expected PING as the session's first frame"
+                );
+                assert!(
+                    ping.header.flags & FLAG_MULTIPATH_RECV != 0,
+                    "multipath client must advertise FLAG_MULTIPATH_RECV"
+                );
+                transport
+                    .send(SessionFrame {
+                        header: SessionHeader {
+                            connection_id: 3,
+                            sequence: ping.header.sequence,
+                            flags: FLAG_PONG,
+                        },
+                        payload: Bytes::new(),
+                    })
+                    .await
+                    .expect("discovery pong should send");
+            }
+
+            let arrivals0 = arrivals_server.clone();
+            let pump0 = tokio::spawn(async move {
+                loop {
+                    match transport0.recv().await {
+                        Ok(frame) => {
+                            if frame.header.flags & FLAG_PING != 0 {
+                                let pong = SessionFrame {
+                                    header: SessionHeader {
+                                        connection_id: 3,
+                                        sequence: frame.header.sequence,
+                                        flags: FLAG_PONG,
+                                    },
+                                    payload: Bytes::new(),
+                                };
+                                if transport0.send(pong).await.is_err() {
+                                    break;
+                                }
+                            } else if !frame.payload.is_empty() {
+                                arrivals0
+                                    .lock()
+                                    .expect("arrivals lock")
+                                    .push((0, frame.payload.to_vec()));
+                                if transport0.send(frame).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+
+            // Path 1 pump: echoes, and right after echoing flow B it
+            // sends an unsolicited downlink packet on this (non-active)
+            // path — the client must surface it even though path 1 is
+            // not the session's active transport. Ends on kill signal.
+            let arrivals1 = arrivals_server.clone();
+            let pump1 = async move {
+                let mut kill_rx = kill_rx;
+                let mut sent_downlink = false;
+                loop {
+                    tokio::select! {
+                        _ = &mut kill_rx => break,
+                        recv = transport1.recv() => {
+                            match recv {
+                                Ok(frame) => {
+                                    if frame.header.flags & FLAG_PING != 0 {
+                                        let pong = SessionFrame {
+                                            header: SessionHeader {
+                                                connection_id: 3,
+                                                sequence: frame.header.sequence,
+                                                flags: FLAG_PONG,
+                                            },
+                                            payload: Bytes::new(),
+                                        };
+                                        if transport1.send(pong).await.is_err() {
+                                            break;
+                                        }
+                                    } else if !frame.payload.is_empty() {
+                                        let is_flow_b =
+                                            frame.payload.as_ref() == packet_b_server.as_slice();
+                                        arrivals1
+                                            .lock()
+                                            .expect("arrivals lock")
+                                            .push((1, frame.payload.to_vec()));
+                                        if transport1.send(frame).await.is_err() {
+                                            break;
+                                        }
+                                        if is_flow_b && !sent_downlink {
+                                            sent_downlink = true;
+                                            let downlink = SessionFrame {
+                                                header: SessionHeader {
+                                                    connection_id: 3,
+                                                    sequence: 0,
+                                                    flags: 0,
+                                                },
+                                                payload: Bytes::from(
+                                                    downlink_server.clone(),
+                                                ),
+                                            };
+                                            if transport1.send(downlink).await.is_err() {
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                    }
+                }
+                drop(transport1);
+            };
+
+            // Serve path 1 until the kill (a client disconnect ends it
+            // early via a recv error instead).
+            pump1.await;
+
+            // After the kill, path 0 keeps serving (flow B's re-pinned
+            // traffic arrives there) until the client disconnects; the
+            // supervisor's re-dial attempts are accepted and handshaked
+            // but their binding pings are never ponged, so the restored
+            // path never rejoins mid-test.
+            let mut pump0 = pump0;
+            let accept_loop = async {
+                loop {
+                    match listener.accept().await {
+                        Ok((stream, _)) => {
+                            let (_, stream) = handshake_server_connection(
+                                stream,
+                                Some(&public_key),
+                                "",
+                            )
+                            .await;
+                            let mut held = NaiveTcpTransport::from_stream(stream);
+                            let _ = held.recv().await; // binding ping, never ponged
+                            let _ = held.recv().await; // hold until close
+                        }
+                        Err(_) => break,
+                    }
+                }
+            };
+            tokio::select! {
+                _ = &mut pump0 => {}
+                _ = accept_loop => {}
+            }
+        });
+
+        start_android_session(
+            &addr.to_string(),
+            "",
+            "",
+            "naive_tcp",
+            2,
+            "[\"127.0.0.2\",\"127.0.0.3\"]",
+            false,
+            "",
+            "",
+            4,
+            0,
+            false,
+            900,
+            0,
+            storage_dir.to_string_lossy().as_ref(),
+        )
+        .expect("android session should start");
+
+        // Wait for the two-path connected state.
+        let mut connected = false;
+        for _ in 0..100 {
+            std::thread::sleep(Duration::from_millis(200));
+            if let Some(snapshot) = get_session_snapshot_json() {
+                if snapshot.contains("\"state\":\"connected\"")
+                    && snapshot.contains("\"transportCount\":2")
+                {
+                    connected = true;
+                    break;
+                }
+            }
+        }
+        assert!(connected, "session should connect with two transports");
+
+        // Uplink spreading: flow A must arrive on connection 0 and
+        // flow B on connection 1 (pre-multipath, both would land on
+        // the active connection 0).
+        queue_outbound_packet(packet_a.clone());
+        queue_outbound_packet(packet_b.clone());
+        let mut saw_a = false;
+        let mut saw_b = false;
+        for _ in 0..100 {
+            {
+                let log = arrivals.lock().expect("arrivals lock");
+                saw_a = log.iter().any(|(c, p)| *c == 0 && p == &packet_a);
+                saw_b = log.iter().any(|(c, p)| *c == 1 && p == &packet_b);
+            }
+            if saw_a && saw_b {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(saw_a, "flow A should arrive on path 0: {arrivals:?}");
+        assert!(saw_b, "flow B should arrive on path 1: {arrivals:?}");
+
+        // Both echoes come back (B's returns on path 1), plus the
+        // unsolicited downlink packet sent on path 1 — the client
+        // receives on every path now.
+        let mut received: Vec<Vec<u8>> = Vec::new();
+        for _ in 0..100 {
+            if received.len() >= 3 {
+                break;
+            }
+            match poll_inbound_packet() {
+                Some(packet) => received.push(packet),
+                None => std::thread::sleep(Duration::from_millis(100)),
+            }
+        }
+        assert!(
+            received.iter().any(|p| p == &packet_a),
+            "echo of flow A should arrive: {received:?}"
+        );
+        assert!(
+            received.iter().any(|p| p == &packet_b),
+            "echo of flow B (on path 1) should arrive: {received:?}"
+        );
+        assert!(
+            received.iter().any(|p| p == &downlink_marker),
+            "unsolicited downlink on path 1 should arrive: {received:?}"
+        );
+
+        // Kill path 1 server-side. The worker's receive on it errors
+        // immediately, so the path is evicted without waiting for
+        // heartbeat timeouts, and flow B re-pins to path 0.
+        let _ = kill_tx.send(());
+        let mut evicted = false;
+        for _ in 0..100 {
+            std::thread::sleep(Duration::from_millis(200));
+            if let Some(snapshot) = get_session_snapshot_json() {
+                assert!(
+                    snapshot.contains("\"state\":\"connected\""),
+                    "session must stay connected: {snapshot}"
+                );
+                if snapshot.contains("\"transportCount\":1") {
+                    evicted = true;
+                    break;
+                }
+            }
+        }
+        assert!(evicted, "killed path should be evicted from the worker");
+
+        queue_outbound_packet(packet_b2.clone());
+        let mut saw_b2_on_0 = false;
+        for _ in 0..100 {
+            {
+                let log = arrivals.lock().expect("arrivals lock");
+                saw_b2_on_0 = log.iter().any(|(c, p)| *c == 0 && p == &packet_b2);
+            }
+            if saw_b2_on_0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(
+            saw_b2_on_0,
+            "flow B should re-pin to path 0 after the kill: {arrivals:?}"
+        );
+        let echoed_b2 = (0..50).find_map(|_| {
+            std::thread::sleep(Duration::from_millis(100));
+            poll_inbound_packet()
+        });
+        assert_eq!(
+            echoed_b2.as_deref(),
+            Some(packet_b2.as_slice()),
+            "re-pinned flow B echo should arrive"
+        );
 
         stop_android_session();
         runtime

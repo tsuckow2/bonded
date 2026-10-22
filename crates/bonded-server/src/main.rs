@@ -716,6 +716,9 @@ async fn run_server(
                         if let Some(frame) = pending_frame.take() {
                             maybe_log_tunnel_packet(&tunnel_pcap, &frame.payload);
                             if frame.header.flags & FLAG_PING != 0 && frame.payload.is_empty() {
+                                if let Some(ctx) = &session_ctx {
+                                    ctx.router.note_frame_flags(frame.header.flags);
+                                }
                                 info!(
                                     peer = %peer,
                                     session_id = handle.session_id,
@@ -759,7 +762,8 @@ async fn run_server(
                                     }
                                 } else if let Some(f) = &forwarder {
                                     if let Some(ctx) = &session_ctx {
-                                        ctx.router.mark_active(transport_id);
+                                        ctx.router
+                                            .note_frame(transport_id, frame.header.flags);
                                     }
                                     f.ingest_packet(frame);
                                 }
@@ -827,6 +831,10 @@ async fn run_server(
                                         // Only treat ping-bit frames as control heartbeats when
                                         // they carry no payload; otherwise keep forwarding.
                                         if frame.header.flags & FLAG_PING != 0 && frame.payload.is_empty() {
+                                            if let Some(ctx) = &session_ctx {
+                                                ctx.router
+                                                    .note_frame_flags(frame.header.flags);
+                                            }
                                             info!(
                                                 peer = %peer,
                                                 session_id = handle.session_id,
@@ -882,7 +890,10 @@ async fn run_server(
                                             // traffic so the outbound router sends replies on
                                             // the currently-live path (failover).
                                             if let Some(ctx) = &session_ctx {
-                                                ctx.router.mark_active(transport_id);
+                                                ctx.router.note_frame(
+                                                    transport_id,
+                                                    frame.header.flags,
+                                                );
                                             }
                                             debug!(
                                                 peer = %peer,

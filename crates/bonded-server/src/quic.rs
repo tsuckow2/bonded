@@ -319,6 +319,7 @@ async fn handle_quic_connection(
 
         if let Some(frame) = pending_frame.take() {
             if frame.header.flags & FLAG_PING != 0 && frame.payload.is_empty() {
+                session_ctx.router.note_frame_flags(frame.header.flags);
                 let pong = SessionFrame {
                     header: SessionHeader {
                         connection_id: handle.session_id as u32,
@@ -333,7 +334,7 @@ async fn handle_quic_connection(
                     break 'session;
                 }
             } else {
-                session_ctx.router.mark_active(transport_id);
+                session_ctx.router.note_frame(transport_id, frame.header.flags);
                 forwarder.ingest_packet(frame);
             }
             continue;
@@ -356,6 +357,7 @@ async fn handle_quic_connection(
                 match recv_result {
                     Ok(frame) => {
                         if frame.header.flags & FLAG_PING != 0 && frame.payload.is_empty() {
+                            session_ctx.router.note_frame_flags(frame.header.flags);
                             let pong = SessionFrame {
                                 header: SessionHeader {
                                     connection_id: frame.header.connection_id,
@@ -371,7 +373,7 @@ async fn handle_quic_connection(
                             }
                             continue;
                         }
-                        session_ctx.router.mark_active(transport_id);
+                        session_ctx.router.note_frame(transport_id, frame.header.flags);
                         forwarder.ingest_packet(frame);
                     }
                     Err(err) => {

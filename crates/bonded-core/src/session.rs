@@ -10,6 +10,14 @@ pub const FLAG_PING: u32 = 0x0001;
 pub const FLAG_PONG: u32 = 0x0002;
 /// Frame flag: the payload contains a signed peer-relay registration control message.
 pub const FLAG_PEER_RELAY_REGISTRATION: u32 = 0x0004;
+/// Frame flag: set on client PINGs (session discovery, heartbeat,
+/// supervisor re-dial binding) to tell the server this client receives on
+/// ALL of its transports, so the server may spread downlink flows across
+/// them per-flow instead of sending everything to the last-active one.
+/// Old servers mask-check FLAG_PING and ignore this bit; servers that
+/// understand it keep the pre-multipath behavior for clients that never
+/// set it.
+pub const FLAG_MULTIPATH_RECV: u32 = 0x0008;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionHeader {
