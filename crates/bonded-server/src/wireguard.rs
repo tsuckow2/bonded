@@ -1324,9 +1324,9 @@ mod tests {
             .await
             .expect("wireguard path should establish via bootstrap");
         assert_eq!(paths.len(), 1);
-        assert!(matches!(paths[0], ClientTransport::WireGuard(_)));
+        assert!(matches!(paths[0].1, ClientTransport::WireGuard(_)));
 
-        paths[0]
+        paths[0].1
             .send(bonded_core::session::SessionFrame {
                 header: bonded_core::session::SessionHeader {
                     connection_id: 91,
@@ -1337,7 +1337,7 @@ mod tests {
             })
             .await
             .expect("wireguard frame should send");
-        let echoed = paths[0]
+        let echoed = paths[0].1
             .recv()
             .await
             .expect("wireguard echoed frame should arrive");

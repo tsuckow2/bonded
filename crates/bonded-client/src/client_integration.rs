@@ -806,6 +806,8 @@ async fn multipath_can_mix_websocket_and_naive_tcp() {
     let mut paths = establish_transport_paths(&cfg, 2)
         .await
         .expect("mixed protocol paths should establish");
+    let mut paths: Vec<ClientTransport> =
+        paths.into_iter().map(|(_, transport)| transport).collect();
 
     let frame0 = SessionFrame {
         header: SessionHeader {
@@ -898,6 +900,8 @@ async fn bind_aware_path_honors_websocket_first_preference() {
     let mut paths = establish_transport_paths(&cfg, 1)
         .await
         .expect("path should establish with websocket preference");
+    let mut paths: Vec<ClientTransport> =
+        paths.into_iter().map(|(_, transport)| transport).collect();
     assert_eq!(paths.len(), 1);
     assert!(matches!(paths[0], ClientTransport::WebSocket(_)));
 
@@ -918,6 +922,104 @@ async fn bind_aware_path_honors_websocket_first_preference() {
 
     ws_task.await.expect("ws task should join");
     naive_task.await.expect("naive task should join");
+
+    let _ = fs::remove_file(&cfg.client.private_key_path);
+    let _ = fs::remove_file(&cfg.client.public_key_path);
+}
+
+#[tokio::test]
+async fn dead_first_path_does_not_veto_session() {
+    // Regression (field, build 181): a phone whose path snapshot led
+    // with a stale bind address (a network it had left) could not
+    // connect at all — path 0 failing aborted establishment even with
+    // a healthy path behind it. Establishment must skip the dead path,
+    // fail it fast (not burn per-protocol timeouts on an address the
+    // OS will not bind), and report the survivor under its true index.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let keypair = DeviceKeypair::generate();
+    let ws_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("ws listener should bind");
+    let ws_addr = ws_listener.local_addr().expect("ws addr should resolve");
+    let ws_public_key = keypair.public_key_b64.clone();
+    let ws_task = tokio::spawn(async move {
+        let (ws_stream, _) = ws_listener
+            .accept()
+            .await
+            .expect("websocket accept should succeed");
+        let mut ws_transport = websocket_server_handshake(ws_stream, &ws_public_key).await;
+        let ws_frame = ws_transport.recv().await.expect("ws frame should arrive");
+        ws_transport
+            .send(ws_frame)
+            .await
+            .expect("ws echo should send");
+    });
+
+    let mut cfg = test_client_config(ws_addr.to_string(), &keypair);
+    cfg.client.server_websocket_address = format!("ws://{ws_addr}");
+    cfg.client.preferred_protocols = vec!["wss".to_owned()];
+    // 192.0.2.1 is TEST-NET-1: never assigned to any interface.
+    cfg.client.path_bind_addresses = vec!["192.0.2.1".to_owned(), "127.0.0.1".to_owned()];
+
+    let started = std::time::Instant::now();
+    let mut paths = establish_transport_paths(&cfg, 2)
+        .await
+        .expect("session must establish on the surviving path");
+    assert!(
+        started.elapsed() < Duration::from_secs(6),
+        "dead path must fail fast, took {:?}",
+        started.elapsed()
+    );
+    assert_eq!(paths.len(), 1);
+    assert_eq!(paths[0].0, 1, "survivor must carry its true path index");
+    assert!(matches!(paths[0].1, ClientTransport::WebSocket(_)));
+
+    let frame = SessionFrame {
+        header: SessionHeader {
+            connection_id: 15,
+            sequence: 0,
+            flags: 0,
+        },
+        payload: Bytes::from_static(b"survivor-path"),
+    };
+    paths[0]
+        .1
+        .send(frame)
+        .await
+        .expect("survivor send should succeed");
+    let echoed = paths[0].1.recv().await.expect("survivor echo should arrive");
+    assert_eq!(&echoed.payload[..], b"survivor-path");
+
+    ws_task.await.expect("ws task should join");
+    let _ = fs::remove_file(&cfg.client.private_key_path);
+    let _ = fs::remove_file(&cfg.client.public_key_path);
+}
+
+#[tokio::test]
+async fn all_paths_dead_fails_establishment() {
+    // The complement: when every path is dead, establishment still
+    // fails — with an aggregate error, not a hang on protocol timeouts.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let keypair = DeviceKeypair::generate();
+    let mut cfg = test_client_config("127.0.0.1:9".to_owned(), &keypair);
+    cfg.client.preferred_protocols = vec!["wss".to_owned()];
+    cfg.client.path_bind_addresses = vec!["192.0.2.1".to_owned(), "192.0.2.2".to_owned()];
+
+    let started = std::time::Instant::now();
+    let result = establish_transport_paths(&cfg, 2).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(6),
+        "all-dead establishment must fail fast, took {:?}",
+        started.elapsed()
+    );
+    let err = match result {
+        Ok(_) => panic!("establishment with no live path must fail"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string().contains("failed to establish any transport path"),
+        "aggregate error expected, got: {err}"
+    );
 
     let _ = fs::remove_file(&cfg.client.private_key_path);
     let _ = fs::remove_file(&cfg.client.public_key_path);
@@ -974,6 +1076,8 @@ async fn mixed_websocket_quic_failover_continues_exchange() {
     let mut paths = establish_transport_paths(&cfg, 2)
         .await
         .expect("mixed websocket/quic paths should establish");
+    let mut paths: Vec<ClientTransport> =
+        paths.into_iter().map(|(_, transport)| transport).collect();
     assert!(matches!(paths[0], ClientTransport::WebSocket(_)));
     assert!(matches!(paths[1], ClientTransport::Quic(_)));
 

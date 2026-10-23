@@ -842,6 +842,12 @@ fn start_android_session(
             }
             alog_info!("Worker: establishing transport paths");
             let requested_paths = path_count.max(1);
+            // Path indexes of the transports establishment returns, in
+            // lockstep with `transports` below: establishment now yields
+            // whatever subset of the requested paths connected (a dead
+            // path no longer vetoes the session), and the supervisor
+            // needs the true indexes to re-dial the missing ones.
+            let mut session_path_indexes: Vec<usize> = Vec::new();
             let mut transports = match tokio::time::timeout(
                 ANDROID_PATH_ESTABLISH_TIMEOUT,
                 establish_transport_paths_with_observer(&config, requested_paths, |message| {
@@ -850,8 +856,16 @@ fn start_android_session(
             )
             .await
             {
-                Ok(Ok(transports)) => {
-                    alog_info!("Transport paths established: count={}", transports.len());
+                Ok(Ok(established)) => {
+                    session_path_indexes =
+                        established.iter().map(|(path_index, _)| *path_index).collect();
+                    alog_info!(
+                        "Transport paths established: count={} path_indexes={:?}",
+                        established.len(),
+                        session_path_indexes
+                    );
+                    let mut transports: Vec<ClientTransport> =
+                        established.into_iter().map(|(_, transport)| transport).collect();
                     for (index, transport) in transports.iter().enumerate() {
                         let kind = client_transport_kind(transport);
                         alog_info!("  transport[{}] = {}", index, kind);
@@ -940,9 +954,15 @@ fn start_android_session(
             // receive initial session frame" and no session ever bound.
             let mut session_id: u32 = 0;
             // Path index of each transports[i], in lockstep: session
-            // start establishes a path-order prefix, and every removal
-            // below removes from both vectors.
-            let mut candidate_paths: Vec<usize> = (0..transports.len()).collect();
+            // start establishes an arbitrary subset of the requested
+            // paths (their true indexes, from establishment), and every
+            // removal below removes from both vectors.
+            let mut candidate_paths: Vec<usize> = session_path_indexes;
+            if candidate_paths.len() != transports.len() {
+                // Defensive: establishment's contract is one index per
+                // transport; never let a drift here corrupt the map.
+                candidate_paths = (0..transports.len()).collect();
+            }
             let mut path_index = 0_usize;
             while path_index < transports.len() {
                 let ping = SessionFrame {
@@ -1610,7 +1630,7 @@ fn redeem_invite_token(
         // the redeem dies with "unexpected end of file" — so pairing
         // against a production server could never succeed.
         let mut paths = establish_transport_paths(&config, 1).await?;
-        let mut transport = paths.remove(0);
+        let mut transport = paths.remove(0).1;
         complete_pairing_session_binding(&mut transport).await?;
         drop(transport);
         Ok::<(), anyhow::Error>(())

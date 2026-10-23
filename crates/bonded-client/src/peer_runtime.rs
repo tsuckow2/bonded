@@ -699,7 +699,11 @@ async fn establish_peer_upstream_paths(
     } else {
         filtered
     };
-    establish_transport_paths(&peer_config, 1).await
+    Ok(establish_transport_paths(&peer_config, 1)
+        .await?
+        .into_iter()
+        .map(|(_, transport)| transport)
+        .collect())
 }
 
 fn build_listener_runtime(

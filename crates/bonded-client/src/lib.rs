@@ -214,11 +214,13 @@ impl ClientRuntime {
         );
 
         let max_paths = interfaces.len().clamp(1, 2);
-        let transports = establish_transport_paths(&self.config, max_paths).await?;
+        let established = establish_transport_paths(&self.config, max_paths).await?;
         info!(
-            paths = transports.len(),
+            paths = established.len(),
             "authenticated transport paths established"
         );
+        let transports: Vec<ClientTransport> =
+            established.into_iter().map(|(_, transport)| transport).collect();
 
         #[cfg(target_os = "linux")]
         {
@@ -266,15 +268,28 @@ impl ClientRuntime {
 pub async fn establish_transport_paths(
     config: &ClientConfig,
     count: usize,
-) -> anyhow::Result<Vec<ClientTransport>> {
+) -> anyhow::Result<Vec<(usize, ClientTransport)>> {
     establish_transport_paths_with_observer(config, count, |_| {}).await
 }
 
+/// Establish up to `count` transport paths. Returns the established
+/// transports paired with their path indexes, in path order.
+///
+/// No single path is load-bearing: a path whose bind address is dead
+/// or whose protocols all fail is skipped, and establishment succeeds
+/// with whatever subset connected. (Previously a path-0 failure
+/// aborted the whole session — a phone carrying a stale bind address
+/// for a network it had left could not connect at all, even with a
+/// healthy Wi-Fi/cellular path right behind it.) Callers that track
+/// paths by index (the Android supervisor) use the returned indexes to
+/// know exactly which paths are present and which to re-dial later.
+/// Returns `Err` only when no path at all could be established, or on
+/// a server-identity failure.
 pub async fn establish_transport_paths_with_observer<F>(
     config: &ClientConfig,
     count: usize,
     mut observer: F,
-) -> anyhow::Result<Vec<ClientTransport>>
+) -> anyhow::Result<Vec<(usize, ClientTransport)>>
 where
     F: FnMut(String),
 {
@@ -330,28 +345,31 @@ where
         }
     }
 
-    let mut paths = Vec::with_capacity(target);
+    let mut paths: Vec<(usize, ClientTransport)> = Vec::with_capacity(target);
+    let mut failure_reasons: Vec<String> = Vec::new();
     for path_index in 0..target {
         match establish_single_transport_path(config, path_index, target, &mut observer)
             .await?
         {
-            SinglePathResult::Connected(path) => paths.push(path),
+            SinglePathResult::Connected(path) => paths.push((path_index, path)),
             SinglePathResult::Failed(reason) => {
-                if path_index == 0 {
-                    anyhow::bail!(
-                        "failed to establish path {path_index} with configured protocols: {reason}"
-                    );
-                }
                 warn!(
                     path_index,
                     requested_paths = target,
                     established_paths = paths.len(),
                     reason = %reason,
-                    "failed to establish additional path; continuing with available paths"
+                    "failed to establish path; continuing with available paths"
                 );
-                break;
+                failure_reasons.push(format!("path {path_index}: {reason}"));
             }
         }
+    }
+
+    if paths.is_empty() {
+        anyhow::bail!(
+            "failed to establish any transport path: {}",
+            failure_reasons.join(" | ")
+        );
     }
 
     Ok(paths)
@@ -399,6 +417,34 @@ where
             .path_bind_addresses
             .get(path_index)
             .map(String::as_str);
+
+        // Pre-flight the bind address: if the OS will not let us bind a
+        // socket to it, the address is not assigned to any live local
+        // interface (a stale snapshot entry for a network the device has
+        // left, in the field case) and every protocol attempt on this
+        // path is doomed — the address-bound ones fail at bind, the
+        // others burn their full establish timeout. Fail the path in
+        // milliseconds instead and let the remaining paths carry the
+        // session. Link-local IPv6 is exempt: it needs a scope id this
+        // check cannot supply, so its bindability cannot be judged here.
+        if let Some(bind) = bind_address {
+            let preflightable = match bind.parse::<IpAddr>() {
+                Ok(IpAddr::V4(_)) => true,
+                Ok(IpAddr::V6(v6)) => (v6.segments()[0] & 0xffc0) != 0xfe80,
+                Err(_) => false,
+            };
+            if preflightable {
+                if let Err(err) = std::net::UdpSocket::bind((bind, 0)) {
+                    let reason = format!(
+                        "bind address {bind} is not assignable on this device: {err}"
+                    );
+                    observer(format!(
+                        "transport path skipped path_index={path_index} requested_paths={target} bind_address={bind} error={reason}"
+                    ));
+                    return Ok(SinglePathResult::Failed(reason));
+                }
+            }
+        }
 
         let mut connected: Option<ClientTransport> = None;
         for protocol in rotated_protocols(&protocols, path_index) {
