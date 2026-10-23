@@ -1,27 +1,5 @@
-[target.aarch64-linux-android]
-linker = "/home/vscode/android-sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang"
-ar = "/home/vscode/android-sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
-
-[target.armv7-linux-androideabi]
-linker = "/home/vscode/android-sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi21-clang"
-ar = "/home/vscode/android-sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
-
-[target.x86_64-linux-android]
-linker = "/home/vscode/android-sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/x86_64-linux-android21-clang"
-ar = "/home/vscode/android-sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
-
-[target.i686-linux-android]
-linker = "/home/vscode/android-sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/i686-linux-android21-clang"
-ar = "/home/vscode/android-sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
-
-[env]
-CC_aarch64_linux_android = "/home/vscode/android-sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang"
-CXX_aarch64_linux_android = "/home/vscode/android-sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang++"
-AR_aarch64_linux_android = "/home/vscode/android-sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
-CC_x86_64_linux_android = "/home/vscode/android-sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/x86_64-linux-android21-clang"
-CXX_x86_64_linux_android = "/home/vscode/android-sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/x86_64-linux-android21-clang++"
-AR_x86_64_linux_android = "/home/vscode/android-sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
-CC_armv7_linux_androideabi = "/home/vscode/android-sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi21-clang"
-CXX_armv7_linux_androideabi = "/home/vscode/android-sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi21-clang++"
-AR_armv7_linux_androideabi = "/home/vscode/android-sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
-ANDROID_NDK_HOME = "/home/vscode/android-sdk/ndk/28.2.13676358"
+# Android toolchain paths are intentionally NOT hardcoded in this file.
+# scripts/build-android-native.sh derives the NDK location from
+# ANDROID_NDK_HOME / ANDROID_HOME and exports the per-target
+# linker/CC/CXX/AR variables, so the same tree builds on a dev machine,
+# in a devcontainer, and on CI runners without machine-specific paths.

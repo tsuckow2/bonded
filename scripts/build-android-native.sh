@@ -8,6 +8,42 @@ WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 JNILIBS_DIR="$WORKSPACE_ROOT/android/android/app/src/main/jniLibs"
 
+# --- Android NDK toolchain, derived from the environment (never hardcoded) ---
+# The NDK comes from ANDROID_NDK_HOME, or ANDROID_HOME/ndk/<version>. The
+# per-target linker/CC/CXX/AR exports below replace the machine-specific
+# paths that used to live in .cargo/config.toml, so this script — and the
+# Gradle buildRustAndroidNative task that invokes it — works anywhere.
+NDK_VERSION="28.2.13676358"
+if [ -n "${ANDROID_NDK_HOME:-}" ]; then
+  NDK_HOME="$ANDROID_NDK_HOME"
+elif [ -n "${ANDROID_HOME:-}" ]; then
+  NDK_HOME="$ANDROID_HOME/ndk/$NDK_VERSION"
+else
+  echo "error: set ANDROID_NDK_HOME or ANDROID_HOME so the Android NDK can be located" >&2
+  exit 1
+fi
+if [ ! -d "$NDK_HOME" ]; then
+  echo "error: Android NDK not found at $NDK_HOME" >&2
+  exit 1
+fi
+export ANDROID_NDK_HOME="$NDK_HOME"
+LLVM_BIN="$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+
+export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$LLVM_BIN/aarch64-linux-android21-clang"
+export CC_aarch64_linux_android="$LLVM_BIN/aarch64-linux-android21-clang"
+export CXX_aarch64_linux_android="$LLVM_BIN/aarch64-linux-android21-clang++"
+export AR_aarch64_linux_android="$LLVM_BIN/llvm-ar"
+
+export CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER="$LLVM_BIN/armv7a-linux-androideabi21-clang"
+export CC_armv7_linux_androideabi="$LLVM_BIN/armv7a-linux-androideabi21-clang"
+export CXX_armv7_linux_androideabi="$LLVM_BIN/armv7a-linux-androideabi21-clang++"
+export AR_armv7_linux_androideabi="$LLVM_BIN/llvm-ar"
+
+export CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER="$LLVM_BIN/x86_64-linux-android21-clang"
+export CC_x86_64_linux_android="$LLVM_BIN/x86_64-linux-android21-clang"
+export CXX_x86_64_linux_android="$LLVM_BIN/x86_64-linux-android21-clang++"
+export AR_x86_64_linux_android="$LLVM_BIN/llvm-ar"
+
 echo "Ensuring Android Rust targets are installed..."
 rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
 
