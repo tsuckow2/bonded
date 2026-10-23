@@ -79,6 +79,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Reclaim disk space
+        # Standard runners start with ~14 GB free and this job installs an
+        # SDK + NDK + Rust + Flutter and builds three ABIs; without this
+        # step the job dies with "No space left on device" mid-build (and
+        # the runner then cannot even upload its logs). Drop preinstalled
+        # toolchains this job never uses.
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+            /usr/local/share/powershell /usr/share/swift \
+            /opt/hostedtoolcache/CodeQL /opt/hostedtoolcache/go \
+            /opt/hostedtoolcache/Ruby /usr/local/lib/android/sdk/ndk-bundle
+          df -h /
+
       - name: Set up Java
         uses: actions/setup-java@v4
         with:
@@ -103,21 +117,12 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.88.0
-          targets: aarch64-linux-android,x86_64-linux-android
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
 
-      - name: Install cargo-ndk
-        run: cargo install cargo-ndk --locked
-
-      - name: Build Rust Android JNI libraries
-        env:
-          ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/${{ env.ANDROID_NDK_VERSION }}
-          ANDROID_NDK_ROOT: ${{ env.ANDROID_HOME }}/ndk/${{ env.ANDROID_NDK_VERSION }}
-        run: |
-          cargo ndk \
-            -t arm64-v8a \
-            -t x86_64 \
-            -o android/android/app/src/main/jniLibs \
-            build -p bonded-ffi --release
+      # The JNI libraries are built exactly once, by Gradle's
+      # buildRustAndroidNative task invoking scripts/build-android-native.sh
+      # (all three ABIs). A standalone cargo-ndk pass here previously built
+      # them a second time, doubling the Rust build's time and disk.
 
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
