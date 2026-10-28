@@ -1759,6 +1759,17 @@ fn prepare_bound_socket_for_connect(
     socket_protect: Option<&bonded_core::config::SocketProtectFn>,
     transport_name: &str,
 ) -> anyhow::Result<()> {
+    // Bench instrumentation (quic-probe-diag): log, at INFO so it
+    // reaches logcat, whether each dial's prepare step actually has
+    // the callbacks — the WAN-session dials never logged a bind call.
+    info!(
+        "prepare {} socket fd={} bind_address={} network_bind={} protect={}",
+        transport_name,
+        fd,
+        bind_address,
+        socket_network_bind.is_some(),
+        socket_protect.is_some()
+    );
     if let Some(bind_network) = socket_network_bind {
         debug!(
             "binding {} socket fd={} to Android network for bind_address={}",
@@ -1877,6 +1888,13 @@ pub(crate) async fn connect_quic_client_with_bind(
         .next()
         .ok_or_else(|| anyhow::anyhow!("no addresses resolved for {host}:{port}"))?;
 
+    // Bench instrumentation (quic-probe-diag): record the exact dial
+    // target and bind choice, so a session dial can be compared with
+    // the standalone probe's dial (same host, same bind).
+    info!(
+        "QUIC dial host={} resolved={} bind_ip={:?}",
+        host, server_addr, bind_ip
+    );
     let mut endpoint = quinn::Endpoint::new(
         Default::default(),
         None,

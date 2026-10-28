@@ -1019,6 +1019,17 @@ fn start_android_session(
                 );
             }
             alog_info!("Worker: establishing transport paths");
+            // Bench instrumentation (quic-probe-diag): the WAN-session
+            // dials observably never invoked the network-bind callback
+            // while LAN-session dials did. Record, per establishment
+            // cycle, whether this worker's config actually carries the
+            // callbacks — distinguishing "config lost them" from
+            // "the dial path skipped them".
+            alog_info!(
+                "Worker: establish config callbacks protect={} network_bind={}",
+                config.socket_protect.is_some(),
+                config.socket_network_bind.is_some()
+            );
             let requested_paths = path_count.max(1);
             // Path indexes of the transports establishment returns, in
             // lockstep with `transports` below: establishment now yields
