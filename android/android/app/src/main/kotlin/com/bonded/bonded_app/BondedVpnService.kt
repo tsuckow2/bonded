@@ -58,6 +58,8 @@ data class SessionPathStat(
         val outboundBytes: Long,
         val inboundBytes: Long,
         val lastRttMs: Long,
+        /** "IP:port" source address the server sees for this path, or null. */
+        val serverSeenAddress: String?,
 )
 
 class BondedVpnService : VpnService() {
@@ -561,6 +563,9 @@ class BondedVpnService : VpnService() {
                             outboundBytes = item.optLong("outboundBytes", 0),
                             inboundBytes = item.optLong("inboundBytes", 0),
                             lastRttMs = item.optLong("lastRttMs", 0),
+                            serverSeenAddress =
+                                    if (item.isNull("serverSeenAddress")) null
+                                    else item.optString("serverSeenAddress").takeIf { it.isNotEmpty() },
                     )
             )
         }
@@ -1203,6 +1208,7 @@ class BondedVpnService : VpnService() {
                                         "outboundBytes" to path.outboundBytes,
                                         "inboundBytes" to path.inboundBytes,
                                         "lastRttMs" to path.lastRttMs,
+                                        "serverSeenAddress" to path.serverSeenAddress,
                                 )
                             },
             )

@@ -12,7 +12,8 @@ use bonded_core::config::SocketProtectFn;
 use bonded_core::session::SessionFrame;
 #[cfg(any(target_os = "android", test))]
 use bonded_core::session::{
-    SessionHeader, SessionState, FLAG_MULTIPATH_RECV, FLAG_PING, FLAG_PONG,
+    decode_observed_address, SessionHeader, SessionState, FLAG_MULTIPATH_RECV, FLAG_PING,
+    FLAG_PONG,
 };
 #[cfg(any(target_os = "android", test))]
 use bonded_core::transport::{NaiveTcpTransport, Transport};
@@ -451,6 +452,11 @@ struct AndroidPathStat {
     /// paths are pinged on the same tick, so a pong's arrival transport
     /// identifies the path its RTT belongs to.
     last_rtt_ms: u64,
+    /// Source address the server reports for this path's connection in
+    /// its heartbeat pongs ("IP:port" exactly as the server sees it):
+    /// the path's public egress address. `None` until a stamped pong
+    /// arrives — servers older than the pong stamp never send one.
+    server_seen_address: Option<String>,
 }
 
 #[cfg(any(target_os = "android", test))]
@@ -606,14 +612,20 @@ fn snapshot_json(snapshot: &AndroidSessionSnapshot) -> String {
                 .path_index
                 .map(|index| index.to_string())
                 .unwrap_or_else(|| "null".to_owned());
+            let server_seen = stat
+                .server_seen_address
+                .as_ref()
+                .map(|addr| format!("\"{}\"", escape_json(addr)))
+                .unwrap_or_else(|| "null".to_owned());
             format!(
-                "{{\"pathIndex\":{},\"kind\":\"{}\",\"active\":{},\"outboundBytes\":{},\"inboundBytes\":{},\"lastRttMs\":{}}}",
+                "{{\"pathIndex\":{},\"kind\":\"{}\",\"active\":{},\"outboundBytes\":{},\"inboundBytes\":{},\"lastRttMs\":{},\"serverSeenAddress\":{}}}",
                 path_index,
                 escape_json(&stat.kind),
                 stat.active,
                 stat.outbound_bytes,
                 stat.inbound_bytes,
                 stat.last_rtt_ms,
+                server_seen,
             )
         })
         .collect::<Vec<_>>()
@@ -827,6 +839,8 @@ fn publish_path_stats(
                     outbound_bytes: prior.map(|stat| stat.outbound_bytes).unwrap_or(0),
                     inbound_bytes: prior.map(|stat| stat.inbound_bytes).unwrap_or(0),
                     last_rtt_ms: prior.map(|stat| stat.last_rtt_ms).unwrap_or(0),
+                    server_seen_address: prior
+                        .and_then(|stat| stat.server_seen_address.clone()),
                 }
             })
             .collect();
@@ -1543,6 +1557,32 @@ fn start_android_session(
                                 Ok(frame) => {
                                     // Handle heartbeat pong — don't feed it to the session reorder buffer.
                                     if frame.header.flags & FLAG_PONG != 0 {
+                                        // Newer servers stamp the pong
+                                        // payload with the source address
+                                        // they see for this path's
+                                        // connection: record it as the
+                                        // path's public egress address.
+                                        if let Some(observed) =
+                                            decode_observed_address(&frame.payload)
+                                        {
+                                            let observed = observed.to_string();
+                                            update_snapshot(
+                                                &worker_snapshot,
+                                                |session_snapshot| {
+                                                    if let Some(stat) = session_snapshot
+                                                        .path_stats
+                                                        .get_mut(index)
+                                                    {
+                                                        if stat.server_seen_address.as_deref()
+                                                            != Some(observed.as_str())
+                                                        {
+                                                            stat.server_seen_address =
+                                                                Some(observed);
+                                                        }
+                                                    }
+                                                },
+                                            );
+                                        }
                                         let now_ms = SystemTime::now()
                                             .duration_since(UNIX_EPOCH)
                                             .map(|d| d.as_millis() as u64)

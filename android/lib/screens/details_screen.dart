@@ -123,7 +123,7 @@ class _DetailsScreenState extends State<DetailsScreen> {
               _Card(
                 title: 'Paths',
                 rows: [
-                  for (final path in _status.directPaths)
+                  for (final path in _status.directPaths) ...[
                     (
                       _pathLabel(path),
                       [
@@ -134,6 +134,12 @@ class _DetailsScreenState extends State<DetailsScreen> {
                         '↑ ${_fmtBytes(path.outboundBytes)}',
                       ].join(' · '),
                     ),
+                    if (path.serverSeenAddress != null)
+                      (
+                        '${_pathLabel(path)} — server sees',
+                        path.serverSeenAddress!,
+                      ),
+                  ],
                 ],
               ),
             ],

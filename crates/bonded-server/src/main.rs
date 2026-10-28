@@ -51,7 +51,9 @@ use authorized_keys::{AuthorizedKeysStore, AuthorizedKeysWatcher};
 
 use anyhow::Context as _;
 use bonded_core::config::{load_server_config, ServerConfig, DEFAULT_SERVER_CONFIG_PATH};
-use bonded_core::session::{SessionFrame, SessionHeader, FLAG_PING, FLAG_PONG};
+use bonded_core::session::{
+    encode_observed_address, SessionFrame, SessionHeader, FLAG_PING, FLAG_PONG,
+};
 use bonded_core::transport::{NaiveTcpTransport, Transport};
 use clap::Parser;
 use health::run_health_server;
@@ -731,7 +733,12 @@ async fn run_server(
                                         sequence: frame.header.sequence,
                                         flags: FLAG_PONG,
                                     },
-                                    payload: frame.payload,
+                                    // Stamp the address this transport's
+                                    // peer presents from, so the client can
+                                    // show its per-path public (egress)
+                                    // address. Older clients ignore PONG
+                                    // payloads: backward compatible.
+                                    payload: encode_observed_address(peer),
                                 };
                                 if let Err(err) = transport.send(pong).await {
                                     warn!(
@@ -847,7 +854,9 @@ async fn run_server(
                                                     sequence: frame.header.sequence,
                                                     flags: FLAG_PONG,
                                                 },
-                                                payload: frame.payload,
+                                                // Observed-address stamp:
+                                                // see the initial pong above.
+                                                payload: encode_observed_address(peer),
                                             };
                                             if let Err(err) = transport.send(pong).await {
                                                 warn!(

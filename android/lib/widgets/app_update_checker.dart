@@ -2,13 +2,15 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 /// The app update check: an automatic Play check that drives the
-/// "update available" banner, plus the manual "Check for Updates"
-/// button that reports every outcome to the user.
+/// "update available" banner. There is deliberately no manual check
+/// button (removed at the user's direction in build 186) — the
+/// automatic checks on open and foreground return are enough, and the
+/// banner appears on its own when Play has a newer build.
 ///
 /// This lives on the home (server list) screen — the app's first
 /// page — since build 178. It used to live on the per-server
 /// dashboard, where a user had to open a server's status page to
-/// learn about or check for an app update.
+/// learn about an app update.
 class AppUpdateChecker extends StatefulWidget {
   const AppUpdateChecker({super.key});
 
@@ -21,7 +23,6 @@ class _AppUpdateCheckerState extends State<AppUpdateChecker>
   static const MethodChannel _channel = MethodChannel('bonded/native');
 
   int? _updateAvailableVersionCode;
-  bool _checkingForUpdate = false;
   DateTime? _lastUpdateCheckAt;
 
   @override
@@ -56,34 +57,18 @@ class _AppUpdateCheckerState extends State<AppUpdateChecker>
   }
 
   /// Ask the native side whether Play has a newer build for this install.
-  /// The automatic checks (app open, foreground return) stay silent and
-  /// only drive the banner. A manual check from the "Check for Updates"
-  /// button reports every outcome to the user — available, none, or
-  /// failed — because the silent version of this check hid real updates
-  /// for three builds in a row.
-  Future<void> _checkForUpdate({bool manual = false}) async {
+  /// The checks (app open, foreground return) stay silent and only
+  /// drive the banner.
+  Future<void> _checkForUpdate() async {
     _lastUpdateCheckAt = DateTime.now();
-    if (manual && mounted) {
-      setState(() {
-        _checkingForUpdate = true;
-      });
-    }
-    var outcome = 'failed';
     int? availableVersionCode;
-    int? currentVersionCode;
     try {
       final result = await _channel.invokeMapMethod<String, dynamic>(
         'checkAppUpdate',
       );
-      if (result != null) {
-        currentVersionCode = (result['currentVersionCode'] as num?)?.toInt();
-        if (result['updateAvailable'] == true) {
-          outcome = 'available';
-          availableVersionCode = (result['availableVersionCode'] as num?)
-              ?.toInt();
-        } else {
-          outcome = 'none';
-        }
+      if (result != null && result['updateAvailable'] == true) {
+        availableVersionCode = (result['availableVersionCode'] as num?)
+            ?.toInt();
       }
     } catch (_) {
       // Update checks must never disrupt the app.
@@ -92,22 +77,10 @@ class _AppUpdateCheckerState extends State<AppUpdateChecker>
       return;
     }
     setState(() {
-      _checkingForUpdate = false;
-      if (outcome == 'available') {
+      if (availableVersionCode != null) {
         _updateAvailableVersionCode = availableVersionCode;
       }
     });
-    if (manual) {
-      final message = switch (outcome) {
-        'available' => 'Update available: build $availableVersionCode',
-        'none' =>
-          'No update available${currentVersionCode != null ? ' — build $currentVersionCode is current for this install' : ''}',
-        _ => "Couldn't check for updates — Play didn't answer",
-      };
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text(message)));
-    }
   }
 
   Future<void> _startUpdate() async {
@@ -120,31 +93,14 @@ class _AppUpdateCheckerState extends State<AppUpdateChecker>
 
   @override
   Widget build(BuildContext context) {
+    if (_updateAvailableVersionCode == null) {
+      return const SizedBox.shrink();
+    }
     return Padding(
       padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
-      child: Column(
-        children: [
-          if (_updateAvailableVersionCode != null) ...[
-            _UpdateBanner(
-              versionCode: _updateAvailableVersionCode!,
-              onTap: _startUpdate,
-            ),
-            const SizedBox(height: 8),
-          ],
-          OutlinedButton.icon(
-            onPressed: _checkingForUpdate
-                ? null
-                : () => _checkForUpdate(manual: true),
-            icon: _checkingForUpdate
-                ? const SizedBox(
-                    width: 16,
-                    height: 16,
-                    child: CircularProgressIndicator(strokeWidth: 2),
-                  )
-                : const Icon(Icons.system_update_outlined),
-            label: Text(_checkingForUpdate ? 'Checking…' : 'Check for Updates'),
-          ),
-        ],
+      child: _UpdateBanner(
+        versionCode: _updateAvailableVersionCode!,
+        onTap: _startUpdate,
       ),
     );
   }

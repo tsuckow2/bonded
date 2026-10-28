@@ -27,7 +27,9 @@ use bonded_core::diagnostics::{
 use bonded_core::peer_share::{
     PeerShareIntroductionClaims, PeerShareIntroductionRequest, SignedPeerShareIntroduction,
 };
-use bonded_core::session::{SessionFrame, SessionHeader, FLAG_PING, FLAG_PONG};
+use bonded_core::session::{
+    encode_observed_address, SessionFrame, SessionHeader, FLAG_PING, FLAG_PONG,
+};
 use bonded_core::transport::{PrependedStream, Transport, WebSocketTlsTransport};
 use http::StatusCode;
 use sha2::{Digest, Sha256};
@@ -1020,7 +1022,11 @@ async fn handle_transport_session<T: Transport>(
                         sequence: frame.header.sequence,
                         flags: FLAG_PONG,
                     },
-                    payload: frame.payload,
+                    // Stamp the address this transport's peer presents
+                    // from, so the client can show its per-path public
+                    // (egress) address. Older clients ignore PONG
+                    // payloads, so this is backward compatible.
+                    payload: encode_observed_address(peer),
                 };
                 if let Err(err) = transport.send(pong).await {
                     warn!(peer = %peer, session_id = handle.session_id, error = %err,
@@ -1078,7 +1084,9 @@ async fn handle_transport_session<T: Transport>(
                                     sequence: frame.header.sequence,
                                     flags: FLAG_PONG,
                                 },
-                                payload: frame.payload,
+                                // Observed-address stamp: see the
+                                // initial-frame pong above.
+                                payload: encode_observed_address(peer),
                             };
                             if let Err(err) = transport.send(pong).await {
                                 warn!(peer = %peer, session_id = handle.session_id, error = %err,

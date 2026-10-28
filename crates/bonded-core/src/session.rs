@@ -154,6 +154,25 @@ impl SessionFrame {
     }
 }
 
+/// Encode the address the server observed for a transport connection into
+/// a PONG payload, so the client can show each path's public (egress)
+/// address exactly as the server sees it.
+///
+/// Heartbeat PINGs carry an empty payload and older servers echo that
+/// empty payload back, so the extension is backward compatible both
+/// ways: old clients ignore PONG payloads entirely, and new clients
+/// treat an empty or unparseable payload as "not reported".
+pub fn encode_observed_address(observed: std::net::SocketAddr) -> Bytes {
+    Bytes::copy_from_slice(observed.to_string().as_bytes())
+}
+
+/// Decode a PONG payload stamped by [`encode_observed_address`]. Returns
+/// `None` for empty payloads (older servers) and anything that is not a
+/// socket-address string.
+pub fn decode_observed_address(payload: &[u8]) -> Option<std::net::SocketAddr> {
+    std::str::from_utf8(payload).ok()?.trim().parse().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{SessionFrame, SessionHeader, SessionState, SessionStateError};
@@ -175,6 +194,24 @@ mod tests {
         assert_eq!(decoded.header.connection_id, 42);
         assert_eq!(decoded.header.sequence, 7);
         assert_eq!(&decoded.payload[..], b"hello");
+    }
+
+    #[test]
+    fn observed_address_roundtrip_and_legacy_payloads() {
+        use super::{decode_observed_address, encode_observed_address};
+        let v4: std::net::SocketAddr = "75.164.76.151:54321".parse().expect("v4 addr");
+        assert_eq!(
+            decode_observed_address(&encode_observed_address(v4)),
+            Some(v4)
+        );
+        let v6: std::net::SocketAddr = "[2607:fb90:8b60:d2c3::1]:443".parse().expect("v6 addr");
+        assert_eq!(
+            decode_observed_address(&encode_observed_address(v6)),
+            Some(v6)
+        );
+        // Older servers echo the ping's empty payload: not reported.
+        assert_eq!(decode_observed_address(&[]), None);
+        assert_eq!(decode_observed_address(b"not an address"), None);
     }
 
     #[test]

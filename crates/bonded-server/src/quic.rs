@@ -24,7 +24,9 @@ use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, RwLock};
 
 use anyhow::Context as _;
-use bonded_core::session::{SessionFrame, SessionHeader, FLAG_PING, FLAG_PONG};
+use bonded_core::session::{
+    encode_observed_address, SessionFrame, SessionHeader, FLAG_PING, FLAG_PONG,
+};
 use bonded_core::transport::{QuicTransport, Transport as _};
 use bytes::{Buf, Bytes};
 use h3::server;
@@ -326,7 +328,10 @@ async fn handle_quic_connection(
                         sequence: frame.header.sequence,
                         flags: FLAG_PONG,
                     },
-                    payload: frame.payload,
+                    // Observed-address stamp: the client shows this as
+                    // the path's public (egress) address. Older clients
+                    // ignore PONG payloads: backward compatible.
+                    payload: encode_observed_address(peer),
                 };
                 if let Err(err) = transport.send(pong).await {
                     warn!(peer = %peer, session_id = handle.session_id,
@@ -364,7 +369,8 @@ async fn handle_quic_connection(
                                     sequence: frame.header.sequence,
                                     flags: FLAG_PONG,
                                 },
-                                payload: frame.payload,
+                                // Observed-address stamp: see above.
+                                payload: encode_observed_address(peer),
                             };
                             if let Err(err) = transport.send(pong).await {
                                 warn!(peer = %peer, session_id = handle.session_id,

@@ -757,6 +757,11 @@ class _PathRow extends StatelessWidget {
                   ].join(' · '),
                   style: TextStyle(fontSize: 12, color: Colors.grey[700]),
                 ),
+                if (path.publicIp != null)
+                  Text(
+                    'Public IP ${path.publicIp}',
+                    style: TextStyle(fontSize: 12, color: Colors.grey[700]),
+                  ),
               ],
             ),
           ),

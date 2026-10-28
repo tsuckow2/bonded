@@ -10,6 +10,11 @@ class PathStat {
   final int inboundBytes;
   final int lastRttMs;
 
+  /// "IP:port" source address the server sees for this path's
+  /// connection, reported in its heartbeat pongs; null until reported
+  /// (older servers never report one).
+  final String? serverSeenAddress;
+
   const PathStat({
     required this.pathIndex,
     required this.kind,
@@ -17,6 +22,7 @@ class PathStat {
     required this.outboundBytes,
     required this.inboundBytes,
     required this.lastRttMs,
+    required this.serverSeenAddress,
   });
 
   factory PathStat.fromMap(Map<dynamic, dynamic> map) {
@@ -27,10 +33,27 @@ class PathStat {
       outboundBytes: (map['outboundBytes'] as num?)?.toInt() ?? 0,
       inboundBytes: (map['inboundBytes'] as num?)?.toInt() ?? 0,
       lastRttMs: (map['lastRttMs'] as num?)?.toInt() ?? 0,
+      serverSeenAddress:
+          (map['serverSeenAddress'] as String?)?.trim().isNotEmpty == true
+          ? map['serverSeenAddress'] as String
+          : null,
     );
   }
 
   bool get isDirect => pathIndex != null;
+
+  /// Just the IP of [serverSeenAddress] (the public egress address for
+  /// this path), without the ephemeral source port.
+  String? get publicIp {
+    final address = serverSeenAddress;
+    if (address == null) return null;
+    if (address.startsWith('[')) {
+      final close = address.indexOf(']');
+      return close > 0 ? address.substring(1, close) : address;
+    }
+    final split = address.lastIndexOf(':');
+    return split > 0 ? address.substring(0, split) : address;
+  }
 }
 
 /// A server-identity verification failure (possible interception),
