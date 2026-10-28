@@ -1128,6 +1128,7 @@ async fn establish_quic_session(config: &ClientConfig) -> anyhow::Result<QuicTra
         rustls_config.clone(),
         b"bonded-quic",
         config.socket_protect.as_ref(),
+        dial_override,
     )
     .await
     {
@@ -1145,6 +1146,7 @@ async fn establish_quic_session(config: &ClientConfig) -> anyhow::Result<QuicTra
                 (*cert_proof::make_pinned_tls_config(&refreshed)).clone(),
                 b"bonded-quic",
                 config.socket_protect.as_ref(),
+                dial_override,
             )
             .await
             .with_context(|| {
@@ -1224,6 +1226,7 @@ async fn establish_quic_session_with_bind(
         config.socket_protect.as_ref(),
         config.socket_network_bind.as_ref(),
         Some(bind_ip),
+        dial_override,
     )
     .await
     {
@@ -1243,6 +1246,7 @@ async fn establish_quic_session_with_bind(
                 config.socket_protect.as_ref(),
                 config.socket_network_bind.as_ref(),
                 Some(bind_ip),
+                dial_override,
             )
             .await
             .with_context(|| {
@@ -1570,6 +1574,7 @@ async fn request_bootstrap_json_h3(
         rustls_config,
         b"h3",
         config.socket_protect.as_ref(),
+        dial_override,
     )
     .await
     {
@@ -1592,6 +1597,7 @@ async fn request_bootstrap_json_h3(
                 (*cert_proof::make_pinned_tls_config(&refreshed)).clone(),
                 b"h3",
                 config.socket_protect.as_ref(),
+                dial_override,
             )
             .await
             .with_context(|| {
@@ -1868,8 +1874,17 @@ pub(crate) async fn connect_quic_client(
     rustls_config: RustlsClientConfig,
     alpn: &[u8],
     socket_protect: Option<&bonded_core::config::SocketProtectFn>,
+    dial_target: Option<&str>,
 ) -> anyhow::Result<(quinn::Endpoint, quinn::Connection)> {
-    connect_quic_client_with_bind(host, port, rustls_config, alpn, socket_protect, None, None).await
+    connect_quic_client_with_bind(host, port, rustls_config, alpn, socket_protect, None, None, dial_target).await
+}
+
+async fn resolve_quic_host(host: &str, port: u16) -> anyhow::Result<SocketAddr> {
+    tokio::net::lookup_host(format!("{host}:{port}"))
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to resolve QUIC server {host}:{port}: {e}"))?
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("no addresses resolved for {host}:{port}"))
 }
 
 pub(crate) async fn connect_quic_client_with_bind(
@@ -1880,13 +1895,26 @@ pub(crate) async fn connect_quic_client_with_bind(
     socket_protect: Option<&bonded_core::config::SocketProtectFn>,
     socket_network_bind: Option<&bonded_core::config::SocketNetworkBindFn>,
     bind_ip: Option<IpAddr>,
+    // Pre-resolved dial target (server_resolved_address, "ip:port" or
+    // bare IP) when the caller has one. When present it is used
+    // directly instead of resolving `host` here: after the VPN TUN
+    // comes up, Android routes DNS through the tunnel, so resolving
+    // the hostname at dial time deadlocks session establishment (the
+    // tunnel cannot forward DNS before the session exists). `host`
+    // remains the TLS server name either way.
+    dial_target: Option<&str>,
 ) -> anyhow::Result<(quinn::Endpoint, quinn::Connection)> {
     let quic_client_config = build_quic_client_config(rustls_config, alpn)?;
-    let server_addr: SocketAddr = tokio::net::lookup_host(format!("{host}:{port}"))
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to resolve QUIC server {host}:{port}: {e}"))?
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("no addresses resolved for {host}:{port}"))?;
+    let server_addr: SocketAddr = match dial_target {
+        Some(target) => match target.parse::<SocketAddr>() {
+            Ok(addr) => addr,
+            Err(_) => match target.parse::<IpAddr>() {
+                Ok(ip) => SocketAddr::new(ip, port),
+                Err(_) => resolve_quic_host(host, port).await?,
+            },
+        },
+        None => resolve_quic_host(host, port).await?,
+    };
 
     // Bench instrumentation (quic-probe-diag): record the exact dial
     // target and bind choice, so a session dial can be compared with
@@ -1994,6 +2022,7 @@ pub async fn probe_quic_handshake(
         socket_protect,
         socket_network_bind,
         bind_ip,
+        None,
     );
     let (endpoint, connection) = match tokio::time::timeout(timeout, dial).await {
         Ok(Ok(pair)) => pair,

@@ -99,6 +99,7 @@ pub async fn connect_peer_relay(
         socket_protect,
         None,
         bind_ip,
+        None,
     )
     .await?;
 
