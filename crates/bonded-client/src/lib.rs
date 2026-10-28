@@ -1948,6 +1948,66 @@ fn build_quic_client_config(
     Ok(client_config)
 }
 
+/// Diagnostics: perform a single production-shaped QUIC session dial —
+/// the same socket creation, protect / network-bind callbacks, ALPN and
+/// transport config as `establish_quic_session` — and report the outcome
+/// as a one-line string, WITHOUT running the bonded auth handshake.
+/// Backs the in-app TEST_QUIC_PROBE diagnostic, which bisects QUIC
+/// establishment failures from inside a live app process (e.g. with a
+/// real session's TUN up). The TLS config is the bootstrap capture
+/// verifier: identity proof is out of scope for a delivery probe and
+/// the on-the-wire flight is identical either way.
+pub async fn probe_quic_handshake(
+    socket_protect: Option<&bonded_core::config::SocketProtectFn>,
+    socket_network_bind: Option<&bonded_core::config::SocketNetworkBindFn>,
+    bind_ip: Option<std::net::IpAddr>,
+    host: &str,
+    port: u16,
+    timeout: std::time::Duration,
+) -> Result<String, String> {
+    let captured = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let rustls_config = (*cert_proof::make_insecure_capture_tls_config(captured)).clone();
+    let start = std::time::Instant::now();
+    let dial = connect_quic_client_with_bind(
+        host,
+        port,
+        rustls_config,
+        b"bonded-quic",
+        socket_protect,
+        socket_network_bind,
+        bind_ip,
+    );
+    let (endpoint, connection) = match tokio::time::timeout(timeout, dial).await {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(e)) => return Err(format!("dial failed: {e:#}")),
+        Err(_) => return Err(format!("TIMEOUT after {}ms", timeout.as_millis())),
+    };
+    let remote = connection.remote_address();
+    let ms = start.elapsed().as_millis();
+    // Post-handshake data-plane check: open a bidi stream and push a
+    // small payload (the server reads it as the start of an auth hello
+    // and simply waits/errors — that is fine for a delivery probe).
+    let stream_note = match tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        connection.open_bi(),
+    )
+    .await
+    {
+        Ok(Ok((mut send, _recv))) => match send.write_all(&[0u8; 64]).await {
+            Ok(()) => {
+                let _ = send.finish();
+                "stream=OK".to_string()
+            }
+            Err(e) => format!("stream-write-err={e}"),
+        },
+        Ok(Err(e)) => format!("stream-err={e}"),
+        Err(_) => "stream-timeout".to_string(),
+    };
+    connection.close(0u32.into(), b"probe-done");
+    endpoint.close(0u32.into(), b"probe-done");
+    Ok(format!("CONNECTED remote={remote} in {ms}ms {stream_note}"))
+}
+
 pub(crate) fn extract_quic_peer_certificate(
     connection: &quinn::Connection,
 ) -> anyhow::Result<Vec<u8>> {

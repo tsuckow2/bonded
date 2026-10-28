@@ -70,6 +70,18 @@ class NetworkTestReceiver : BroadcastReceiver() {
         }
     }
 
+    /**
+     * Production-shaped QUIC handshake probe implemented in bonded-ffi /
+     * bonded-client (same socket path and protect/bind callbacks as a
+     * live session). Returns a one-line result string.
+     */
+    private external fun nativeProbeQuicHandshake(
+            bindAddress: String,
+            host: String,
+            port: Int,
+            timeoutMs: Int,
+    ): String
+
     private fun logI(message: String) {
         android.util.Log.i("NetworkTest", message)
         appendBufferedLog("I", message)
@@ -111,6 +123,7 @@ class NetworkTestReceiver : BroadcastReceiver() {
                         action == "com.bonded.bonded_app.TEST_HTTP_CODINGWELL" ||
                         action == "com.bonded.bonded_app.TEST_PROTOCOL_STRESS" ||
                         action == "com.bonded.bonded_app.TEST_UDP_PROBE" ||
+                        action == "com.bonded.bonded_app.TEST_QUIC_PROBE" ||
                         action == "com.bonded.bonded_app.TEST_ALL"
 
         if (isAsyncAction) {
@@ -160,6 +173,30 @@ class NetworkTestReceiver : BroadcastReceiver() {
                                     logW = ::logW,
                                     logE = ::logE,
                             )
+                        }
+                        "com.bonded.bonded_app.TEST_QUIC_PROBE" -> {
+                            val bindAddress =
+                                    intent.getStringExtra("bind_address") ?: ""
+                            val probeHost =
+                                    intent.getStringExtra("host")
+                                            ?: "charter.codingwell.net"
+                            val probePort = intent.getIntExtra("port", 443)
+                            logI(
+                                    "QUIC handshake probe: bind=$bindAddress target=$probeHost:$probePort",
+                            )
+                            runCatching { System.loadLibrary("bonded_ffi") }
+                            val probeResult =
+                                    try {
+                                        nativeProbeQuicHandshake(
+                                                bindAddress,
+                                                probeHost,
+                                                probePort,
+                                                8000,
+                                        )
+                                    } catch (e: Throwable) {
+                                        "ERR ${e.javaClass.simpleName}: ${e.message}"
+                                    }
+                            logI("QUIC handshake probe result: $probeResult")
                         }
                         "com.bonded.bonded_app.TEST_UDP_PROBE" -> {
                             UdpProbeTester.run(

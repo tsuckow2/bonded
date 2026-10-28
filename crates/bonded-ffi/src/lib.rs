@@ -2242,6 +2242,82 @@ pub extern "system" fn Java_com_bonded_bonded_1app_BondedVpnService_nativeGetSes
     }
 }
 
+/// In-app QUIC handshake probe (diagnostics): dials one production-shaped
+/// QUIC session connection using the same protect / network-bind
+/// callbacks as a live session, from a dedicated thread + runtime (the
+/// FFI's per-session pattern). Backs the Kotlin TEST_QUIC_PROBE
+/// broadcast; returns a one-line result string.
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_bonded_bonded_1app_NetworkTestReceiver_nativeProbeQuicHandshake(
+    mut env: jni::JNIEnv,
+    _obj: jni::objects::JObject,
+    bind_address: jni::objects::JString,
+    host: jni::objects::JString,
+    port: jni::sys::jint,
+    timeout_ms: jni::sys::jint,
+) -> jni::sys::jstring {
+    let bind_address: String = match env.get_string(&bind_address) {
+        Ok(value) => value.into(),
+        Err(_) => String::new(),
+    };
+    let host: String = match env.get_string(&host) {
+        Ok(value) => value.into(),
+        Err(_) => String::new(),
+    };
+    let bind_ip = if bind_address.is_empty() {
+        None
+    } else {
+        match bind_address.parse::<std::net::IpAddr>() {
+            Ok(ip) => Some(ip),
+            Err(_) => {
+                let message = format!("ERR bad bind_address {bind_address}");
+                return match env.new_string(message) {
+                    Ok(value) => value.into_raw(),
+                    Err(_) => std::ptr::null_mut(),
+                };
+            }
+        }
+    };
+    let socket_protect = SocketProtectFn(Arc::new(|fd| protect_fd(fd)));
+    let socket_network_bind = SocketNetworkBindFn(Arc::new(|fd, bind_address| {
+        bind_socket_to_network(fd, bind_address)
+    }));
+    let timeout = std::time::Duration::from_millis(timeout_ms.max(0) as u64);
+    let port_u16 = port as u16;
+    let handle = std::thread::spawn(move || {
+        let runtime = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(err) => return format!("ERR runtime: {err}"),
+        };
+        runtime.block_on(async move {
+            match bonded_client::probe_quic_handshake(
+                Some(&socket_protect),
+                Some(&socket_network_bind),
+                bind_ip,
+                &host,
+                port_u16,
+                timeout,
+            )
+            .await
+            {
+                Ok(line) => line,
+                Err(line) => line,
+            }
+        })
+    });
+    let result = handle
+        .join()
+        .unwrap_or_else(|_| "ERR probe thread panicked".to_string());
+    match env.new_string(result) {
+        Ok(value) => value.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
 #[unsafe(no_mangle)]
 /// # Safety
 ///
