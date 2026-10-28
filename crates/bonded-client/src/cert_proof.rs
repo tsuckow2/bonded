@@ -295,7 +295,7 @@ impl ServerCertVerifier for PinnedCertVerifier {
             Ok(ServerCertVerified::assertion())
         } else {
             Err(TlsError::General(format!(
-                "TLS certificate fingerprint mismatch: got {actual}, expected {}",
+                "{IDENTITY_MISMATCH_MARKER}: TLS certificate fingerprint mismatch: got {actual}, expected {}",
                 self.expected
             )))
         }
@@ -379,6 +379,35 @@ mod tests {
         assert!(
             is_identity_mismatch_error(&wrapped),
             "signature failure must classify as identity mismatch through context layers: {wrapped:#}"
+        );
+    }
+
+    #[test]
+    fn pinned_verifier_rejection_is_an_identity_mismatch() {
+        // The pinned-fingerprint flavor of verification (WSS/QUIC when a
+        // fingerprint is stored from the pairing): a presented cert that
+        // does not match the pin is the same identity evidence as a bad
+        // cert-proof, and must classify the same way so session
+        // establishment fails closed and the app can surface it as a
+        // possible interception on that path.
+        let verifier = PinnedCertVerifier {
+            expected: compute_fingerprint(b"the paired server's cert"),
+        };
+        let presented = CertificateDer::from(&b"some other cert"[..]);
+        let server_name = ServerName::try_from("server.example").expect("valid dns name");
+        let err = verifier
+            .verify_server_cert(
+                &presented,
+                &[],
+                &server_name,
+                &[],
+                UnixTime::now(),
+            )
+            .expect_err("a cert that does not match the pin must be rejected");
+        let wrapped = anyhow::Error::new(err).context("wss connect wrapper");
+        assert!(
+            is_identity_mismatch_error(&wrapped),
+            "pinned fingerprint rejection must classify as identity mismatch: {wrapped:#}"
         );
     }
 

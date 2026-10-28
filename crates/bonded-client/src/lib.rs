@@ -532,6 +532,14 @@ where
                         && cert_proof::is_identity_mismatch_error(&err)
                     {
                         identity_error = Some(format!("{err:#}"));
+                        // Machine-readable marker for the platform layer:
+                        // lets the app attribute the interception to this
+                        // path and surface it as a user-visible warning
+                        // (the FFI session observer watches for this line
+                        // and records it in the session snapshot).
+                        observer(format!(
+                            "server-identity-mismatch path_index={path_index} detail={err:#}"
+                        ));
                     }
                     let bind_context = bind_address
                         .map(|bind| format!(", bind_address={bind}"))

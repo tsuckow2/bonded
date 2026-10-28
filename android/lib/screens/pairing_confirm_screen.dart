@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import '../models/pairing_model.dart';
+import '../services/app_settings_service.dart';
 import '../services/pairing_service.dart';
 
 class PairingConfirmScreen extends StatefulWidget {
@@ -36,13 +37,14 @@ class _PairingConfirmScreenState extends State<PairingConfirmScreen> {
         serverIdentityPublicKey: widget.payload.serverIdentityPublicKey,
       );
 
-      // Success - navigate to dashboard
+      // Success: make the new server the selected one and land on the
+      // main screen, one tap from connecting.
+      final settings = await AppSettingsService.load();
+      await AppSettingsService.update(
+        settings.copyWith(selectedServerId: deviceId),
+      );
       if (mounted) {
-        Navigator.of(context).pushNamedAndRemoveUntil(
-          '/dashboard',
-          (route) => false,
-          arguments: {'deviceId': deviceId},
-        );
+        Navigator.of(context).pushNamedAndRemoveUntil('/home', (route) => false);
       }
     } on PairingException catch (e) {
       setState(() {

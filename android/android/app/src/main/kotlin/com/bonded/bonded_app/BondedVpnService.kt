@@ -34,6 +34,30 @@ data class SessionSnapshot(
         val inboundBytes: Long,
         val connectedAtMs: Long,
         val lastError: String?,
+        val peerShareError: String? = null,
+        val paths: List<SessionPathStat> = emptyList(),
+        val interception: InterceptionWarning? = null,
+)
+
+/** A server-identity failure (possible interception) from the native
+ * snapshot, attributed to the connection that presented bad credentials. */
+data class InterceptionWarning(
+        /** Path index of the offending connection; null when the failure
+         * came from the pre-session identity gate. */
+        val pathIndex: Int?,
+        val detail: String,
+        val atMs: Long,
+)
+
+/** Per-path stats from the native snapshot (transport-vec order). */
+data class SessionPathStat(
+        /** Supervisor path index; null for peer-relay transports. */
+        val pathIndex: Int?,
+        val kind: String,
+        val active: Boolean,
+        val outboundBytes: Long,
+        val inboundBytes: Long,
+        val lastRttMs: Long,
 )
 
 class BondedVpnService : VpnService() {
@@ -501,10 +525,46 @@ class BondedVpnService : VpnService() {
                     connectedAtMs = json.optLong("connectedAtMs", 0),
                     lastError =
                             json.optString("lastError").takeIf { it.isNotBlank() && it != "null" },
+                    peerShareError =
+                            json.optString("peerShareError")
+                                    .takeIf { it.isNotBlank() && it != "null" },
+                    paths = parseSessionPaths(json.optJSONArray("paths")),
+                    interception =
+                            json.optJSONObject("interception")?.let { warning ->
+                                InterceptionWarning(
+                                        pathIndex =
+                                                if (warning.isNull("pathIndex")) null
+                                                else warning.optInt("pathIndex", -1)
+                                                        .takeIf { it >= 0 },
+                                        detail = warning.optString("detail", ""),
+                                        atMs = warning.optLong("atMs", 0),
+                                )
+                            },
             )
         } catch (_: Exception) {
             null
         }
+    }
+
+    private fun parseSessionPaths(array: JSONArray?): List<SessionPathStat> {
+        if (array == null) return emptyList()
+        val paths = ArrayList<SessionPathStat>(array.length())
+        for (i in 0 until array.length()) {
+            val item = array.optJSONObject(i) ?: continue
+            paths.add(
+                    SessionPathStat(
+                            pathIndex =
+                                    if (item.isNull("pathIndex")) null
+                                    else item.optInt("pathIndex", -1).takeIf { it >= 0 },
+                            kind = item.optString("kind", "Unknown"),
+                            active = item.optBoolean("active", false),
+                            outboundBytes = item.optLong("outboundBytes", 0),
+                            inboundBytes = item.optLong("inboundBytes", 0),
+                            lastRttMs = item.optLong("lastRttMs", 0),
+                    )
+            )
+        }
+        return paths
     }
 
     private fun updateSessionSnapshot(snapshot: SessionSnapshot?) {
@@ -513,6 +573,12 @@ class BondedVpnService : VpnService() {
 
         // Emit state-change events only on transitions to avoid spam.
         if (state != lastEmittedSessionState) {
+            // Keep the Quick Settings tile and the home-screen widget in
+            // step with the session without either polling.
+            try {
+                BondedTileService.requestRefresh(this)
+                BondedWidgetProvider.refreshAll(this)
+            } catch (_: Exception) {}
             lastEmittedSessionState = state
             when (state) {
                 "connected" -> {
@@ -1116,9 +1182,29 @@ class BondedVpnService : VpnService() {
                     "inboundBytes" to snapshot.inboundBytes,
                     "connectedAtMs" to snapshot.connectedAtMs,
                     "lastError" to snapshot.lastError,
+                    "peerShareError" to snapshot.peerShareError,
+                    "interception" to
+                            snapshot.interception?.let { warning ->
+                                mapOf<String, Any?>(
+                                        "pathIndex" to warning.pathIndex,
+                                        "detail" to warning.detail,
+                                        "atMs" to warning.atMs,
+                                )
+                            },
                     "networkPathCount" to activeNetworkPathCount,
                     "networkBindAddresses" to activeNetworkBindAddresses,
                     "networkPathSummaries" to activeNetworkPathSummaries,
+                    "paths" to
+                            snapshot.paths.map { path ->
+                                mapOf<String, Any?>(
+                                        "pathIndex" to path.pathIndex,
+                                        "kind" to path.kind,
+                                        "active" to path.active,
+                                        "outboundBytes" to path.outboundBytes,
+                                        "inboundBytes" to path.inboundBytes,
+                                        "lastRttMs" to path.lastRttMs,
+                                )
+                            },
             )
         }
 

@@ -8,6 +8,7 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE"/>
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
 
     <application
         android:label="bonded_app"
@@ -94,6 +95,49 @@
                 <action android:name="com.bonded.bonded_app.VPN_STOP"/>
             </intent-filter>
         </receiver>
+
+        <!-- Auto-connect on boot (Settings toggle). -->
+        <receiver
+            android:name=".BootReceiver"
+            android:exported="true"
+            android:enabled="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED"/>
+            </intent-filter>
+        </receiver>
+
+        <!-- Quick Settings tile. -->
+        <service
+            android:name=".BondedTileService"
+            android:exported="true"
+            android:icon="@mipmap/ic_launcher"
+            android:label="@string/bonded_tile_label"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE"/>
+            </intent-filter>
+            <meta-data
+                android:name="android.service.quicksettings.ACTIVE_TILE"
+                android:value="true"/>
+        </service>
+
+        <!-- Home-screen widget. -->
+        <receiver
+            android:name=".BondedWidgetProvider"
+            android:exported="false"
+            android:enabled="true">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE"/>
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/bonded_widget_info"/>
+        </receiver>
+
+        <receiver
+            android:name=".BondedWidgetToggleReceiver"
+            android:exported="false"
+            android:enabled="true"/>
 
         <receiver
             android:name=".NetworkTestReceiver"

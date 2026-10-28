@@ -411,6 +411,46 @@ struct AndroidSessionSnapshot {
     /// Set when the peer-share runtime failed to start. The session itself
     /// keeps running without peer-share; this is informational, not fatal.
     peer_share_error: Option<String>,
+    /// Per-transport stats in transport-vec order, for the app's main
+    /// screen (per-path rows + graphs). Structure (which paths exist,
+    /// their kinds, which is active) is refreshed by
+    /// [`publish_path_stats`] wherever the transport set changes;
+    /// counters are incremented in place by transport-vec index.
+    path_stats: Vec<AndroidPathStat>,
+    /// The most recent server-identity failure (possible interception)
+    /// seen while establishing or re-dialing this session, if any. The
+    /// app surfaces it as a dedicated warning naming the connection
+    /// that presented the unverifiable credentials.
+    interception: Option<InterceptionRecord>,
+}
+
+/// A server-identity verification failure attributed to a connection.
+#[cfg(any(target_os = "android", test))]
+#[derive(Clone, Debug)]
+struct InterceptionRecord {
+    /// Path whose connection presented the bad credentials; `None` when
+    /// the failure came from the pre-session identity gate, which runs
+    /// before any path exists.
+    path_index: Option<usize>,
+    detail: String,
+    at_ms: u64,
+}
+
+/// Stats for one session transport, in transport-vec order.
+#[cfg(any(target_os = "android", test))]
+#[derive(Clone, Debug, Default)]
+struct AndroidPathStat {
+    /// Supervisor path index of this transport; `None` for peer relays,
+    /// which have no path index.
+    path_index: Option<usize>,
+    kind: String,
+    active: bool,
+    outbound_bytes: u64,
+    inbound_bytes: u64,
+    /// Most recent heartbeat RTT in ms (0 = none measured yet). All
+    /// paths are pinged on the same tick, so a pong's arrival transport
+    /// identifies the path its RTT belongs to.
+    last_rtt_ms: u64,
 }
 
 #[cfg(any(target_os = "android", test))]
@@ -542,9 +582,45 @@ fn snapshot_json(snapshot: &AndroidSessionSnapshot) -> String {
         .as_ref()
         .map(|value| format!("\"{}\"", escape_json(value)))
         .unwrap_or_else(|| "null".to_owned());
+    let interception = snapshot
+        .interception
+        .as_ref()
+        .map(|record| {
+            let path_index = record
+                .path_index
+                .map(|index| index.to_string())
+                .unwrap_or_else(|| "null".to_owned());
+            format!(
+                "{{\"pathIndex\":{},\"detail\":\"{}\",\"atMs\":{}}}",
+                path_index,
+                escape_json(&record.detail),
+                record.at_ms,
+            )
+        })
+        .unwrap_or_else(|| "null".to_owned());
+    let paths = snapshot
+        .path_stats
+        .iter()
+        .map(|stat| {
+            let path_index = stat
+                .path_index
+                .map(|index| index.to_string())
+                .unwrap_or_else(|| "null".to_owned());
+            format!(
+                "{{\"pathIndex\":{},\"kind\":\"{}\",\"active\":{},\"outboundBytes\":{},\"inboundBytes\":{},\"lastRttMs\":{}}}",
+                path_index,
+                escape_json(&stat.kind),
+                stat.active,
+                stat.outbound_bytes,
+                stat.inbound_bytes,
+                stat.last_rtt_ms,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
 
     format!(
-        "{{\"state\":\"{}\",\"serverAddress\":\"{}\",\"activeTransport\":\"{}\",\"transportCount\":{},\"peerRelayCount\":{},\"outboundPackets\":{},\"inboundPackets\":{},\"outboundBytes\":{},\"inboundBytes\":{},\"connectedAtMs\":{},\"lastError\":{},\"peerShareError\":{}}}",
+        "{{\"state\":\"{}\",\"serverAddress\":\"{}\",\"activeTransport\":\"{}\",\"transportCount\":{},\"peerRelayCount\":{},\"outboundPackets\":{},\"inboundPackets\":{},\"outboundBytes\":{},\"inboundBytes\":{},\"connectedAtMs\":{},\"lastError\":{},\"peerShareError\":{},\"interception\":{},\"paths\":[{}]}}",
         escape_json(&snapshot.state),
         escape_json(&snapshot.server_address),
         escape_json(&snapshot.active_transport),
@@ -557,6 +633,8 @@ fn snapshot_json(snapshot: &AndroidSessionSnapshot) -> String {
         snapshot.connected_at_ms,
         last_error,
         peer_share_error,
+        interception,
+        paths,
     )
 }
 
@@ -671,6 +749,90 @@ fn sync_transport_snapshot(
     });
 }
 
+/// Whether an error text represents a server-identity verification
+/// failure: the error chain carries the `server-identity-mismatch`
+/// marker, or the text is the canonical user-surfaced identity error.
+#[cfg(any(target_os = "android", test))]
+fn is_identity_failure_text(text: &str) -> bool {
+    text.contains("server-identity-mismatch")
+        || text.contains("Server identity verification failed")
+}
+
+/// Record a server-identity failure (possible interception) in the
+/// session snapshot for the app to surface, attributed to the path
+/// whose connection presented the bad credentials (`None` for the
+/// pre-session identity gate).
+#[cfg(any(target_os = "android", test))]
+fn record_interception(
+    snapshot: &Arc<Mutex<AndroidSessionSnapshot>>,
+    path_index: Option<usize>,
+    detail: String,
+) {
+    let at_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    alog_error!(
+        "Server identity failure recorded for surfacing: path_index={:?} detail={}",
+        path_index,
+        detail
+    );
+    update_snapshot(snapshot, |session_snapshot| {
+        session_snapshot.interception = Some(InterceptionRecord {
+            path_index,
+            detail,
+            at_ms,
+        });
+    });
+}
+
+/// Per-vec-index path-index slots from the worker's path map, in the
+/// shape [`publish_path_stats`] expects.
+#[cfg(any(target_os = "android", test))]
+fn path_index_slots(map: &PathIndexMap, len: usize) -> Vec<Option<usize>> {
+    (0..len).map(|index| map.path_of(index)).collect()
+}
+
+/// Refresh the snapshot's per-path structure (which transports exist,
+/// their path indexes and kinds, which is active) after a transport-set
+/// change. Counters survive the refresh: direct paths are matched by
+/// path index (a re-dialed path keeps its totals), peer relays by vec
+/// position. Between refreshes the worker increments counters in place
+/// by vec index — safe because every structural change republishes
+/// before any further counter update, all within the one worker task.
+#[cfg(any(target_os = "android", test))]
+fn publish_path_stats(
+    snapshot: &Arc<Mutex<AndroidSessionSnapshot>>,
+    transports: &[ClientTransport],
+    path_index_of: &[Option<usize>],
+    active_index: usize,
+) {
+    update_snapshot(snapshot, |session_snapshot| {
+        let previous = std::mem::take(&mut session_snapshot.path_stats);
+        session_snapshot.path_stats = transports
+            .iter()
+            .enumerate()
+            .map(|(index, transport)| {
+                let path_index = path_index_of.get(index).copied().flatten();
+                let prior = match path_index {
+                    Some(path_index) => previous
+                        .iter()
+                        .find(|stat| stat.path_index == Some(path_index)),
+                    None => previous.get(index),
+                };
+                AndroidPathStat {
+                    path_index,
+                    kind: client_transport_kind(transport).to_owned(),
+                    active: index == active_index,
+                    outbound_bytes: prior.map(|stat| stat.outbound_bytes).unwrap_or(0),
+                    inbound_bytes: prior.map(|stat| stat.inbound_bytes).unwrap_or(0),
+                    last_rtt_ms: prior.map(|stat| stat.last_rtt_ms).unwrap_or(0),
+                }
+            })
+            .collect();
+    });
+}
+
 #[cfg(any(target_os = "android", test))]
 fn stop_android_session() {
     let handle = {
@@ -764,6 +926,8 @@ fn start_android_session(
         connected_at_ms: 0,
         last_error: None,
         peer_share_error: None,
+        path_stats: Vec::new(),
+        interception: None,
     }));
     let worker_snapshot = Arc::clone(&snapshot);
     let cancel_token = CancellationToken::new();
@@ -852,6 +1016,23 @@ fn start_android_session(
                 ANDROID_PATH_ESTABLISH_TIMEOUT,
                 establish_transport_paths_with_observer(&config, requested_paths, |message| {
                     alog_info!("Worker: {message}");
+                    // The client emits a machine-readable marker when a
+                    // path's attempt fails server-identity verification;
+                    // record it for the app to surface as an interception
+                    // warning attributed to that path.
+                    if let Some(rest) =
+                        message.strip_prefix("server-identity-mismatch path_index=")
+                    {
+                        if let Some((index, detail)) = rest.split_once(" detail=") {
+                            if let Ok(path_index) = index.parse::<usize>() {
+                                record_interception(
+                                    &worker_snapshot,
+                                    Some(path_index),
+                                    detail.to_owned(),
+                                );
+                            }
+                        }
+                    }
                 }),
             )
             .await
@@ -875,6 +1056,15 @@ fn start_android_session(
                         .map(|d| d.as_millis() as u64)
                         .unwrap_or(0);
                     sync_transport_snapshot(&worker_snapshot, &transports, 0);
+                    publish_path_stats(
+                        &worker_snapshot,
+                        &transports,
+                        &session_path_indexes
+                            .iter()
+                            .map(|index| Some(*index))
+                            .collect::<Vec<_>>(),
+                        0,
+                    );
                     update_snapshot(&worker_snapshot, |session_snapshot| {
                         session_snapshot.state = "connected".to_owned();
                         session_snapshot.connected_at_ms = now_ms;
@@ -884,6 +1074,25 @@ fn start_android_session(
                 }
                 Ok(Err(err)) => {
                     alog_error!("Failed to establish transport paths: {}", err);
+                    // Establishment returns Err only for a server-identity
+                    // failure. If no per-path marker was recorded (the
+                    // pre-session identity gate failed, before any path
+                    // existed), record it unattributed so the app still
+                    // surfaces the warning.
+                    if is_identity_failure_text(&format!("{err:#}")) {
+                        let already_recorded = worker_snapshot
+                            .lock()
+                            .expect("android session snapshot lock poisoned")
+                            .interception
+                            .is_some();
+                        if !already_recorded {
+                            record_interception(
+                                &worker_snapshot,
+                                None,
+                                format!("{err:#}"),
+                            );
+                        }
+                    }
                     update_snapshot(&worker_snapshot, |session_snapshot| {
                         session_snapshot.state = "error".to_owned();
                         session_snapshot.last_error = Some(err.to_string());
@@ -1038,6 +1247,15 @@ fn start_android_session(
                 return;
             }
             sync_transport_snapshot(&worker_snapshot, &transports, 0);
+            publish_path_stats(
+                &worker_snapshot,
+                &transports,
+                &candidate_paths
+                    .iter()
+                    .map(|index| Some(*index))
+                    .collect::<Vec<_>>(),
+                0,
+            );
             // F4: give every direct path a durable identity and an
             // owner. candidate_paths[i] is the path index of
             // transports[i]; the map keeps that association across the
@@ -1102,6 +1320,12 @@ fn start_android_session(
                             let kind = client_transport_kind(&transport);
                             transports.push(transport);
                             sync_transport_snapshot(&worker_snapshot, &transports, active_index);
+                            publish_path_stats(
+                                &worker_snapshot,
+                                &transports,
+                                &path_index_slots(&path_index_map, transports.len()),
+                                active_index,
+                            );
                             alog_info!(
                                 "Worker: added peer-share transport kind={} total={}",
                                 kind,
@@ -1131,6 +1355,15 @@ fn start_android_session(
                                         &transports,
                                         active_index,
                                     );
+                                    publish_path_stats(
+                                        &worker_snapshot,
+                                        &transports,
+                                        &path_index_slots(
+                                            &path_index_map,
+                                            transports.len(),
+                                        ),
+                                        active_index,
+                                    );
                                     alog_info!(
                                         "Worker: path {} restored by supervisor total={}",
                                         path_index,
@@ -1138,11 +1371,18 @@ fn start_android_session(
                                     );
                                 }
                             }
-                            Some(RedialOutcome::SessionDead { reason }) => {
+                            Some(RedialOutcome::SessionDead { reason, path_index }) => {
                                 alog_error!(
                                     "Worker: path supervisor reports the session is dead: {}",
                                     reason
                                 );
+                                if is_identity_failure_text(&reason) {
+                                    record_interception(
+                                        &worker_snapshot,
+                                        path_index,
+                                        reason.clone(),
+                                    );
+                                }
                                 update_snapshot(&worker_snapshot, |session_snapshot| {
                                     session_snapshot.state = "error".to_owned();
                                     session_snapshot.last_error = Some(reason);
@@ -1191,11 +1431,13 @@ fn start_android_session(
                                 let mut send_queue: std::collections::VecDeque<usize> =
                                     candidates.into();
                                 let mut sent = false;
+                                let mut sent_index: Option<usize> = None;
                                 let mut fatal_error: Option<String> = None;
                                 while let Some(index) = send_queue.pop_front() {
                                     match transports[index].send(frame.clone()).await {
                                         Ok(()) => {
                                             sent = true;
+                                            sent_index = Some(index);
                                             break;
                                         }
                                         Err(err) => {
@@ -1234,6 +1476,15 @@ fn start_android_session(
                                                 &transports,
                                                 active_index,
                                             );
+                                            publish_path_stats(
+                                                &worker_snapshot,
+                                                &transports,
+                                                &path_index_slots(
+                                                    &path_index_map,
+                                                    transports.len(),
+                                                ),
+                                                active_index,
+                                            );
                                         }
                                     }
                                 }
@@ -1251,6 +1502,14 @@ fn start_android_session(
                                     update_snapshot(&worker_snapshot, |session_snapshot| {
                                         session_snapshot.outbound_packets = session_snapshot.outbound_packets.saturating_add(1);
                                         session_snapshot.outbound_bytes = session_snapshot.outbound_bytes.saturating_add(packet_len);
+                                        if let Some(index) = sent_index {
+                                            if let Some(stat) =
+                                                session_snapshot.path_stats.get_mut(index)
+                                            {
+                                                stat.outbound_bytes =
+                                                    stat.outbound_bytes.saturating_add(packet_len);
+                                            }
+                                        }
                                     });
                                 } else {
                                     // Every candidate failed but other
@@ -1279,7 +1538,7 @@ fn start_android_session(
                         // so each removal leaves the remaining error
                         // indices valid.
                         let mut errors: Vec<(usize, anyhow::Error)> = Vec::new();
-                        for (_index, result) in recv_events {
+                        for (index, result) in recv_events {
                             match result {
                                 Ok(frame) => {
                                     // Handle heartbeat pong — don't feed it to the session reorder buffer.
@@ -1295,6 +1554,17 @@ fn start_android_session(
                                                 "Heartbeat pong received: seq={} rtt={}ms",
                                                 frame.header.sequence, rtt
                                             );
+                                            // Every path is pinged on the
+                                            // same tick, so the transport
+                                            // this pong arrived on owns
+                                            // this RTT.
+                                            update_snapshot(&worker_snapshot, |session_snapshot| {
+                                                if let Some(stat) =
+                                                    session_snapshot.path_stats.get_mut(index)
+                                                {
+                                                    stat.last_rtt_ms = rtt;
+                                                }
+                                            });
                                         } else {
                                             alog_info!(
                                                 "Heartbeat pong received: seq={}",
@@ -1330,10 +1600,16 @@ fn start_android_session(
                                         update_snapshot(&worker_snapshot, |session_snapshot| {
                                             session_snapshot.inbound_packets = session_snapshot.inbound_packets.saturating_add(1);
                                             session_snapshot.inbound_bytes = session_snapshot.inbound_bytes.saturating_add(payload_len);
+                                            if let Some(stat) =
+                                                session_snapshot.path_stats.get_mut(index)
+                                            {
+                                                stat.inbound_bytes =
+                                                    stat.inbound_bytes.saturating_add(payload_len);
+                                            }
                                         });
                                     }
                                 }
-                                Err(err) => errors.push((_index, err)),
+                                Err(err) => errors.push((index, err)),
                             }
                         }
                         errors.sort_by_key(|(index, _)| std::cmp::Reverse(*index));
@@ -1364,6 +1640,12 @@ fn start_android_session(
                                 active_index = 0;
                             }
                             sync_transport_snapshot(&worker_snapshot, &transports, active_index);
+                            publish_path_stats(
+                                &worker_snapshot,
+                                &transports,
+                                &path_index_slots(&path_index_map, transports.len()),
+                                active_index,
+                            );
                             if was_active {
                                 alog_warn!("Worker: failover from recv error on transport[{}] to transport[{}]", index, active_index);
                             }
@@ -1506,6 +1788,12 @@ fn start_android_session(
                         }
                         if retired_any {
                             sync_transport_snapshot(&worker_snapshot, &transports, active_index);
+                            publish_path_stats(
+                                &worker_snapshot,
+                                &transports,
+                                &path_index_slots(&path_index_map, transports.len()),
+                                active_index,
+                            );
                         }
                     }
                 }

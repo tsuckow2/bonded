@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="bonded_widget_description">Bonded VPN status and one-tap connect for the selected server</string>
+    <string name="bonded_tile_label">Bonded VPN</string>
+</resources>

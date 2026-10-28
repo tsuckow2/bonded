@@ -584,6 +584,40 @@ class MainActivity : FlutterActivity() {
                         "getVpnSessionStatus" -> {
                             result.success(BondedVpnService.getSessionSnapshot())
                         }
+                        "getAppSettings" -> {
+                            result.success(
+                                    mapOf<String, Any?>(
+                                            "autoConnectOnOpen" to
+                                                    AppSettingsStore.autoConnectOnOpen(
+                                                            this@MainActivity
+                                                    ),
+                                            "autoConnectOnBoot" to
+                                                    AppSettingsStore.autoConnectOnBoot(
+                                                            this@MainActivity
+                                                    ),
+                                            "selectedServerId" to
+                                                    AppSettingsStore.selectedServerId(
+                                                            this@MainActivity
+                                                    ),
+                                    )
+                            )
+                        }
+                        "updateAppSettings" -> {
+                            val args = call.arguments as? Map<*, *>
+                            (args?.get("autoConnectOnOpen") as? Boolean)?.let {
+                                AppSettingsStore.setAutoConnectOnOpen(this@MainActivity, it)
+                            }
+                            (args?.get("autoConnectOnBoot") as? Boolean)?.let {
+                                AppSettingsStore.setAutoConnectOnBoot(this@MainActivity, it)
+                            }
+                            if (args?.containsKey("selectedServerId") == true) {
+                                AppSettingsStore.setSelectedServerId(
+                                        this@MainActivity,
+                                        args["selectedServerId"] as? String,
+                                )
+                            }
+                            result.success(true)
+                        }
                         "startVpnService" -> {
                             val args = call.arguments as? Map<*, *>
                             val deviceId = args?.get("deviceId") as? String

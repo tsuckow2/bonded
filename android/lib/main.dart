@@ -5,7 +5,8 @@ import 'package:flutter/material.dart';
 import 'screens/home_screen.dart';
 import 'screens/qr_scanner_screen.dart';
 import 'screens/pairing_confirm_screen.dart';
-import 'screens/dashboard_screen.dart';
+import 'screens/details_screen.dart';
+import 'screens/diagnostics_screen.dart';
 import 'screens/server_config_screen.dart';
 import 'screens/settings_screen.dart';
 import 'screens/network_tests_screen.dart';
@@ -100,6 +101,7 @@ class _BondedAppState extends State<BondedApp> {
       routes: {
         '/home': (context) => const HomeScreen(),
         '/qr-scanner': (context) => const QRScannerScreen(),
+        '/diagnostics': (context) => const DiagnosticsScreen(),
         '/settings': (context) => const SettingsScreen(),
         '/network-tests': (context) => const NetworkTestsScreen(),
         '/stress-tests': (context) => const StressTestScreen(),
@@ -114,11 +116,11 @@ class _BondedAppState extends State<BondedApp> {
             );
           }
         }
-        if (settings.name == '/dashboard') {
+        if (settings.name == '/details') {
           final args = settings.arguments as Map<String, dynamic>?;
           final deviceId = args?['deviceId'] as String? ?? '';
           return MaterialPageRoute(
-            builder: (context) => DashboardScreen(deviceId: deviceId),
+            builder: (context) => DetailsScreen(deviceId: deviceId),
           );
         }
         if (settings.name == '/server-config') {

@@ -69,7 +69,14 @@ pub enum RedialOutcome {
     },
     /// The session is unrecoverable in place; the worker must tear it
     /// down so the platform layer restarts it.
-    SessionDead { reason: String },
+    SessionDead {
+        reason: String,
+        /// The path whose dial produced the fatal outcome, when the
+        /// outcome came from dialing a specific path (used to attribute
+        /// a server-identity failure to the connection that presented
+        /// the bad credentials).
+        path_index: Option<usize>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -383,8 +390,10 @@ pub fn spawn_path_supervisor(
                                 ));
                             }
                             AttemptResult::SessionDead(reason) => {
-                                let _ = outcome_tx
-                                    .send(RedialOutcome::SessionDead { reason });
+                                let _ = outcome_tx.send(RedialOutcome::SessionDead {
+                                    reason,
+                                    path_index: Some(path),
+                                });
                                 return;
                             }
                         }
