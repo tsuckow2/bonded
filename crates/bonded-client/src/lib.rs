@@ -1343,16 +1343,15 @@ async fn establish_wireguard_session(config: &ClientConfig) -> anyhow::Result<Wi
     .await?;
     let peer_public_key = decode_wireguard_public_key(&bootstrap.server_public_key)?;
 
-    let server_addr: std::net::SocketAddr = tokio::net::lookup_host(&bootstrap.endpoint)
-        .await
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "failed to resolve WireGuard server {}: {e}",
-                bootstrap.endpoint
-            )
-        })?
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("no addresses resolved for {}", bootstrap.endpoint))?;
+    let server_addr: std::net::SocketAddr =
+        resolve_wireguard_endpoint(config, &bootstrap.endpoint, None)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to resolve WireGuard server {}: {e}",
+                    bootstrap.endpoint
+                )
+            })?;
 
     let transport = WireGuardTransport::new(
         local_keypair,
@@ -1385,7 +1384,8 @@ async fn establish_wireguard_session_with_bind(
     )
     .await?;
     let peer_public_key = decode_wireguard_public_key(&bootstrap.server_public_key)?;
-    let server_addr = resolve_server_address(&bootstrap.endpoint, Some(bind_ip)).await?;
+    let server_addr =
+        resolve_wireguard_endpoint(config, &bootstrap.endpoint, Some(bind_ip)).await?;
     let bind_addr = SocketAddr::new(bind_ip, 0).to_string();
 
     let transport = WireGuardTransport::new(
@@ -2318,6 +2318,33 @@ async fn resolve_server_address(
     }
 
     Ok(addresses[0])
+}
+
+/// Resolve a WireGuard endpoint, preferring the pre-resolved server IP
+/// when the config carries one. Same DNS-bootstrap-deadlock reason as
+/// the QUIC dial fix: after the VPN TUN comes up, Android routes DNS
+/// through the tunnel, so resolving the endpoint hostname here stalls
+/// path establishment. Only the endpoint's host is replaced — its port
+/// (the WireGuard port, e.g. 51820) is kept, since the resolved address
+/// on the record names the TLS bootstrap port (443).
+async fn resolve_wireguard_endpoint(
+    config: &ClientConfig,
+    endpoint: &str,
+    bind_ip: Option<IpAddr>,
+) -> anyhow::Result<SocketAddr> {
+    if !config.client.server_resolved_address.trim().is_empty() {
+        let resolved = config.client.server_resolved_address.trim();
+        let resolved_ip: Option<IpAddr> = resolved
+            .parse::<SocketAddr>()
+            .ok()
+            .map(|addr| addr.ip())
+            .or_else(|| resolved.parse::<IpAddr>().ok());
+        if let (Some(ip), Ok((_, port))) = (resolved_ip, split_host_port(endpoint)) {
+            return Ok(SocketAddr::new(ip, port));
+        }
+        // Unparseable override or endpoint: fall through to DNS below.
+    }
+    resolve_server_address(endpoint, bind_ip).await
 }
 
 async fn perform_auth_handshake(
