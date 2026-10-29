@@ -703,6 +703,7 @@ class _StatTile extends StatelessWidget {
 }
 
 class _PathRow extends StatelessWidget {
+  static const _channel = MethodChannel('bonded/native');
   final SessionStatus status;
   final PathStat path;
   const _PathRow({required this.status, required this.path});
@@ -727,7 +728,14 @@ class _PathRow extends StatelessWidget {
     }
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 6),
-      child: Row(
+      child: InkWell(
+        // Long-press is the path debug menu (pause/resume, reset).
+        // Relay transports have no supervisor path index, so they
+        // get no menu.
+        onLongPress: path.isDirect
+            ? () => _showPathMenu(context, networkLabel)
+            : null,
+        child: Row(
         crossAxisAlignment: CrossAxisAlignment.center,
         children: [
           Icon(
@@ -771,9 +779,78 @@ class _PathRow extends StatelessWidget {
               visualDensity: VisualDensity.compact,
               padding: EdgeInsets.zero,
             ),
+          if (path.paused)
+            const Chip(
+              label: Text('Paused', style: TextStyle(fontSize: 11)),
+              visualDensity: VisualDensity.compact,
+              padding: EdgeInsets.zero,
+            ),
         ],
+        ),
       ),
     );
+  }
+
+  /// Debug menu for one path: pause/resume (stays connected, treated
+  /// as a bad connection) or reset (tear down and re-dial just this
+  /// path). Reached by long-pressing the path row.
+  Future<void> _showPathMenu(BuildContext context, String networkLabel) async {
+    final pathIndex = path.pathIndex;
+    if (pathIndex == null) return;
+    final action = await showModalBottomSheet<String>(
+      context: context,
+      builder: (context) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              title: Text('$networkLabel (path $pathIndex)'),
+              subtitle: const Text('Debug path controls'),
+            ),
+            ListTile(
+              leading: Icon(path.paused ? Icons.play_arrow : Icons.pause),
+              title: Text(path.paused ? 'Resume path' : 'Pause path'),
+              subtitle: Text(
+                path.paused
+                    ? 'Return the path to normal flow assignment'
+                    : 'Stay connected, but treat as a bad connection',
+              ),
+              onTap: () => Navigator.pop(context, 'pause'),
+            ),
+            ListTile(
+              leading: const Icon(Icons.refresh),
+              title: const Text('Reset path'),
+              subtitle: const Text('Tear down and re-dial this path only'),
+              onTap: () => Navigator.pop(context, 'reset'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (action == null || !context.mounted) return;
+    final bool ok;
+    switch (action) {
+      case 'pause':
+        ok = await _channel.invokeMethod<bool>('pausePath', {
+              'pathIndex': pathIndex,
+              'paused': !path.paused,
+            }) ??
+            false;
+      case 'reset':
+        ok = await _channel.invokeMethod<bool>('resetPath', {
+              'pathIndex': pathIndex,
+            }) ??
+            false;
+      default:
+        return;
+    }
+    if (!ok && context.mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Path action failed (no session running?)'),
+        ),
+      );
+    }
   }
 
   static String _bytes(int bytes) {

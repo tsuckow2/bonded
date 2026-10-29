@@ -6,6 +6,7 @@ class PathStat {
   final int? pathIndex;
   final String kind;
   final bool active;
+  final bool paused;
   final int outboundBytes;
   final int inboundBytes;
   final int lastRttMs;
@@ -19,6 +20,7 @@ class PathStat {
     required this.pathIndex,
     required this.kind,
     required this.active,
+    this.paused = false,
     required this.outboundBytes,
     required this.inboundBytes,
     required this.lastRttMs,
@@ -30,6 +32,7 @@ class PathStat {
       pathIndex: (map['pathIndex'] as num?)?.toInt(),
       kind: map['kind'] as String? ?? 'Unknown',
       active: map['active'] == true,
+      paused: map['paused'] == true,
       outboundBytes: (map['outboundBytes'] as num?)?.toInt() ?? 0,
       inboundBytes: (map['inboundBytes'] as num?)?.toInt() ?? 0,
       lastRttMs: (map['lastRttMs'] as num?)?.toInt() ?? 0,

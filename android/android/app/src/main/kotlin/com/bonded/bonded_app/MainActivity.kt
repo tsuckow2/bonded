@@ -584,6 +584,25 @@ class MainActivity : FlutterActivity() {
                         "getVpnSessionStatus" -> {
                             result.success(BondedVpnService.getSessionSnapshot())
                         }
+                        "pausePath" -> {
+                            val args = call.arguments as? Map<*, *>
+                            val pathIndex = (args?.get("pathIndex") as? Number)?.toInt()
+                            val paused = args?.get("paused") as? Boolean
+                            if (pathIndex == null || paused == null) {
+                                result.error("bad_args", "pathIndex and paused are required", null)
+                            } else {
+                                result.success(BondedVpnService.pausePath(pathIndex, paused))
+                            }
+                        }
+                        "resetPath" -> {
+                            val args = call.arguments as? Map<*, *>
+                            val pathIndex = (args?.get("pathIndex") as? Number)?.toInt()
+                            if (pathIndex == null) {
+                                result.error("bad_args", "pathIndex is required", null)
+                            } else {
+                                result.success(BondedVpnService.resetPath(pathIndex))
+                            }
+                        }
                         "getAppSettings" -> {
                             result.success(
                                     mapOf<String, Any?>(
