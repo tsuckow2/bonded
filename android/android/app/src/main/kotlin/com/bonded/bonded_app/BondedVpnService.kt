@@ -305,7 +305,7 @@ class BondedVpnService : VpnService() {
         return NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
                 .setContentTitle("Bonded VPN")
                 .setContentText("VPN is running in the background")
-                .setSmallIcon(R.mipmap.ic_launcher)
+                .setSmallIcon(R.drawable.ic_notification)
                 .setOngoing(true)
                 .build()
     }

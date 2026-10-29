@@ -1,0 +1,40 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="512"
+    android:viewportHeight="512">
+    <!-- Fat-trunk Converge mark, white silhouette for the VPN foreground notification.
+         Notification small icons render from alpha only, so all geometry is white. -->
+    <path
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="36"
+        android:strokeLineCap="round"
+        android:pathData="M118,108 C230,108 216,256 296,256" />
+    <path
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="36"
+        android:strokeLineCap="round"
+        android:pathData="M118,256 L296,256" />
+    <path
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="36"
+        android:strokeLineCap="round"
+        android:pathData="M118,404 C230,404 216,256 296,256" />
+    <path
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="60"
+        android:strokeLineCap="round"
+        android:pathData="M296,256 L378,256" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M58,108 a34,34 0 1,0 68,0 a34,34 0 1,0 -68,0" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M58,256 a34,34 0 1,0 68,0 a34,34 0 1,0 -68,0" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M58,404 a34,34 0 1,0 68,0 a34,34 0 1,0 -68,0" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M352,256 a60,60 0 1,0 120,0 a60,60 0 1,0 -120,0" />
+</vector>
