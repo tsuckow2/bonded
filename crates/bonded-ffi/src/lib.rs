@@ -389,6 +389,7 @@ struct AndroidSessionHandle {
     outbound_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     inbound_queue: Arc<Mutex<VecDeque<Vec<u8>>>>,
     snapshot: Arc<Mutex<AndroidSessionSnapshot>>,
+    path_control_tx: tokio::sync::mpsc::UnboundedSender<PathControl>,
     cancel_token: CancellationToken,
     worker: Option<JoinHandle<()>>,
 }
@@ -446,6 +447,9 @@ struct AndroidPathStat {
     path_index: Option<usize>,
     kind: String,
     active: bool,
+    /// Debug-paused via long-press (see [`PathControl`]): still
+    /// connected, but outbound assignment treats it as last resort.
+    paused: bool,
     outbound_bytes: u64,
     inbound_bytes: u64,
     /// Most recent heartbeat RTT in ms (0 = none measured yet). All
@@ -618,10 +622,11 @@ fn snapshot_json(snapshot: &AndroidSessionSnapshot) -> String {
                 .map(|addr| format!("\"{}\"", escape_json(addr)))
                 .unwrap_or_else(|| "null".to_owned());
             format!(
-                "{{\"pathIndex\":{},\"kind\":\"{}\",\"active\":{},\"outboundBytes\":{},\"inboundBytes\":{},\"lastRttMs\":{},\"serverSeenAddress\":{}}}",
+                "{{\"pathIndex\":{},\"kind\":\"{}\",\"active\":{},\"paused\":{},\"outboundBytes\":{},\"inboundBytes\":{},\"lastRttMs\":{},\"serverSeenAddress\":{}}}",
                 path_index,
                 escape_json(&stat.kind),
                 stat.active,
+                stat.paused,
                 stat.outbound_bytes,
                 stat.inbound_bytes,
                 stat.last_rtt_ms,
@@ -685,6 +690,51 @@ fn direct_transport_indices(transports: &[ClientTransport]) -> Vec<usize> {
         })
         .map(|(index, _)| index)
         .collect()
+}
+
+/// Debug controls for one direct path, sent from the app (long-press on
+/// a path row) to the worker loop.
+#[cfg(any(target_os = "android", test))]
+enum PathControl {
+    /// Pause (`paused = true`) or resume a path. A paused path stays
+    /// in the transport set — heartbeats, session binding and inbound
+    /// traffic are untouched — but outbound flow assignment treats it
+    /// as a last resort (see [`order_candidates_for_send`]), so it
+    /// carries ~no traffic while a healthy path exists.
+    Pause { path_index: usize, paused: bool },
+    /// Tear a path's transport down and let the path supervisor
+    /// re-dial it in place (multi-path sessions). On a single-path
+    /// session there is no supervisor, so emptying the transport set
+    /// errors the session and the platform layer restarts it.
+    Reset { path_index: usize },
+}
+
+/// Order direct-transport candidates for one outbound packet's
+/// try-list. Healthy paths keep today's hash rotation; paused paths
+/// move to the end, tried only after every healthy path failed to
+/// send. When every candidate is paused the rotation covers all of
+/// them, so pausing everything degrades to today's behavior instead
+/// of blackholing the session.
+#[cfg(any(target_os = "android", test))]
+fn order_candidates_for_send(
+    candidates: Vec<usize>,
+    is_paused: impl Fn(usize) -> bool,
+    flow_hash: u64,
+) -> Vec<usize> {
+    let (mut healthy, mut paused): (Vec<usize>, Vec<usize>) =
+        candidates.into_iter().partition(|&index| !is_paused(index));
+    if healthy.is_empty() {
+        if !paused.is_empty() {
+            let rot = (flow_hash % paused.len() as u64) as usize;
+            paused.rotate_left(rot);
+        }
+        paused
+    } else {
+        let rot = (flow_hash % healthy.len() as u64) as usize;
+        healthy.rotate_left(rot);
+        healthy.extend(paused);
+        healthy
+    }
 }
 
 /// Poll every transport's `recv()` concurrently and return the frames
@@ -836,6 +886,7 @@ fn publish_path_stats(
                     path_index,
                     kind: client_transport_kind(transport).to_owned(),
                     active: index == active_index,
+                    paused: prior.map(|stat| stat.paused).unwrap_or(false),
                     outbound_bytes: prior.map(|stat| stat.outbound_bytes).unwrap_or(0),
                     inbound_bytes: prior.map(|stat| stat.inbound_bytes).unwrap_or(0),
                     last_rtt_ms: prior.map(|stat| stat.last_rtt_ms).unwrap_or(0),
@@ -985,6 +1036,8 @@ fn start_android_session(
         })));
     }
 
+    let (path_control_tx, mut path_control_rx) =
+        tokio::sync::mpsc::unbounded_channel::<PathControl>();
     let worker = thread::spawn(move || {
         let runtime = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1290,6 +1343,12 @@ fn start_android_session(
             for (vec_index, path_index) in candidate_paths.iter().enumerate() {
                 path_index_map.insert(vec_index, *path_index);
             }
+            // Debug-paused direct paths, by durable path index (not
+            // vec index, which shifts on insert/remove). Paused paths
+            // stay connected; only outbound assignment deprioritizes
+            // them (see order_candidates_for_send).
+            let mut paused_paths: std::collections::HashSet<usize> =
+                std::collections::HashSet::new();
             let (path_lost_tx, path_lost_rx) =
                 tokio::sync::mpsc::unbounded_channel::<usize>();
             let (redial_outcome_tx, mut redial_outcome_rx) =
@@ -1339,6 +1398,96 @@ fn start_android_session(
                         alog_info!("Worker: cancellation requested");
                         close_client_transports(&mut transports).await;
                         break;
+                    }
+                    control = path_control_rx.recv() => {
+                        match control {
+                            Some(PathControl::Pause { path_index, paused }) => {
+                                if paused {
+                                    paused_paths.insert(path_index);
+                                } else {
+                                    paused_paths.remove(&path_index);
+                                }
+                                update_snapshot(
+                                    &worker_snapshot,
+                                    |session_snapshot| {
+                                        for stat in session_snapshot
+                                            .path_stats
+                                            .iter_mut()
+                                        {
+                                            if stat.path_index == Some(path_index) {
+                                                stat.paused = paused;
+                                            }
+                                        }
+                                    },
+                                );
+                                alog_info!(
+                                    "Worker: path {} {}",
+                                    path_index,
+                                    if paused { "paused" } else { "resumed" }
+                                );
+                            }
+                            Some(PathControl::Reset { path_index }) => {
+                                if let Some(vec_index) =
+                                    path_index_map.vec_index_of(path_index)
+                                {
+                                    paused_paths.remove(&path_index);
+                                    let mut transport =
+                                        transports.remove(vec_index);
+                                    let _ = transport.close().await;
+                                    path_index_map.on_remove(vec_index);
+                                    if vec_index < active_index {
+                                        active_index -= 1;
+                                    } else if vec_index == active_index
+                                        && active_index >= transports.len()
+                                    {
+                                        active_index = 0;
+                                    }
+                                    sync_transport_snapshot(
+                                        &worker_snapshot,
+                                        &transports,
+                                        active_index,
+                                    );
+                                    publish_path_stats(
+                                        &worker_snapshot,
+                                        &transports,
+                                        &path_index_slots(
+                                            &path_index_map,
+                                            transports.len(),
+                                        ),
+                                        active_index,
+                                    );
+                                    alog_info!(
+                                        "Worker: path {} reset by debug control",
+                                        path_index
+                                    );
+                                    if transports.is_empty() {
+                                        // No supervisor on a single-path
+                                        // session: nothing will re-dial,
+                                        // so fail the session and let the
+                                        // platform layer restart it.
+                                        update_snapshot(
+                                            &worker_snapshot,
+                                            |session_snapshot| {
+                                                session_snapshot.state =
+                                                    "error".to_owned();
+                                                session_snapshot.last_error =
+                                                    Some(format!(
+                                                        "path {path_index} reset with no other transport; restarting session"
+                                                    ));
+                                            },
+                                        );
+                                        break;
+                                    }
+                                    let _ = path_lost_tx.send(path_index);
+                                } else {
+                                    alog_warn!(
+                                        "Worker: reset for unknown path {}",
+                                        path_index
+                                    );
+                                }
+                            }
+                            None => {}
+                        }
                     }
                     peer_transport = peer_transport_rx.recv() => {
                         if let Some(transport) = peer_transport {
@@ -1439,19 +1588,23 @@ fn start_android_session(
                                 // exactly the pre-multipath behavior.
                                 let flow = bonded_core::flow::flow_hash(&packet);
                                 let frame = session.create_outbound_frame(Bytes::from(packet), 0);
-                                let mut candidates =
-                                    direct_transport_indices(&transports);
+                                // Paused paths go last in the try-list:
+                                // they stay connected, but a healthy path
+                                // is always tried first.
+                                let mut candidates = order_candidates_for_send(
+                                    direct_transport_indices(&transports),
+                                    |vec_index| {
+                                        path_index_map
+                                            .path_of(vec_index)
+                                            .map(|path| paused_paths.contains(&path))
+                                            .unwrap_or(false)
+                                    },
+                                    flow,
+                                );
                                 if candidates.is_empty() {
                                     candidates.push(active_index);
-                                } else {
-                                    let pick = bonded_core::flow::pick_index(
-                                        flow,
-                                        candidates.len(),
-                                    );
-                                    candidates.rotate_left(pick);
-                                    if !candidates.contains(&active_index) {
-                                        candidates.push(active_index);
-                                    }
+                                } else if !candidates.contains(&active_index) {
+                                    candidates.push(active_index);
                                 }
                                 let mut send_queue: std::collections::VecDeque<usize> =
                                     candidates.into();
@@ -1870,6 +2023,7 @@ fn start_android_session(
         outbound_tx,
         inbound_queue,
         snapshot,
+        path_control_tx,
         cancel_token,
         worker: Some(worker),
     };
@@ -2253,6 +2407,54 @@ pub extern "system" fn Java_com_bonded_bonded_1app_BondedVpnService_nativeGetSes
     }
 }
 
+/// Debug path controls (long-press on a path row): pause/resume and
+/// reset one direct path. Returns false when no session is running.
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_bonded_bonded_1app_BondedVpnService_nativePausePath(
+    _env: jni::JNIEnv,
+    _obj: jni::objects::JObject,
+    path_index: jni::sys::jint,
+    paused: jni::sys::jboolean,
+) -> jni::sys::jboolean {
+    android_session_slot()
+        .lock()
+        .expect("android session slot lock poisoned")
+        .as_ref()
+        .map(|handle| {
+            handle
+                .path_control_tx
+                .send(PathControl::Pause {
+                    path_index: path_index as usize,
+                    paused: paused != 0,
+                })
+                .is_ok()
+        })
+        .unwrap_or(false) as jni::sys::jboolean
+}
+
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_bonded_bonded_1app_BondedVpnService_nativeResetPath(
+    _env: jni::JNIEnv,
+    _obj: jni::objects::JObject,
+    path_index: jni::sys::jint,
+) -> jni::sys::jboolean {
+    android_session_slot()
+        .lock()
+        .expect("android session slot lock poisoned")
+        .as_ref()
+        .map(|handle| {
+            handle
+                .path_control_tx
+                .send(PathControl::Reset {
+                    path_index: path_index as usize,
+                })
+                .is_ok()
+        })
+        .unwrap_or(false) as jni::sys::jboolean
+}
+
 /// In-app QUIC handshake probe (diagnostics): dials one production-shaped
 /// QUIC session connection using the same protect / network-bind
 /// callbacks as a live session, from a dedicated thread + runtime (the
@@ -2359,6 +2561,44 @@ pub unsafe extern "C" fn bonded_ffi_decode_frame_metadata(
 
 #[cfg(test)]
 mod tests {
+    use super::order_candidates_for_send;
+
+    #[test]
+    fn paused_paths_go_last_regardless_of_hash_pick() {
+        // Candidates [0, 1, 2] with 2 paused: no hash pick may put 2
+        // first; healthy rotation is preserved among [0, 1].
+        for flow in 0..64u64 {
+            let ordered = order_candidates_for_send(vec![0, 1, 2], |i| i == 2, flow);
+            let first = flow as usize % 2;
+            assert_eq!(
+                ordered,
+                vec![first, 1 - first, 2],
+                "paused path must be last for flow {flow}"
+            );
+        }
+    }
+
+    #[test]
+    fn all_paused_keeps_todays_rotation() {
+        for flow in 0..16u64 {
+            let ordered = order_candidates_for_send(vec![0, 1, 2], |_| true, flow);
+            let mut expected = vec![0, 1, 2];
+            expected.rotate_left(flow as usize % 3);
+            assert_eq!(ordered, expected, "all-paused must rotate like today");
+        }
+    }
+
+    #[test]
+    fn no_paused_is_identity_rotation() {
+        for flow in 0..16u64 {
+            let ordered = order_candidates_for_send(vec![0, 1], |_| false, flow);
+            let mut expected = vec![0, 1];
+            expected.rotate_left(flow as usize % 2);
+            assert_eq!(ordered, expected);
+        }
+        assert!(order_candidates_for_send(vec![], |_| false, 7).is_empty());
+    }
+
     use super::{
         android_client_config, bonded_ffi_api_version, complete_pairing_session_binding,
         decode_frame_metadata, establish_naive_tcp_session, get_session_snapshot_json,

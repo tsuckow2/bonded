@@ -204,6 +204,14 @@ impl PathIndexMap {
         self.by_vec_index.get(&vec_index).copied()
     }
 
+    /// Vector index currently holding a path, if present.
+    pub fn vec_index_of(&self, path_index: usize) -> Option<usize> {
+        self.by_vec_index
+            .iter()
+            .find(|(_, &path)| path == path_index)
+            .map(|(&index, _)| index)
+    }
+
     pub fn contains_path(&self, path_index: usize) -> bool {
         self.by_vec_index.values().any(|&p| p == path_index)
     }

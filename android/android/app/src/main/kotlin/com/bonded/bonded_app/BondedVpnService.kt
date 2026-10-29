@@ -55,6 +55,9 @@ data class SessionPathStat(
         val pathIndex: Int?,
         val kind: String,
         val active: Boolean,
+        /** Debug-paused via long-press: still connected, but outbound
+         * assignment treats the path as last resort. */
+        val paused: Boolean = false,
         val outboundBytes: Long,
         val inboundBytes: Long,
         val lastRttMs: Long,
@@ -560,6 +563,7 @@ class BondedVpnService : VpnService() {
                                     else item.optInt("pathIndex", -1).takeIf { it >= 0 },
                             kind = item.optString("kind", "Unknown"),
                             active = item.optBoolean("active", false),
+                            paused = item.optBoolean("paused", false),
                             outboundBytes = item.optLong("outboundBytes", 0),
                             inboundBytes = item.optLong("inboundBytes", 0),
                             lastRttMs = item.optLong("lastRttMs", 0),
@@ -781,6 +785,10 @@ class BondedVpnService : VpnService() {
     ): Boolean
 
     private external fun nativeStopSession()
+
+    private external fun nativePausePath(pathIndex: Int, paused: Boolean): Boolean
+
+    private external fun nativeResetPath(pathIndex: Int): Boolean
 
     // Resolve a "host:port" address to "ip:port" using system DNS, before the VPN is
     // active. Returns the original string unchanged on any error or if already an IP.
@@ -1159,6 +1167,26 @@ class BondedVpnService : VpnService() {
 
         fun isRunning(): Boolean = running
 
+        /** Debug path control (long-press on a path row). False when
+         * no service instance or no session is running. */
+        fun pausePath(pathIndex: Int, paused: Boolean): Boolean {
+            val service = activeInstance ?: return false
+            return try {
+                service.nativePausePath(pathIndex, paused)
+            } catch (_: Exception) {
+                false
+            }
+        }
+
+        fun resetPath(pathIndex: Int): Boolean {
+            val service = activeInstance ?: return false
+            return try {
+                service.nativeResetPath(pathIndex)
+            } catch (_: Exception) {
+                false
+            }
+        }
+
         fun isBackgroundRunning(): Boolean = running && backgroundRunning
 
         fun protectDatagramSocketForDebug(socket: DatagramSocket): Boolean {
@@ -1205,6 +1233,7 @@ class BondedVpnService : VpnService() {
                                         "pathIndex" to path.pathIndex,
                                         "kind" to path.kind,
                                         "active" to path.active,
+                                        "paused" to path.paused,
                                         "outboundBytes" to path.outboundBytes,
                                         "inboundBytes" to path.inboundBytes,
                                         "lastRttMs" to path.lastRttMs,
