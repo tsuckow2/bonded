@@ -513,14 +513,31 @@ pub async fn run_wireguard_server(
         let (read, source) = socket.recv_from(&mut datagram_buf).await?;
         let datagram = &datagram_buf[..read];
 
-        let matched_peer = if let Some(device_public_key) = peer_by_source.get(&source) {
-            runtimes.get(device_public_key).cloned()
-        } else {
-            None
-        };
-
-        let peer = if let Some(existing) = matched_peer {
-            existing
+        // NOTE: each datagram must pass through boringtun's decapsulate
+        // exactly once. Data packets carry a nonce that replay protection
+        // rejects on a second pass, so the old shape — probe every
+        // registered peer with try_accept_datagram (consuming the
+        // datagram, discarding any decoded frames) and then process the
+        // same datagram a second time — ate every session data frame:
+        // the probe discarded the discovery ping and the reprocessing
+        // rejected it, so session discovery over WireGuard could never
+        // complete. The probe's frames are therefore the ones delivered
+        // below; there is no second pass.
+        let (peer, frames) = if let Some(device_public_key) =
+            peer_by_source.get(&source).cloned()
+        {
+            let Some(peer) = runtimes.get(&device_public_key).cloned() else {
+                peer_by_source.remove(&source);
+                continue;
+            };
+            match peer.runtime.try_accept_datagram(source, datagram).await? {
+                Some(frames) => (peer, frames),
+                None => {
+                    peer_by_source.remove(&source);
+                    debug!(source = %source, session_id = peer.session_id, "wireguard datagram rejected by cached peer runtime");
+                    continue;
+                }
+            }
         } else {
             let mut found = None;
             for registered_peer in peers.all_peers() {
@@ -535,30 +552,22 @@ pub async fn run_wireguard_server(
                     tunnel_pcap.clone(),
                 )
                 .await?;
-                if runtime
+                if let Some(frames) = runtime
                     .runtime
                     .try_accept_datagram(source, datagram)
                     .await?
-                    .is_some()
                 {
                     peer_by_source.insert(source, registered_peer.device_public_key.clone());
-                    found = Some(runtime);
+                    found = Some((runtime, frames));
                     break;
                 }
             }
 
-            let Some(runtime) = found else {
+            let Some(found) = found else {
                 debug!(source = %source, bytes = read, "wireguard datagram did not match any provisioned peer");
                 continue;
             };
-
-            runtime
-        };
-
-        let Some(frames) = peer.runtime.try_accept_datagram(source, datagram).await? else {
-            peer_by_source.remove(&source);
-            debug!(source = %source, session_id = peer.session_id, "wireguard datagram rejected by cached peer runtime");
-            continue;
+            found
         };
 
         peer_by_source.insert(source, peer.public_key.clone());

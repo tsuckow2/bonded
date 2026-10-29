@@ -1128,6 +1128,7 @@ async fn establish_quic_session(config: &ClientConfig) -> anyhow::Result<QuicTra
         rustls_config.clone(),
         b"bonded-quic",
         config.socket_protect.as_ref(),
+        dial_override,
     )
     .await
     {
@@ -1145,6 +1146,7 @@ async fn establish_quic_session(config: &ClientConfig) -> anyhow::Result<QuicTra
                 (*cert_proof::make_pinned_tls_config(&refreshed)).clone(),
                 b"bonded-quic",
                 config.socket_protect.as_ref(),
+                dial_override,
             )
             .await
             .with_context(|| {
@@ -1224,6 +1226,7 @@ async fn establish_quic_session_with_bind(
         config.socket_protect.as_ref(),
         config.socket_network_bind.as_ref(),
         Some(bind_ip),
+        dial_override,
     )
     .await
     {
@@ -1243,6 +1246,7 @@ async fn establish_quic_session_with_bind(
                 config.socket_protect.as_ref(),
                 config.socket_network_bind.as_ref(),
                 Some(bind_ip),
+                dial_override,
             )
             .await
             .with_context(|| {
@@ -1339,16 +1343,15 @@ async fn establish_wireguard_session(config: &ClientConfig) -> anyhow::Result<Wi
     .await?;
     let peer_public_key = decode_wireguard_public_key(&bootstrap.server_public_key)?;
 
-    let server_addr: std::net::SocketAddr = tokio::net::lookup_host(&bootstrap.endpoint)
-        .await
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "failed to resolve WireGuard server {}: {e}",
-                bootstrap.endpoint
-            )
-        })?
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("no addresses resolved for {}", bootstrap.endpoint))?;
+    let server_addr: std::net::SocketAddr =
+        resolve_wireguard_endpoint(config, &bootstrap.endpoint, None)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to resolve WireGuard server {}: {e}",
+                    bootstrap.endpoint
+                )
+            })?;
 
     let transport = WireGuardTransport::new(
         local_keypair,
@@ -1381,7 +1384,8 @@ async fn establish_wireguard_session_with_bind(
     )
     .await?;
     let peer_public_key = decode_wireguard_public_key(&bootstrap.server_public_key)?;
-    let server_addr = resolve_server_address(&bootstrap.endpoint, Some(bind_ip)).await?;
+    let server_addr =
+        resolve_wireguard_endpoint(config, &bootstrap.endpoint, Some(bind_ip)).await?;
     let bind_addr = SocketAddr::new(bind_ip, 0).to_string();
 
     let transport = WireGuardTransport::new(
@@ -1570,6 +1574,7 @@ async fn request_bootstrap_json_h3(
         rustls_config,
         b"h3",
         config.socket_protect.as_ref(),
+        dial_override,
     )
     .await
     {
@@ -1592,6 +1597,7 @@ async fn request_bootstrap_json_h3(
                 (*cert_proof::make_pinned_tls_config(&refreshed)).clone(),
                 b"h3",
                 config.socket_protect.as_ref(),
+                dial_override,
             )
             .await
             .with_context(|| {
@@ -1759,6 +1765,17 @@ fn prepare_bound_socket_for_connect(
     socket_protect: Option<&bonded_core::config::SocketProtectFn>,
     transport_name: &str,
 ) -> anyhow::Result<()> {
+    // Bench instrumentation (quic-probe-diag): log, at INFO so it
+    // reaches logcat, whether each dial's prepare step actually has
+    // the callbacks — the WAN-session dials never logged a bind call.
+    info!(
+        "prepare {} socket fd={} bind_address={} network_bind={} protect={}",
+        transport_name,
+        fd,
+        bind_address,
+        socket_network_bind.is_some(),
+        socket_protect.is_some()
+    );
     if let Some(bind_network) = socket_network_bind {
         debug!(
             "binding {} socket fd={} to Android network for bind_address={}",
@@ -1857,8 +1874,17 @@ pub(crate) async fn connect_quic_client(
     rustls_config: RustlsClientConfig,
     alpn: &[u8],
     socket_protect: Option<&bonded_core::config::SocketProtectFn>,
+    dial_target: Option<&str>,
 ) -> anyhow::Result<(quinn::Endpoint, quinn::Connection)> {
-    connect_quic_client_with_bind(host, port, rustls_config, alpn, socket_protect, None, None).await
+    connect_quic_client_with_bind(host, port, rustls_config, alpn, socket_protect, None, None, dial_target).await
+}
+
+async fn resolve_quic_host(host: &str, port: u16) -> anyhow::Result<SocketAddr> {
+    tokio::net::lookup_host(format!("{host}:{port}"))
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to resolve QUIC server {host}:{port}: {e}"))?
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("no addresses resolved for {host}:{port}"))
 }
 
 pub(crate) async fn connect_quic_client_with_bind(
@@ -1869,14 +1895,34 @@ pub(crate) async fn connect_quic_client_with_bind(
     socket_protect: Option<&bonded_core::config::SocketProtectFn>,
     socket_network_bind: Option<&bonded_core::config::SocketNetworkBindFn>,
     bind_ip: Option<IpAddr>,
+    // Pre-resolved dial target (server_resolved_address, "ip:port" or
+    // bare IP) when the caller has one. When present it is used
+    // directly instead of resolving `host` here: after the VPN TUN
+    // comes up, Android routes DNS through the tunnel, so resolving
+    // the hostname at dial time deadlocks session establishment (the
+    // tunnel cannot forward DNS before the session exists). `host`
+    // remains the TLS server name either way.
+    dial_target: Option<&str>,
 ) -> anyhow::Result<(quinn::Endpoint, quinn::Connection)> {
     let quic_client_config = build_quic_client_config(rustls_config, alpn)?;
-    let server_addr: SocketAddr = tokio::net::lookup_host(format!("{host}:{port}"))
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to resolve QUIC server {host}:{port}: {e}"))?
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("no addresses resolved for {host}:{port}"))?;
+    let server_addr: SocketAddr = match dial_target {
+        Some(target) => match target.parse::<SocketAddr>() {
+            Ok(addr) => addr,
+            Err(_) => match target.parse::<IpAddr>() {
+                Ok(ip) => SocketAddr::new(ip, port),
+                Err(_) => resolve_quic_host(host, port).await?,
+            },
+        },
+        None => resolve_quic_host(host, port).await?,
+    };
 
+    // Bench instrumentation (quic-probe-diag): record the exact dial
+    // target and bind choice, so a session dial can be compared with
+    // the standalone probe's dial (same host, same bind).
+    info!(
+        "QUIC dial host={} resolved={} bind_ip={:?}",
+        host, server_addr, bind_ip
+    );
     let mut endpoint = quinn::Endpoint::new(
         Default::default(),
         None,
@@ -1946,6 +1992,67 @@ fn build_quic_client_config(
     transport.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
     client_config.transport_config(Arc::new(transport));
     Ok(client_config)
+}
+
+/// Diagnostics: perform a single production-shaped QUIC session dial —
+/// the same socket creation, protect / network-bind callbacks, ALPN and
+/// transport config as `establish_quic_session` — and report the outcome
+/// as a one-line string, WITHOUT running the bonded auth handshake.
+/// Backs the in-app TEST_QUIC_PROBE diagnostic, which bisects QUIC
+/// establishment failures from inside a live app process (e.g. with a
+/// real session's TUN up). The TLS config is the bootstrap capture
+/// verifier: identity proof is out of scope for a delivery probe and
+/// the on-the-wire flight is identical either way.
+pub async fn probe_quic_handshake(
+    socket_protect: Option<&bonded_core::config::SocketProtectFn>,
+    socket_network_bind: Option<&bonded_core::config::SocketNetworkBindFn>,
+    bind_ip: Option<std::net::IpAddr>,
+    host: &str,
+    port: u16,
+    timeout: std::time::Duration,
+) -> Result<String, String> {
+    let captured = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let rustls_config = (*cert_proof::make_insecure_capture_tls_config(captured)).clone();
+    let start = std::time::Instant::now();
+    let dial = connect_quic_client_with_bind(
+        host,
+        port,
+        rustls_config,
+        b"bonded-quic",
+        socket_protect,
+        socket_network_bind,
+        bind_ip,
+        None,
+    );
+    let (endpoint, connection) = match tokio::time::timeout(timeout, dial).await {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(e)) => return Err(format!("dial failed: {e:#}")),
+        Err(_) => return Err(format!("TIMEOUT after {}ms", timeout.as_millis())),
+    };
+    let remote = connection.remote_address();
+    let ms = start.elapsed().as_millis();
+    // Post-handshake data-plane check: open a bidi stream and push a
+    // small payload (the server reads it as the start of an auth hello
+    // and simply waits/errors — that is fine for a delivery probe).
+    let stream_note = match tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        connection.open_bi(),
+    )
+    .await
+    {
+        Ok(Ok((mut send, _recv))) => match send.write_all(&[0u8; 64]).await {
+            Ok(()) => {
+                let _ = send.finish();
+                "stream=OK".to_string()
+            }
+            Err(e) => format!("stream-write-err={e}"),
+        },
+        Ok(Err(e)) => format!("stream-err={e}"),
+        Err(_) => "stream-timeout".to_string(),
+    };
+    connection.close(0u32.into(), b"probe-done");
+    endpoint.close(0u32.into(), b"probe-done");
+    Ok(format!("CONNECTED remote={remote} in {ms}ms {stream_note}"))
 }
 
 pub(crate) fn extract_quic_peer_certificate(
@@ -2211,6 +2318,33 @@ async fn resolve_server_address(
     }
 
     Ok(addresses[0])
+}
+
+/// Resolve a WireGuard endpoint, preferring the pre-resolved server IP
+/// when the config carries one. Same DNS-bootstrap-deadlock reason as
+/// the QUIC dial fix: after the VPN TUN comes up, Android routes DNS
+/// through the tunnel, so resolving the endpoint hostname here stalls
+/// path establishment. Only the endpoint's host is replaced — its port
+/// (the WireGuard port, e.g. 51820) is kept, since the resolved address
+/// on the record names the TLS bootstrap port (443).
+async fn resolve_wireguard_endpoint(
+    config: &ClientConfig,
+    endpoint: &str,
+    bind_ip: Option<IpAddr>,
+) -> anyhow::Result<SocketAddr> {
+    if !config.client.server_resolved_address.trim().is_empty() {
+        let resolved = config.client.server_resolved_address.trim();
+        let resolved_ip: Option<IpAddr> = resolved
+            .parse::<SocketAddr>()
+            .ok()
+            .map(|addr| addr.ip())
+            .or_else(|| resolved.parse::<IpAddr>().ok());
+        if let (Some(ip), Ok((_, port))) = (resolved_ip, split_host_port(endpoint)) {
+            return Ok(SocketAddr::new(ip, port));
+        }
+        // Unparseable override or endpoint: fall through to DNS below.
+    }
+    resolve_server_address(endpoint, bind_ip).await
 }
 
 async fn perform_auth_handshake(

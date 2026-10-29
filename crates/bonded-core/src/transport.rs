@@ -933,6 +933,17 @@ impl Transport for WireGuardTransport {
             }
         }
 
+        // Ensure a data-capable session exists BEFORE encapsulating. On a
+        // fresh transport, boringtun's encapsulate() queues the frame and
+        // returns only the handshake initiation as WriteToNetwork — treating
+        // that as "frame sent" drops the frame and never drives the
+        // handshake, so discovery waits forever for a PONG to a ping that
+        // was never transmitted. (The Err|Done branch below only covered
+        // the cases where encapsulate declines to return a packet.)
+        if self.tunn.time_since_last_handshake().is_none() {
+            self.establish_session().await?;
+        }
+
         let encoded = frame.encode();
         let ip_pkt = wrap_in_ipv4(&encoded);
 
