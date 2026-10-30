@@ -62,10 +62,14 @@ fn backoff_delay(failed_attempts: u32) -> Duration {
 /// What the supervisor hands back to the worker loop.
 pub enum RedialOutcome {
     /// The path was re-dialed and bound to the live session; insert
-    /// this transport as that path's standby.
+    /// this transport as that path's standby. `bind_address` is the
+    /// address the dial actually used, so the worker can discard a
+    /// re-dial that went stale while it was in flight (its path was
+    /// removed, or re-addressed, by a path-set change meanwhile).
     Bound {
         path_index: usize,
         transport: ClientTransport,
+        bind_address: Option<String>,
     },
     /// The session is unrecoverable in place; the worker must tear it
     /// down so the platform layer restarts it.
@@ -77,6 +81,15 @@ pub enum RedialOutcome {
         /// the bad credentials).
         path_index: Option<usize>,
     },
+}
+
+/// A path-set change for the supervisor: interfaces that appeared
+/// (dial them) and interfaces that vanished (stop dialing them).
+/// Addresses travel separately, through the shared address map the
+/// supervisor reads at dial time, so this carries indexes only.
+pub struct PathsUpdate {
+    pub added: Vec<usize>,
+    pub removed: Vec<usize>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -136,6 +149,48 @@ impl PathSupervisorState {
         if let Some(status) = self.paths.get_mut(&path) {
             *status = PathStatus::Present;
         }
+    }
+
+    /// Record that a path newly appeared (an interface came back).
+    /// Absent paths join as due immediately, and a path already
+    /// missing (backing off a failed dial) has its backoff reset to
+    /// due now: unlike a path missing since session start (which
+    /// just failed a dial and waits out [`INITIAL_MISSING_DELAY`]),
+    /// a newly appeared interface has never been dialed in this
+    /// state, so there is nothing to back off from. Present paths
+    /// are untouched (no disturbance to a healthy path).
+    pub fn note_added(&mut self, path: usize, now: Instant) {
+        match self.paths.get_mut(&path) {
+            Some(PathStatus::Missing {
+                failed_attempts,
+                next_due,
+            }) => {
+                *failed_attempts = 0;
+                *next_due = now;
+            }
+            Some(PathStatus::Present) => {}
+            None => {
+                self.paths.insert(
+                    path,
+                    PathStatus::Missing {
+                        failed_attempts: 0,
+                        next_due: now,
+                    },
+                );
+            }
+        }
+    }
+
+    /// Forget a path entirely (its interface is gone): no further
+    /// re-dials. A dial already in flight for it completes into the
+    /// worker's stale-dial discard, and a later failure notice for
+    /// it is a no-op.
+    pub fn note_removed(&mut self, path: usize) {
+        self.paths.remove(&path);
+    }
+
+    pub fn contains(&self, path: usize) -> bool {
+        self.paths.contains_key(&path)
     }
 
     /// Record a failed re-dial attempt; returns the delay until the
@@ -212,6 +267,12 @@ impl PathIndexMap {
             .map(|(&index, _)| index)
     }
 
+    /// Every direct path index currently mapped, in no particular
+    /// order (the durable identities of the live direct transports).
+    pub fn path_indexes(&self) -> Vec<usize> {
+        self.by_vec_index.values().copied().collect()
+    }
+
     pub fn contains_path(&self, path_index: usize) -> bool {
         self.by_vec_index.values().any(|&p| p == path_index)
     }
@@ -232,7 +293,10 @@ impl PathIndexMap {
 }
 
 enum AttemptResult {
-    Bound(ClientTransport),
+    Bound {
+        transport: ClientTransport,
+        bind_address: Option<String>,
+    },
     Failed(String),
     SessionDead(String),
 }
@@ -284,13 +348,25 @@ async fn attempt_redial(
     path_index: usize,
     requested_paths: usize,
     session_id: u32,
+    path_addresses: &Arc<std::sync::RwLock<HashMap<usize, String>>>,
     log: &Arc<dyn Fn(String) + Send + Sync>,
 ) -> AttemptResult {
     let mut observer = |message: String| log(message);
+    // The bind address comes from the live path-set map, not the
+    // frozen session-start config: after a path-set change the map
+    // holds the current address for this path (or nothing, for an
+    // unbound path, in which case the config fallback below applies
+    // exactly as at session start).
+    let bind_address = path_addresses
+        .read()
+        .expect("path address map lock poisoned")
+        .get(&path_index)
+        .cloned();
     let dial = establish_single_transport_path(
         config,
         path_index,
         requested_paths,
+        bind_address.as_deref(),
         &mut observer,
     );
     let mut transport = match tokio::time::timeout(DIAL_TIMEOUT, dial).await {
@@ -303,7 +379,10 @@ async fn attempt_redial(
         Ok(Ok(SinglePathResult::Connected(transport))) => transport,
     };
     match bind_redialed_transport(&mut transport, session_id).await {
-        Ok(()) => AttemptResult::Bound(transport),
+        Ok(()) => AttemptResult::Bound {
+            transport,
+            bind_address,
+        },
         Err(BindFailure::SessionReplaced(other)) => {
             let _ = transport.close().await;
             AttemptResult::SessionDead(format!(
@@ -323,22 +402,24 @@ async fn attempt_redial(
 pub fn spawn_path_supervisor(
     config: ClientConfig,
     requested_paths: usize,
+    desired_paths: Vec<usize>,
     initially_present: Vec<usize>,
     session_id: u32,
     cancel_token: CancellationToken,
     mut lost_rx: mpsc::UnboundedReceiver<usize>,
+    mut paths_update_rx: mpsc::UnboundedReceiver<PathsUpdate>,
+    path_addresses: Arc<std::sync::RwLock<HashMap<usize, String>>>,
     outcome_tx: mpsc::UnboundedSender<RedialOutcome>,
     log: Arc<dyn Fn(String) + Send + Sync>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let desired: Vec<usize> = (0..requested_paths).collect();
         let mut state =
-            PathSupervisorState::new(&desired, &initially_present, Instant::now());
+            PathSupervisorState::new(&desired_paths, &initially_present, Instant::now());
         if state.next_wakeup().is_some() {
             log(format!(
                 "supervisor active: {} of {} direct paths present",
                 initially_present.len(),
-                requested_paths
+                desired_paths.len()
             ));
         }
         loop {
@@ -362,6 +443,23 @@ pub fn spawn_path_supervisor(
                         None => break,
                     }
                 }
+                update = paths_update_rx.recv() => {
+                    match update {
+                        Some(PathsUpdate { added, removed }) => {
+                            for path in removed {
+                                state.note_removed(path);
+                            }
+                            let now = Instant::now();
+                            for path in added {
+                                state.note_added(path, now);
+                            }
+                            // Loop back: wakeup is recomputed, so a
+                            // newly added path (due now) dials
+                            // without waiting out a stale sleep.
+                        }
+                        None => break,
+                    }
+                }
                 _ = sleep => {
                     for path in state.due_paths(Instant::now()) {
                         if cancel_token.is_cancelled() {
@@ -372,17 +470,22 @@ pub fn spawn_path_supervisor(
                             path,
                             requested_paths,
                             session_id,
+                            &path_addresses,
                             &log,
                         )
                         .await
                         {
-                            AttemptResult::Bound(transport) => {
+                            AttemptResult::Bound {
+                                transport,
+                                bind_address,
+                            } => {
                                 state.note_bound(path);
                                 log(format!("path {path} re-dialed and bound"));
                                 if outcome_tx
                                     .send(RedialOutcome::Bound {
                                         path_index: path,
                                         transport,
+                                        bind_address,
                                     })
                                     .is_err()
                                 {
@@ -390,12 +493,19 @@ pub fn spawn_path_supervisor(
                                 }
                             }
                             AttemptResult::Failed(reason) => {
-                                let delay =
-                                    state.note_attempt_failed(path, Instant::now());
-                                log(format!(
-                                    "path {path} re-dial failed ({reason}); next attempt in {}s",
-                                    delay.as_secs()
-                                ));
+                                // A path removed while its dial was
+                                // in flight is no longer in state;
+                                // don't log a phantom "next attempt".
+                                if state.contains(path) {
+                                    let delay = state.note_attempt_failed(
+                                        path,
+                                        Instant::now(),
+                                    );
+                                    log(format!(
+                                        "path {path} re-dial failed ({reason}); next attempt in {}s",
+                                        delay.as_secs()
+                                    ));
+                                }
                             }
                             AttemptResult::SessionDead(reason) => {
                                 let _ = outcome_tx.send(RedialOutcome::SessionDead {
@@ -482,6 +592,28 @@ mod tests {
         state.note_bound(1);
         assert_eq!(state.next_wakeup(), None);
         assert!(state.is_present(1));
+    }
+
+    #[test]
+    fn added_path_is_due_immediately_and_removed_path_is_forgotten() {
+        let now = t0();
+        let mut state = PathSupervisorState::new(&[0, 1], &[0, 1], now);
+        assert_eq!(state.next_wakeup(), None);
+        // A removed path leaves the schedule entirely: no wakeup,
+        // and a later failure notice for it is a silent no-op.
+        state.note_removed(1);
+        assert!(!state.contains(1));
+        assert_eq!(state.next_wakeup(), None);
+        assert_eq!(state.note_attempt_failed(1, now), Duration::ZERO);
+        // A newly added path dials at once, not after the
+        // missing-at-start delay.
+        state.note_added(2, now);
+        assert_eq!(state.due_paths(now), vec![2]);
+        assert_eq!(state.next_wakeup(), Some(now));
+        // Adding a present path disturbs nothing.
+        state.note_added(0, now);
+        assert!(state.is_present(0));
+        assert_eq!(state.due_paths(now), vec![2]);
     }
 
     #[test]

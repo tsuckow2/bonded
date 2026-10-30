@@ -95,6 +95,13 @@ class BondedVpnService : VpnService() {
     private val pendingOutboundLock = Any()
     private val pendingOutboundPackets = ArrayDeque<ByteArray>()
 
+    // Serializes network path-set updates: the flag check + pending
+    // set (callback side) and the pending take (startup side) share
+    // this lock so a change arriving during session startup is never
+    // lost between the flag clear and the drain.
+    private val pathUpdateLock = Any()
+    @Volatile private var pendingPathUpdate: List<String>? = null
+
     private var lastEmittedSessionState: String? = null
     private var lastNetworkBindingSignature: String = ""
     // Server address with hostname pre-resolved to IP before VPN captures DNS traffic.
@@ -231,6 +238,7 @@ class BondedVpnService : VpnService() {
             return START_NOT_STICKY
         }
         sessionStartupInProgress = false
+        drainPendingPathUpdate()
 
         running = running || (vpnInterface != null)
         startPacketIoLoopIfNeeded()
@@ -790,6 +798,8 @@ class BondedVpnService : VpnService() {
 
     private external fun nativeResetPath(pathIndex: Int): Boolean
 
+    private external fun nativeUpdatePaths(bindAddressesJson: String): Boolean
+
     // Resolve a "host:port" address to "ip:port" using system DNS, before the VPN is
     // active. Returns the original string unchanged on any error or if already an IP.
     private fun appVersionCode(): Long {
@@ -1026,39 +1036,87 @@ class BondedVpnService : VpnService() {
             return
         }
 
-        if (sessionStartupInProgress || networkRebindInProgress) {
-            return
-        }
-
         val deviceId = activeDeviceId ?: return
         val manager = networkPathManager ?: return
-        val bindAddresses = manager.activeBindAddresses()
-        val pathSummaries = manager.activePathSummaries()
-        setActiveNetworkBindings(bindAddresses, pathSummaries)
-        val bindingSignature = JSONArray(bindAddresses).toString()
-        if (bindingSignature == lastNetworkBindingSignature) {
-            return
-        }
-
-        val server = PairedServerStore.findById(this, deviceId) ?: return
-        networkRebindInProgress = true
-        thread(name = "bonded-network-path-restart", start = true) {
-            if (shutdownInProgress) {
-                networkRebindInProgress = false
-                return@thread
+        // Re-read the current list inside the lock (never the
+        // callback's snapshot): rapid callbacks serialize here, and
+        // the last one to run always sends the freshest list, so the
+        // worker's final state matches reality even if callbacks
+        // arrived out of order.
+        synchronized(pathUpdateLock) {
+            val bindAddresses = manager.activeBindAddresses()
+            val pathSummaries = manager.activePathSummaries()
+            setActiveNetworkBindings(bindAddresses, pathSummaries)
+            val bindingSignature = JSONArray(bindAddresses).toString()
+            if (bindingSignature == lastNetworkBindingSignature) {
+                return
             }
-
-            stopNativeSession()
-            if (startNativeSession(server, count, bindAddresses)) {
-                rehandoffTunFdAfterSessionRestart()
+            if (sessionStartupInProgress) {
+                // The worker isn't listening yet; park the change
+                // for the drain that runs when startup completes.
+                pendingPathUpdate = bindAddresses
+                return
+            }
+            // Surgical update first: the live worker adds/removes
+            // only the changed paths, keeping surviving transports
+            // (e.g. the cellular QUIC connection when Wi-Fi dies)
+            // exactly as they are — no session restart, no TUN
+            // re-handoff.
+            if (updatePaths(bindAddresses)) {
+                lastNetworkBindingSignature = bindingSignature
                 emitEvent(
                         "network_paths",
-                        "Rebound VPN session across ${bindAddresses.size.coerceAtLeast(count)} network path(s); bindAddresses=${JSONArray(bindAddresses).toString()}, summaries=${JSONArray(pathSummaries).toString()}"
+                        "Updated VPN paths; bindAddresses=${JSONArray(bindAddresses).toString()}, summaries=${JSONArray(pathSummaries).toString()}"
                 )
-            } else {
-                emitEvent("error", "Failed to rebind VPN session after network change")
+                return
             }
-            networkRebindInProgress = false
+            // No live worker to update (or its channel is closed):
+            // fall back to the full stop/start rebind.
+            if (networkRebindInProgress) {
+                return
+            }
+            val server = PairedServerStore.findById(this, deviceId) ?: return
+            networkRebindInProgress = true
+            thread(name = "bonded-network-path-restart", start = true) {
+                if (shutdownInProgress) {
+                    networkRebindInProgress = false
+                    return@thread
+                }
+
+                stopNativeSession()
+                if (startNativeSession(server, count, bindAddresses)) {
+                    rehandoffTunFdAfterSessionRestart()
+                    emitEvent(
+                            "network_paths",
+                            "Rebound VPN session across ${bindAddresses.size.coerceAtLeast(count)} network path(s); bindAddresses=${JSONArray(bindAddresses).toString()}, summaries=${JSONArray(pathSummaries).toString()}"
+                    )
+                } else {
+                    emitEvent("error", "Failed to rebind VPN session after network change")
+                }
+                networkRebindInProgress = false
+            }
+        }
+    }
+
+    /** Applies a path-set change parked during session startup, if
+     * it still differs from what startup just bound. Called right
+     * after `sessionStartupInProgress` clears, so a callback racing
+     * the drain either parked its change (found here) or took the
+     * normal update path (flag already clear). */
+    private fun drainPendingPathUpdate() {
+        val pending = synchronized(pathUpdateLock) {
+            pendingPathUpdate.also { pendingPathUpdate = null }
+        } ?: return
+        val signature = JSONArray(pending).toString()
+        if (signature == lastNetworkBindingSignature) {
+            return
+        }
+        if (updatePaths(pending)) {
+            lastNetworkBindingSignature = signature
+            emitEvent(
+                    "network_paths",
+                    "Updated VPN paths after startup; bindAddresses=$signature"
+            )
         }
     }
 
@@ -1182,6 +1240,18 @@ class BondedVpnService : VpnService() {
             val service = activeInstance ?: return false
             return try {
                 service.nativeResetPath(pathIndex)
+            } catch (_: Exception) {
+                false
+            }
+        }
+
+        /** Surgical path-set update (an interface appeared or
+         * vanished). False when no service instance or no session
+         * is running — the caller falls back to a full restart. */
+        fun updatePaths(bindAddresses: List<String>): Boolean {
+            val service = activeInstance ?: return false
+            return try {
+                service.nativeUpdatePaths(JSONArray(bindAddresses).toString())
             } catch (_: Exception) {
                 false
             }

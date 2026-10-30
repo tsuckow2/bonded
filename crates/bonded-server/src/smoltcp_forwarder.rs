@@ -350,10 +350,18 @@ pub struct SessionContext {
 #[derive(Clone)]
 pub struct SessionOutboundRouter {
     inner: Arc<RwLock<RouterInner>>,
+    /// Clone of the channel the forwarder feeds. A transport handler
+    /// whose connection just died hands its undelivered response frame
+    /// back here (see `requeue`) instead of dropping it.
+    tx: mpsc::UnboundedSender<SessionFrame>,
 }
 
 struct RouterInner {
     transports: HashMap<u64, mpsc::UnboundedSender<SessionFrame>>,
+    /// Peer socket address per transport, recorded at add time so a
+    /// client-sent path-retire frame (which names the dead path by
+    /// its server-observed address) can find the transports to drop.
+    peers: HashMap<u64, std::net::SocketAddr>,
     last_active: Option<u64>,
     /// Set once any frame from this session's client carries
     /// FLAG_MULTIPATH_RECV (the client receives on all its transports).
@@ -361,6 +369,10 @@ struct RouterInner {
     /// last-active-only behavior, because an old client only reads its
     /// active transport and would lose frames sent anywhere else.
     multipath_capable: bool,
+    /// Epoch of the worker currently bound to this session (0 = none
+    /// yet; worker epochs are ms timestamps, always > 0). A newer
+    /// epoch retires every other transport (see `adopt_epoch`).
+    epoch: u64,
 }
 
 impl SessionOutboundRouter {
@@ -369,9 +381,12 @@ impl SessionOutboundRouter {
         let router = Self {
             inner: Arc::new(RwLock::new(RouterInner {
                 transports: HashMap::new(),
+                peers: HashMap::new(),
                 last_active: None,
                 multipath_capable: false,
+                epoch: 0,
             })),
+            tx: tx.clone(),
         };
         let task_router = router.clone();
         tokio::spawn(async move {
@@ -380,8 +395,47 @@ impl SessionOutboundRouter {
         (router, tx)
     }
 
-    pub fn add_transport(&self, id: u64, tx: mpsc::UnboundedSender<SessionFrame>) {
-        self.inner
+    /// Hand a response frame back to the router for delivery to another
+    /// live transport. Callers must have removed the dead transport
+    /// first, so `deliver` cannot re-pick it; if no transport is live
+    /// the frame is dropped by `deliver` with its usual warning.
+    /// This is what keeps a session restart from blackholing flows:
+    /// a reply hashed to a transport whose client-side socket is
+    /// already gone (the server QUIC idle timeout has not fired yet)
+    /// used to die in the dead handler; now it is retried on a live
+    /// path. Each failure removes one transport, so a frame is
+    /// requeued at most once per dead transport, never in a loop.
+    pub fn requeue(&self, frame: SessionFrame) {
+        let _ = self.tx.send(frame);
+    }
+
+    /// Adopt a session epoch from a binding PING. When a fresh worker
+    /// binds with a strictly newer epoch, every other transport in
+    /// the router belongs to a previous worker (a restart) and can
+    /// never deliver again — its client-side socket is closed or its
+    /// interface is gone — so drop them from candidacy immediately
+    /// instead of waiting for the QUIC idle timeout, during which
+    /// flows hashed to them blackhole. The retired handlers keep
+    /// running until their connections time out, but with no router
+    /// sender they can neither receive routed frames nor ingest
+    /// anything (their client is gone), so they are harmless.
+    /// Same-or-older epochs (same worker binding its paths, or a
+    /// supervisor re-dial) change nothing. Returns true when the
+    /// epoch was adopted.
+    pub fn adopt_epoch(&self, keep_id: u64, epoch: u64) -> bool {
+        let mut inner = self.inner.write().expect("router lock poisoned");
+        if epoch <= inner.epoch {
+            return false;
+        }
+        inner.epoch = epoch;
+        inner.transports.retain(|id, _| *id == keep_id);
+        if inner.last_active != Some(keep_id) {
+            inner.last_active = None;
+        }
+        true
+    }
+
+    pub fn add_transport(&self, id: u64, tx: mpsc::UnboundedSender<SessionFrame>) {        self.inner
             .write()
             .expect("router lock poisoned")
             .transports
@@ -391,9 +445,42 @@ impl SessionOutboundRouter {
     pub fn remove_transport(&self, id: u64) {
         let mut inner = self.inner.write().expect("router lock poisoned");
         inner.transports.remove(&id);
+        inner.peers.remove(&id);
         if inner.last_active == Some(id) {
             inner.last_active = None;
         }
+    }
+
+    /// Record the peer socket address a transport arrived from, so a
+    /// later path-retire frame can find it by its server-observed
+    /// address. Called at handler setup, next to `add_transport`.
+    pub fn note_peer(&self, id: u64, peer: std::net::SocketAddr) {
+        let mut inner = self.inner.write().expect("router lock poisoned");
+        inner.peers.insert(id, peer);
+    }
+
+    /// Drop every transport whose recorded peer matches `peer`
+    /// (a client-sent path retire for a dead interface). Returns the
+    /// retired transport ids. The retired handlers keep running
+    /// until their connections time out, but with no router sender
+    /// they can neither receive routed frames nor ingest anything,
+    /// so they are harmless — the same posture as an epoch retire.
+    pub fn retire_by_peer(&self, peer: std::net::SocketAddr) -> Vec<u64> {
+        let mut inner = self.inner.write().expect("router lock poisoned");
+        let retired: Vec<u64> = inner
+            .peers
+            .iter()
+            .filter(|(_, p)| **p == peer)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in &retired {
+            inner.transports.remove(id);
+            inner.peers.remove(id);
+            if inner.last_active == Some(*id) {
+                inner.last_active = None;
+            }
+        }
+        retired
     }
 
     pub fn mark_active(&self, id: u64) {
@@ -3632,6 +3719,67 @@ mod tests {
             .expect("rx1 closed");
         assert_eq!(got.header.sequence, 41);
         assert!(rx2.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn router_adopt_epoch_retires_previous_worker_transports() {
+        let (router, fwd_tx) = SessionOutboundRouter::new();
+        let (tx1, _rx1) = mpsc::unbounded_channel::<SessionFrame>();
+        let (tx2, mut rx2) = mpsc::unbounded_channel::<SessionFrame>();
+        router.add_transport(1, tx1);
+        router.add_transport(2, tx2);
+        router.mark_active(1);
+        router.note_frame_flags(bonded_core::session::FLAG_MULTIPATH_RECV);
+
+        // A newer worker binds on transport 2: transport 1 (the old
+        // worker's) must leave candidacy immediately, and the
+        // last-active pointer must not keep pointing at it. A flow
+        // that would have hashed to transport 1 in the two-transport
+        // set must now arrive on transport 2, the only survivor.
+        assert!(router.adopt_epoch(2, 1000));
+        fwd_tx
+            .send(flow_frame(50, flow_port_for_pick(0)))
+            .expect("send to router");
+        let got = timeout(Duration::from_secs(2), rx2.recv())
+            .await
+            .expect("rx2 timeout")
+            .expect("rx2 closed");
+        assert_eq!(got.header.sequence, 50);
+
+        // Same epoch (the new worker binding its second path) and
+        // older epochs change nothing.
+        assert!(!router.adopt_epoch(2, 1000));
+        assert!(!router.adopt_epoch(2, 999));
+    }
+
+    #[tokio::test]
+    async fn router_retire_by_peer_drops_only_matching_transports() {
+        let (router, fwd_tx) = SessionOutboundRouter::new();
+        let (tx1, _rx1) = mpsc::unbounded_channel::<SessionFrame>();
+        let (tx2, mut rx2) = mpsc::unbounded_channel::<SessionFrame>();
+        router.add_transport(1, tx1);
+        router.add_transport(2, tx2);
+        let dead: std::net::SocketAddr = "192.168.1.1:34071".parse().unwrap();
+        let live: std::net::SocketAddr = "172.56.205.81:38408".parse().unwrap();
+        router.note_peer(1, dead);
+        router.note_peer(2, live);
+        router.mark_active(1);
+
+        // Retiring the dead peer drops only transport 1, and the
+        // last-active pointer stops pointing at it.
+        assert_eq!(router.retire_by_peer(dead), vec![1]);
+        fwd_tx
+            .send(flow_frame(51, flow_port_for_pick(0)))
+            .expect("send to router");
+        let got = timeout(Duration::from_secs(2), rx2.recv())
+            .await
+            .expect("rx2 timeout")
+            .expect("rx2 closed");
+        assert_eq!(got.header.sequence, 51);
+
+        // An unknown peer retires nothing.
+        let unknown: std::net::SocketAddr = "10.0.0.1:1234".parse().unwrap();
+        assert!(router.retire_by_peer(unknown).is_empty());
     }
 
     #[tokio::test]

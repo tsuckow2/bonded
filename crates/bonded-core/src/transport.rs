@@ -443,11 +443,23 @@ impl QuicTransport {
         Ok(line)
     }
 
-    /// Gracefully finish the send stream.  The connection itself is closed
-    /// when the transport is dropped (the `quinn::Connection` held in
-    /// `_connection` calls `close(0, b"")` on the last handle's drop).
+    /// Gracefully finish the send stream, then close the connection
+    /// and give the endpoint driver an explicit window to flush the
+    /// CONNECTION_CLOSE before the caller drops the transport (and
+    /// the worker runtime it was driven on). `closed()` does NOT
+    /// provide that window: it resolves locally once the close is
+    /// queued (bench 2026-10-29: close "completed" in 1 ms over a
+    /// 200 ms-RTT link, yet the server still saw "connection lost"
+    /// 30-60 s later) — without a real poll window the close packet
+    /// never leaves and the server only learns of the close via the
+    /// idle timeout, keeping the dead transport in the session
+    /// router. A 50 ms sleep fits inside the caller's 100 ms close
+    /// timeout and is plenty for one driver poll. Best effort: a
+    /// dead peer simply never acks, and close still succeeds.
     pub async fn close(&mut self) -> anyhow::Result<()> {
-        self.send.finish()?;
+        let _ = self.send.finish();
+        self._connection.close(quinn::VarInt::from_u32(0), b"");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         Ok(())
     }
 }

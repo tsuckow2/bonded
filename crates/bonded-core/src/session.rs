@@ -18,6 +18,41 @@ pub const FLAG_PEER_RELAY_REGISTRATION: u32 = 0x0004;
 /// understand it keep the pre-multipath behavior for clients that never
 /// set it.
 pub const FLAG_MULTIPATH_RECV: u32 = 0x0008;
+/// Frame flag: set on a session-start binding PING (only) whose payload
+/// is an 8-byte big-endian worker epoch (milliseconds since the Unix
+/// epoch at worker start). It tells the server this is a fresh worker,
+/// so the server can retire transports left behind by a previous
+/// worker of the same session instead of leaving them in the router
+/// until the QUIC idle timeout, during which flows hashed to them
+/// blackhole (2026-10-29 Wi-Fi-drop diagnosis). Supervisor re-dial
+/// bindings never carry it (same worker, same epoch). Old servers see
+/// a non-empty PING payload and drop it without a PONG; clients fall
+/// back to a plain PING on binding timeout.
+pub const FLAG_SESSION_EPOCH: u32 = 0x0010;
+/// Frame flag: set on a control frame a live session sends over a
+/// surviving transport to retire one dead path's transports from the
+/// session router at once (2026-10-29 path-set redesign: the session
+/// no longer restarts when an interface dies, so there is no new
+/// worker epoch to retire with). The payload is the dead path's
+/// server-observed address, exactly as the server stamped it on that
+/// path's PONGs (see [`encode_observed_address`]). The server removes
+/// every transport of this session whose peer matches; the retired
+/// handlers idle out on their own. Sent only when the client has a
+/// stamped address for the path (old servers never stamp, so old
+/// sessions keep the idle-timeout behavior). QUIC/WSS only: a
+/// WireGuard transport carries no session frames.
+pub const FLAG_PATH_RETIRE: u32 = 0x0020;
+
+/// Parse a session-epoch binding PING's epoch, if present: the flag
+/// must be set and the payload must be exactly 8 bytes.
+pub fn parse_session_epoch(frame: &SessionFrame) -> Option<u64> {
+    if frame.header.flags & FLAG_SESSION_EPOCH == 0 || frame.payload.len() != 8 {
+        return None;
+    }
+    Some(u64::from_be_bytes(
+        frame.payload[..8].try_into().ok()?,
+    ))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionHeader {

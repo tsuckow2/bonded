@@ -348,7 +348,7 @@ where
     let mut paths: Vec<(usize, ClientTransport)> = Vec::with_capacity(target);
     let mut failure_reasons: Vec<String> = Vec::new();
     for path_index in 0..target {
-        match establish_single_transport_path(config, path_index, target, &mut observer)
+        match establish_single_transport_path(config, path_index, target, None, &mut observer)
             .await?
         {
             SinglePathResult::Connected(path) => paths.push((path_index, path)),
@@ -398,6 +398,7 @@ pub async fn establish_single_transport_path<F>(
     config: &ClientConfig,
     path_index: usize,
     requested_paths: usize,
+    bind_override: Option<&str>,
     observer: &mut F,
 ) -> anyhow::Result<SinglePathResult>
 where
@@ -412,11 +413,13 @@ where
     let mut identity_error: Option<String> = None;
     let mut attempt_errors: Vec<String> = Vec::new();
 
-        let bind_address = config
-            .client
-            .path_bind_addresses
-            .get(path_index)
-            .map(String::as_str);
+        let bind_address = bind_override.or_else(|| {
+            config
+                .client
+                .path_bind_addresses
+                .get(path_index)
+                .map(String::as_str)
+        });
 
         // Pre-flight the bind address: if the OS will not let us bind a
         // socket to it, the address is not assigned to any live local

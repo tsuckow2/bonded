@@ -28,7 +28,8 @@ use bonded_core::peer_share::{
     PeerShareIntroductionClaims, PeerShareIntroductionRequest, SignedPeerShareIntroduction,
 };
 use bonded_core::session::{
-    encode_observed_address, SessionFrame, SessionHeader, FLAG_PING, FLAG_PONG,
+    decode_observed_address, encode_observed_address, parse_session_epoch, SessionFrame,
+    SessionHeader, FLAG_PATH_RETIRE, FLAG_PING, FLAG_PONG,
 };
 use bonded_core::transport::{PrependedStream, Transport, WebSocketTlsTransport};
 use http::StatusCode;
@@ -991,6 +992,7 @@ async fn handle_transport_session<T: Transport>(
         }
     };
     session_ctx.router.add_transport(transport_id, forward_tx);
+    session_ctx.router.note_peer(transport_id, peer);
     tracing::info!(
         session_id = handle.session_id,
         transport_id = transport_id,
@@ -1005,17 +1007,25 @@ async fn handle_transport_session<T: Transport>(
         // Send at most one queued frame before polling inbound; draining the full queue starves recv when the forwarder is chatty.
         if let Ok(frame) = forward_rx.try_recv() {
             log_tunnel_packet(&tunnel_pcap, &frame.payload);
-            if let Err(err) = transport.send(frame).await {
+            if let Err(err) = transport.send(frame.clone()).await {
                 warn!(peer = %peer, session_id = handle.session_id, error = %err,
-                    "failed to return drained websocket frame");
+                    "failed to return drained websocket frame; requeueing on a live transport");
+                session_ctx.router.remove_transport(transport_id);
+                session_ctx.router.requeue(frame);
                 break;
             }
         }
 
         if let Some(frame) = pending_frame.take() {
             log_tunnel_packet(&tunnel_pcap, &frame.payload);
-            if frame.header.flags & FLAG_PING != 0 && frame.payload.is_empty() {
+            if frame.header.flags & FLAG_PING != 0
+                && (frame.payload.is_empty()
+                    || parse_session_epoch(&frame).is_some())
+            {
                 session_ctx.router.note_frame_flags(frame.header.flags);
+                if let Some(epoch) = parse_session_epoch(&frame) {
+                    session_ctx.router.adopt_epoch(transport_id, epoch);
+                }
                 let pong = SessionFrame {
                     header: SessionHeader {
                         connection_id: handle.session_id as u32,
@@ -1048,9 +1058,11 @@ async fn handle_transport_session<T: Transport>(
                     break;
                 };
                 log_tunnel_packet(&tunnel_pcap, &frame.payload);
-                if let Err(err) = transport.send(frame).await {
+                if let Err(err) = transport.send(frame.clone()).await {
                     warn!(peer = %peer, session_id = handle.session_id, error = %err,
-                        "failed to send websocket frame");
+                        "failed to send websocket frame; requeueing on a live transport");
+                    session_ctx.router.remove_transport(transport_id);
+                    session_ctx.router.requeue(frame);
                     break;
                 }
             }
@@ -1076,8 +1088,34 @@ async fn handle_transport_session<T: Transport>(
                             );
                         }
                         log_tunnel_packet(&tunnel_pcap, &frame.payload);
-                        if frame.header.flags & FLAG_PING != 0 && frame.payload.is_empty() {
+                        if frame.header.flags & FLAG_PATH_RETIRE != 0 {
+                            match decode_observed_address(&frame.payload) {
+                                Some(dead_peer) => {
+                                    let retired =
+                                        session_ctx.router.retire_by_peer(dead_peer);
+                                    tracing::info!(
+                                        session_id = handle.session_id,
+                                        dead_peer = %dead_peer, retired = ?retired,
+                                        "retired transports for dead path at client request"
+                                    );
+                                }
+                                None => {
+                                    tracing::warn!(
+                                        session_id = handle.session_id,
+                                        "path-retire frame with undecodable payload"
+                                    );
+                                }
+                            }
+                            continue;
+                        }
+                        if frame.header.flags & FLAG_PING != 0
+                            && (frame.payload.is_empty()
+                                || parse_session_epoch(&frame).is_some())
+                        {
                             session_ctx.router.note_frame_flags(frame.header.flags);
+                            if let Some(epoch) = parse_session_epoch(&frame) {
+                                session_ctx.router.adopt_epoch(transport_id, epoch);
+                            }
                             let pong = SessionFrame {
                                 header: SessionHeader {
                                     connection_id: handle.session_id as u32,

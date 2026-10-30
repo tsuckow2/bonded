@@ -12,8 +12,8 @@ use bonded_core::config::SocketProtectFn;
 use bonded_core::session::SessionFrame;
 #[cfg(any(target_os = "android", test))]
 use bonded_core::session::{
-    decode_observed_address, SessionHeader, SessionState, FLAG_MULTIPATH_RECV, FLAG_PING,
-    FLAG_PONG,
+    decode_observed_address, SessionHeader, SessionState, FLAG_MULTIPATH_RECV, FLAG_PATH_RETIRE,
+    FLAG_PING, FLAG_PONG, FLAG_SESSION_EPOCH,
 };
 #[cfg(any(target_os = "android", test))]
 use bonded_core::transport::{NaiveTcpTransport, Transport};
@@ -42,7 +42,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio_util::sync::CancellationToken;
 
 mod path_supervisor;
-use path_supervisor::{spawn_path_supervisor, PathIndexMap, RedialOutcome};
+use path_supervisor::{
+    spawn_path_supervisor, PathIndexMap, PathsUpdate, RedialOutcome,
+};
 
 // Per-path connect attempts inside establish_transport_paths each carry an 8s
 // timeout.  With two paths and a bind-aware attempt first, path 0 can take close
@@ -479,6 +481,7 @@ const ANDROID_TRANSPORT_CLOSE_TIMEOUT: Duration = Duration::from_millis(100);
 #[cfg(any(target_os = "android", test))]
 async fn close_client_transports(transports: &mut Vec<ClientTransport>) {
     for transport in transports.iter_mut() {
+        alog_info!("Worker: closing transport for session stop");
         let close_result =
             tokio::time::timeout(ANDROID_TRANSPORT_CLOSE_TIMEOUT, transport.close()).await;
         if let Err(err) = close_result {
@@ -486,6 +489,8 @@ async fn close_client_transports(transports: &mut Vec<ClientTransport>) {
                 "[bonded-ffi] Timed out closing transport after {:?}: {}",
                 ANDROID_TRANSPORT_CLOSE_TIMEOUT, err,
             );
+        } else {
+            alog_info!("Worker: transport close completed");
         }
     }
     transports.clear();
@@ -692,6 +697,53 @@ fn direct_transport_indices(transports: &[ClientTransport]) -> Vec<usize> {
         .collect()
 }
 
+/// Diff a path-set change against the worker's desired-path map
+/// (`path_index -> bind address`). Returns `(removed, added)`:
+/// indexes whose address vanished, and `(index, address)` pairs for
+/// addresses that appeared, assigned the lowest index used by
+/// neither the desired map (after removals) nor any live transport
+/// (so a returning interface reuses its old index when it is free,
+/// keeping pause flags and snapshot rows stable). Addresses already
+/// desired are untouched even if their position in the new list
+/// moved; duplicates in the new list are ignored after the first
+/// occurrence. Unbound paths (no map entry) are never removed by a
+/// diff — they have no address to match on.
+#[cfg(any(target_os = "android", test))]
+fn diff_path_addresses(
+    current: &std::collections::HashMap<usize, String>,
+    used_indexes: &std::collections::HashSet<usize>,
+    new_list: &[String],
+) -> (Vec<usize>, Vec<(usize, String)>) {
+    let new_set: std::collections::HashSet<&str> =
+        new_list.iter().map(String::as_str).collect();
+    let mut removed: Vec<usize> = current
+        .iter()
+        .filter(|(_, address)| !new_set.contains(address.as_str()))
+        .map(|(index, _)| *index)
+        .collect();
+    removed.sort_unstable();
+    let removed_set: std::collections::HashSet<usize> =
+        removed.iter().copied().collect();
+    let mut used: std::collections::HashSet<usize> = used_indexes
+        .difference(&removed_set)
+        .copied()
+        .collect();
+    let mut seen: std::collections::HashSet<&str> =
+        current.values().map(String::as_str).collect();
+    let mut added = Vec::new();
+    for address in new_list {
+        if seen.insert(address.as_str()) {
+            let mut index = 0;
+            while used.contains(&index) {
+                index += 1;
+            }
+            used.insert(index);
+            added.push((index, address.clone()));
+        }
+    }
+    (removed, added)
+}
+
 /// Debug controls for one direct path, sent from the app (long-press on
 /// a path row) to the worker loop.
 #[cfg(any(target_os = "android", test))]
@@ -707,6 +759,20 @@ enum PathControl {
     /// session there is no supervisor, so emptying the transport set
     /// errors the session and the platform layer restarts it.
     Reset { path_index: usize },
+    /// A network path-set change (an interface appeared or
+    /// vanished): surgically add/remove direct paths WITHOUT
+    /// restarting the session, so surviving transports (e.g. the
+    /// cellular QUIC connection when Wi-Fi dies) are never
+    /// recreated. Removed paths are closed, retired server-side
+    /// over a surviving frame transport, and forgotten by the
+    /// supervisor; added paths are dialed by the supervisor (which
+    /// is spawned mid-session if the session started single-path).
+    /// Diffing is by bind address (see [`diff_path_addresses`]):
+    /// unbound paths are never removed by a path-set change, and a
+    /// path's paused flag is kept across its removal (pause is a
+    /// per-index debugging intent, and the index is reused when
+    /// the interface returns).
+    PathsChanged { bind_addresses: Vec<String> },
 }
 
 /// Order direct-transport candidates for one outbound packet's
@@ -1251,14 +1317,23 @@ fn start_android_session(
                 candidate_paths = (0..transports.len()).collect();
             }
             let mut path_index = 0_usize;
+            // Worker epoch: one value for this worker's whole life,
+            // carried on every session-start binding PING so the
+            // server can retire transports left by a previous worker
+            // (see FLAG_SESSION_EPOCH). Supervisor re-dials never
+            // carry it (same worker, same epoch).
+            let session_epoch: u64 = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
             while path_index < transports.len() {
                 let ping = SessionFrame {
                     header: SessionHeader {
                         connection_id: 0,
                         sequence: 0,
-                        flags: FLAG_PING | FLAG_MULTIPATH_RECV,
+                        flags: FLAG_PING | FLAG_MULTIPATH_RECV | FLAG_SESSION_EPOCH,
                     },
-                    payload: Bytes::new(),
+                    payload: Bytes::copy_from_slice(&session_epoch.to_be_bytes()),
                 };
                 if let Err(err) = transports[path_index].send(ping).await {
                     alog_warn!(
@@ -1305,12 +1380,53 @@ fn start_android_session(
                         candidate_paths.remove(path_index);
                     }
                     Err(_) => {
-                        alog_warn!(
-                            "Worker: path {} timed out during session discovery",
-                            path_index
-                        );
-                        transports.remove(path_index);
-                        candidate_paths.remove(path_index);
+                        // Old servers drop non-empty PINGs without a
+                        // PONG, so an epoch binding times out against
+                        // them. Retry once as a plain PING before
+                        // giving up on the path; a new server answers
+                        // the epoch PING, so this costs nothing there
+                        // (a late epoch PONG also satisfies the retry
+                        // below, since only FLAG_PONG is checked).
+                        let plain_ping = SessionFrame {
+                            header: SessionHeader {
+                                connection_id: 0,
+                                sequence: 0,
+                                flags: FLAG_PING | FLAG_MULTIPATH_RECV,
+                            },
+                            payload: Bytes::new(),
+                        };
+                        let retried = match transports[path_index].send(plain_ping).await {
+                            Ok(()) => {
+                                match tokio::time::timeout(
+                                    Duration::from_secs(10),
+                                    transports[path_index].recv(),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(frame))
+                                        if frame.header.flags & FLAG_PONG != 0 =>
+                                    {
+                                        session_id = frame.header.connection_id;
+                                        alog_info!(
+                                            "Worker: path {} bound to session {} (plain retry)",
+                                            path_index, session_id
+                                        );
+                                        path_index += 1;
+                                        true
+                                    }
+                                    _ => false,
+                                }
+                            }
+                            Err(_) => false,
+                        };
+                        if !retried {
+                            alog_warn!(
+                                "Worker: path {} timed out during session discovery",
+                                path_index
+                            );
+                            transports.remove(path_index);
+                            candidate_paths.remove(path_index);
+                        }
                     }
                 }
             }
@@ -1349,24 +1465,60 @@ fn start_android_session(
             // them (see order_candidates_for_send).
             let mut paused_paths: std::collections::HashSet<usize> =
                 std::collections::HashSet::new();
+            // Desired direct paths, by durable path index: the bind
+            // address for every path this session wants, whether or
+            // not it established (a path missing at start is still
+            // desired — the supervisor dials it). This map is the
+            // path-set change's source of truth, shared with the
+            // supervisor (which reads it at dial time, since the
+            // session-start config is frozen). Paths with no config
+            // entry are unbound (default-network dials) and have no
+            // entry here; they are never removed by a path-set diff.
+            let path_addresses: Arc<
+                std::sync::RwLock<std::collections::HashMap<usize, String>>,
+            > = Arc::new(std::sync::RwLock::new(
+                (0..requested_paths)
+                    .filter_map(|path_index| {
+                        config
+                            .client
+                            .path_bind_addresses
+                            .get(path_index)
+                            .map(|address| (path_index, address.clone()))
+                    })
+                    .collect(),
+            ));
             let (path_lost_tx, path_lost_rx) =
                 tokio::sync::mpsc::unbounded_channel::<usize>();
             let (redial_outcome_tx, mut redial_outcome_rx) =
                 tokio::sync::mpsc::unbounded_channel::<RedialOutcome>();
+            let (supervisor_paths_tx, supervisor_paths_rx) =
+                tokio::sync::mpsc::unbounded_channel::<PathsUpdate>();
+            // Receivers are held as Options so a supervisor spawned
+            // mid-session (a session that started single-path and
+            // grew) can take them; the setup spawn below takes them
+            // in the multi-path case. Unsent path updates buffer
+            // harmlessly when no supervisor exists yet.
+            let mut supervisor_paths_rx = Some(supervisor_paths_rx);
+            let mut path_lost_rx = Some(path_lost_rx);
+            let supervisor_log: Arc<dyn Fn(String) + Send + Sync> =
+                Arc::new(|message: String| {
+                    alog_info!("PathSupervisor: {message}");
+                });
+            let mut supervisor_present = false;
             let _path_supervisor = if requested_paths >= 2 {
-                let supervisor_log: Arc<dyn Fn(String) + Send + Sync> =
-                    Arc::new(|message: String| {
-                        alog_info!("PathSupervisor: {message}");
-                    });
+                supervisor_present = true;
                 Some(spawn_path_supervisor(
                     config.clone(),
                     requested_paths,
+                    (0..requested_paths).collect(),
                     candidate_paths.clone(),
                     session_id,
                     worker_cancel_token.clone(),
-                    path_lost_rx,
-                    redial_outcome_tx,
-                    supervisor_log,
+                    path_lost_rx.take().expect("supervisor lost channel"),
+                    supervisor_paths_rx.take().expect("supervisor paths channel"),
+                    path_addresses.clone(),
+                    redial_outcome_tx.clone(),
+                    supervisor_log.clone(),
                 ))
             } else {
                 None
@@ -1486,6 +1638,229 @@ fn start_android_session(
                                     );
                                 }
                             }
+                            Some(PathControl::PathsChanged { bind_addresses }) => {
+                                // Surgical path-set update: surviving
+                                // transports are never touched (no
+                                // session restart, no re-dial of
+                                // healthy paths). Only remove what
+                                // vanished and queue what appeared.
+                                let live_indexes: std::collections::HashSet<usize> =
+                                    path_index_map.path_indexes().into_iter().collect();
+                                let (removed, added) = {
+                                    let desired = path_addresses
+                                        .read()
+                                        .expect("path address map lock poisoned");
+                                    diff_path_addresses(
+                                        &desired,
+                                        &live_indexes,
+                                        &bind_addresses,
+                                    )
+                                };
+                                if removed.is_empty() && added.is_empty() {
+                                    alog_info!(
+                                        "Worker: path-set change is a no-op"
+                                    );
+                                } else {
+                                    alog_info!(
+                                        "Worker: path-set change removed={:?} added={:?}",
+                                        removed, added
+                                    );
+                                    // Capture each removed path's
+                                    // server-observed address before
+                                    // its transport (and snapshot
+                                    // row) goes away, for the retire
+                                    // frames below.
+                                    let mut retire_observed: Vec<String> = Vec::new();
+                                    for path_index in &removed {
+                                        if let Some(vec_index) =
+                                            path_index_map.vec_index_of(*path_index)
+                                        {
+                                            let mut observed: Option<String> = None;
+                                            update_snapshot(
+                                                &worker_snapshot,
+                                                |session_snapshot| {
+                                                    observed = session_snapshot
+                                                        .path_stats
+                                                        .iter()
+                                                        .find(|stat| {
+                                                            stat.path_index
+                                                                == Some(*path_index)
+                                                        })
+                                                        .and_then(|stat| {
+                                                            stat.server_seen_address.clone()
+                                                        });
+                                                },
+                                            );
+                                            if let Some(observed) = observed {
+                                                retire_observed.push(observed);
+                                            }
+                                            let mut transport =
+                                                transports.remove(vec_index);
+                                            let _ = transport.close().await;
+                                            path_index_map.on_remove(vec_index);
+                                            if vec_index < active_index {
+                                                active_index -= 1;
+                                            } else if vec_index == active_index
+                                                && active_index >= transports.len()
+                                            {
+                                                active_index = 0;
+                                            }
+                                        }
+                                    }
+                                    {
+                                        let mut desired = path_addresses
+                                            .write()
+                                            .expect("path address map lock poisoned");
+                                        for path_index in &removed {
+                                            desired.remove(path_index);
+                                        }
+                                        for (path_index, address) in &added {
+                                            desired.insert(*path_index, address.clone());
+                                        }
+                                    }
+                                    let added_indexes: Vec<usize> = added
+                                        .iter()
+                                        .map(|(index, _)| *index)
+                                        .collect();
+                                    if supervisor_present {
+                                        let _ = supervisor_paths_tx.send(PathsUpdate {
+                                            added: added_indexes,
+                                            removed: removed.clone(),
+                                        });
+                                    } else if !added_indexes.is_empty() {
+                                        // The session started
+                                        // single-path and just grew:
+                                        // give it a supervisor so
+                                        // the new paths get dialed.
+                                        // Desired = every direct
+                                        // path now wanted (map keys
+                                        // plus unbound live paths);
+                                        // present = the live ones.
+                                        // The update below makes
+                                        // the added paths due now
+                                        // (instead of the 5 s
+                                        // missing-at-start delay).
+                                        let desired: Vec<usize> = {
+                                            let map = path_addresses
+                                                .read()
+                                                .expect("path address map lock poisoned");
+                                            let mut d: Vec<usize> =
+                                                map.keys().copied().collect();
+                                            for p in path_index_map.path_indexes() {
+                                                if !d.contains(&p) {
+                                                    d.push(p);
+                                                }
+                                            }
+                                            d
+                                        };
+                                        let present =
+                                            path_index_map.path_indexes();
+                                        if desired.len() >= 2 {
+                                            if let (Some(lost_rx), Some(paths_rx)) = (
+                                                path_lost_rx.take(),
+                                                supervisor_paths_rx.take(),
+                                            ) {
+                                                spawn_path_supervisor(
+                                                    config.clone(),
+                                                    requested_paths,
+                                                    desired,
+                                                    present,
+                                                    session_id,
+                                                    worker_cancel_token.clone(),
+                                                    lost_rx,
+                                                    paths_rx,
+                                                    path_addresses.clone(),
+                                                    redial_outcome_tx.clone(),
+                                                    supervisor_log.clone(),
+                                                );
+                                                supervisor_present = true;
+                                                let _ = supervisor_paths_tx.send(
+                                                    PathsUpdate {
+                                                        added: added_indexes,
+                                                        removed: removed.clone(),
+                                                    },
+                                                );
+                                            }
+                                        }
+                                    }
+                                    // Retire the dead paths
+                                    // server-side, batched over the
+                                    // first surviving frame
+                                    // transport (QUIC/WSS — a
+                                    // WireGuard transport carries no
+                                    // session frames, and peer
+                                    // relays have no path index).
+                                    // Best effort with a short cap:
+                                    // if no frame transport survives
+                                    // (or the send stalls), the
+                                    // server-side idle timeout is
+                                    // still the backstop.
+                                    if !retire_observed.is_empty() {
+                                        if let Some((_, survivor)) = transports
+                                            .iter_mut()
+                                            .enumerate()
+                                            .find(|(vec_index, transport)| {
+                                                path_index_map
+                                                    .path_of(*vec_index)
+                                                    .is_some()
+                                                    && client_transport_kind(transport)
+                                                        != "WireGuard"
+                                            })
+                                        {
+                                            for observed in retire_observed {
+                                                let retire = SessionFrame {
+                                                    header: SessionHeader {
+                                                        connection_id: session_id,
+                                                        sequence: 0,
+                                                        flags: FLAG_PATH_RETIRE,
+                                                    },
+                                                    payload: Bytes::from(
+                                                        observed.into_bytes(),
+                                                    ),
+                                                };
+                                                let _ = tokio::time::timeout(
+                                                    Duration::from_millis(500),
+                                                    survivor.send(retire),
+                                                )
+                                                .await;
+                                            }
+                                        }
+                                    }
+                                    sync_transport_snapshot(
+                                        &worker_snapshot,
+                                        &transports,
+                                        active_index,
+                                    );
+                                    publish_path_stats(
+                                        &worker_snapshot,
+                                        &transports,
+                                        &path_index_slots(
+                                            &path_index_map,
+                                            transports.len(),
+                                        ),
+                                        active_index,
+                                    );
+                                    if path_index_map.path_indexes().is_empty() {
+                                        // No direct path left: nothing
+                                        // will re-dial (and an idle
+                                        // session is reaped server-side
+                                        // anyway), so fail the session
+                                        // and let the platform layer
+                                        // restart it when an interface
+                                        // returns.
+                                        update_snapshot(
+                                            &worker_snapshot,
+                                            |session_snapshot| {
+                                                session_snapshot.state =
+                                                    "error".to_owned();
+                                                session_snapshot.last_error =
+                                                    Some("all direct paths removed by path-set change; restarting session".to_owned());
+                                            },
+                                        );
+                                        break;
+                                    }
+                                }
+                            }
                             None => {}
                         }
                     }
@@ -1509,7 +1884,12 @@ fn start_android_session(
                     }
                     redial_outcome = redial_outcome_rx.recv() => {
                         match redial_outcome {
-                            Some(RedialOutcome::Bound { path_index, transport }) => {
+                            Some(RedialOutcome::Bound { path_index, transport, bind_address }) => {
+                                let current_address = path_addresses
+                                    .read()
+                                    .expect("path address map lock poisoned")
+                                    .get(&path_index)
+                                    .cloned();
                                 if path_index_map.contains_path(path_index) {
                                     // Raced with another restore of the
                                     // same path; keep the one already in
@@ -1520,6 +1900,27 @@ fn start_android_session(
                                         "Worker: path {} already present; closed duplicate re-dial",
                                         path_index
                                     );
+                                } else if current_address.as_deref()
+                                    != bind_address.as_deref()
+                                {
+                                    // Stale re-dial: its path was
+                                    // removed, or re-addressed, by a
+                                    // path-set change while the dial
+                                    // was in flight (an unbound path
+                                    // has None on both sides and
+                                    // passes). Drop it, and tell the
+                                    // supervisor it is lost after
+                                    // all — otherwise the supervisor
+                                    // keeps it marked Present (it
+                                    // noted the Bound) and never
+                                    // re-dials the current address.
+                                    let mut stale = transport;
+                                    let _ = stale.close().await;
+                                    alog_warn!(
+                                        "Worker: path {} re-dial went stale (current {:?}, dialed {:?}); closed",
+                                        path_index, current_address, bind_address
+                                    );
+                                    let _ = path_lost_tx.send(path_index);
                                 } else {
                                     transports.push(transport);
                                     path_index_map
@@ -2455,6 +2856,36 @@ pub extern "system" fn Java_com_bonded_bonded_1app_BondedVpnService_nativeResetP
         .unwrap_or(false) as jni::sys::jboolean
 }
 
+/// Network path-set update (an interface appeared or vanished):
+/// hands the live worker the current bind-address list so it can
+/// add/remove paths surgically instead of restarting the session.
+/// Returns false when no session is running (the caller falls back
+/// to the stop/start rebind).
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_bonded_bonded_1app_BondedVpnService_nativeUpdatePaths(
+    mut env: jni::JNIEnv,
+    _obj: jni::objects::JObject,
+    bind_addresses_json: jni::objects::JString,
+) -> jni::sys::jboolean {
+    let bind_addresses_json: String = match env.get_string(&bind_addresses_json) {
+        Ok(value) => value.into(),
+        Err(_) => return false as jni::sys::jboolean,
+    };
+    let bind_addresses = parse_bind_address_list(&bind_addresses_json);
+    android_session_slot()
+        .lock()
+        .expect("android session slot lock poisoned")
+        .as_ref()
+        .map(|handle| {
+            handle
+                .path_control_tx
+                .send(PathControl::PathsChanged { bind_addresses })
+                .is_ok()
+        })
+        .unwrap_or(false) as jni::sys::jboolean
+}
+
 /// In-app QUIC handshake probe (diagnostics): dials one production-shaped
 /// QUIC session connection using the same protect / network-bind
 /// callbacks as a live session, from a dedicated thread + runtime (the
@@ -2561,7 +2992,70 @@ pub unsafe extern "C" fn bonded_ffi_decode_frame_metadata(
 
 #[cfg(test)]
 mod tests {
+    use super::diff_path_addresses;
     use super::order_candidates_for_send;
+
+    #[test]
+    fn path_diff_removes_vanished_and_reuses_freed_indexes() {
+        use std::collections::{HashMap, HashSet};
+        let current: HashMap<usize, String> = [
+            (0, "192.168.1.250".to_owned()),
+            (1, "192.0.0.4".to_owned()),
+        ]
+        .into_iter()
+        .collect();
+        let used: HashSet<usize> = [0, 1].into_iter().collect();
+        // Wi-Fi dies: only cellular remains. Nothing added.
+        let (removed, added) = diff_path_addresses(
+            &current,
+            &used,
+            &["192.0.0.4".to_owned()],
+        );
+        assert_eq!(removed, vec![0]);
+        assert!(added.is_empty());
+        // Wi-Fi returns on the same address: it reuses index 0.
+        let (removed, added) = diff_path_addresses(
+            &current,
+            &used,
+            &["192.168.1.250".to_owned(), "192.0.0.4".to_owned()],
+        );
+        assert!(removed.is_empty());
+        assert!(added.is_empty());
+        // Wi-Fi returns on a NEW address (DHCP change): the old
+        // index is freed by the removal and reused for the new one.
+        let (removed, added) = diff_path_addresses(
+            &current,
+            &used,
+            &["192.168.1.99".to_owned(), "192.0.0.4".to_owned()],
+        );
+        assert_eq!(removed, vec![0]);
+        assert_eq!(added, vec![(0, "192.168.1.99".to_owned())]);
+    }
+
+    #[test]
+    fn path_diff_ignores_order_and_duplicates() {
+        use std::collections::{HashMap, HashSet};
+        let current: HashMap<usize, String> =
+            [(0, "10.0.0.1".to_owned())].into_iter().collect();
+        let used: HashSet<usize> = [0].into_iter().collect();
+        // Reordered list with a duplicate: no change, no second path.
+        let (removed, added) = diff_path_addresses(
+            &current,
+            &used,
+            &["10.0.0.1".to_owned(), "10.0.0.1".to_owned()],
+        );
+        assert!(removed.is_empty());
+        assert!(added.is_empty());
+        // A genuinely new address takes the next free index (1),
+        // since 0 is live.
+        let (removed, added) = diff_path_addresses(
+            &current,
+            &used,
+            &["10.0.0.1".to_owned(), "10.0.0.2".to_owned()],
+        );
+        assert!(removed.is_empty());
+        assert_eq!(added, vec![(1, "10.0.0.2".to_owned())]);
+    }
 
     #[test]
     fn paused_paths_go_last_regardless_of_hash_pick() {
