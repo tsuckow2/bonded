@@ -528,6 +528,8 @@ class _HomeScreenState extends State<HomeScreen> {
             const SizedBox(height: 16),
             _buildPathsCard(),
             const SizedBox(height: 16),
+            _buildPeerCard(),
+            const SizedBox(height: 16),
             _buildGraphsCard(),
           ],
         ],
@@ -597,6 +599,37 @@ class _HomeScreenState extends State<HomeScreen> {
                 style: TextStyle(color: Colors.grey[600]),
               ),
             for (final path in paths) _PathRow(status: _status, path: path),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Peer connections, listed separately from direct paths: one row
+  /// per relay leg (a provider with several paths yields several
+  /// legs, numbered within their peer). Legs are full transports for
+  /// spreading and failover; this list is only a presentation split.
+  Widget _buildPeerCard() {
+    final peers = _status.peerTransports;
+    if (peers.isEmpty) return const SizedBox.shrink();
+    final legNumber = <String, int>{};
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'Peer connections',
+              style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
+            ),
+            const SizedBox(height: 8),
+            for (final path in peers)
+              _PeerRow(
+                path: path,
+                leg: (legNumber[path.peerId ?? ''] =
+                    (legNumber[path.peerId ?? ''] ?? 0) + 1),
+              ),
           ],
         ),
       ),
@@ -857,6 +890,68 @@ class _PathRow extends StatelessWidget {
     if (bytes < 1024) return '$bytes B';
     if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
     return '${(bytes / (1024 * 1024)).toStringAsFixed(2)} MB';
+  }
+}
+
+/// One peer-relay leg: peer short id + leg number within that peer,
+/// kind, RTT, byte counters, active chip. No long-press menu: pause
+/// and reset are path-index actions and relays have no path index.
+class _PeerRow extends StatelessWidget {
+  final PathStat path;
+  final int leg;
+  const _PeerRow({required this.path, required this.leg});
+
+  static String _shortId(String? peerId) {
+    if (peerId == null || peerId.isEmpty) return 'Unknown peer';
+    return peerId.length > 8 ? peerId.substring(0, 8) : peerId;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 6),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.center,
+        children: [
+          Icon(
+            Icons.people,
+            size: 20,
+            color: path.active ? Colors.teal : Colors.grey,
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Peer ${_shortId(path.peerId)} · leg $leg',
+                  style: const TextStyle(fontWeight: FontWeight.w600),
+                ),
+                Text(
+                  [
+                    path.kind,
+                    if (path.lastRttMs > 0) '${path.lastRttMs} ms',
+                    '↓ ${_PathRow._bytes(path.inboundBytes)} · ↑ ${_PathRow._bytes(path.outboundBytes)}',
+                  ].join(' · '),
+                  style: TextStyle(fontSize: 12, color: Colors.grey[700]),
+                ),
+                if (path.publicIp != null)
+                  Text(
+                    'Public IP ${path.publicIp}',
+                    style: TextStyle(fontSize: 12, color: Colors.grey[700]),
+                  ),
+              ],
+            ),
+          ),
+          if (path.active)
+            const Chip(
+              label: Text('Active', style: TextStyle(fontSize: 11)),
+              visualDensity: VisualDensity.compact,
+              padding: EdgeInsets.zero,
+            ),
+        ],
+      ),
+    );
   }
 }
 

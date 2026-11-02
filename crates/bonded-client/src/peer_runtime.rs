@@ -21,16 +21,144 @@ use crate::cert_proof;
 use crate::peer_discovery::{PeerShareAdvertiser, PeerShareBrowser};
 use crate::peer_listener::{
     accept_peer_relay, connect_peer_relay, register_peer_relay_upstream,
-    relay_peer_frames_rate_limited, AcceptedPeerRelay, PeerListenerIdentity, PeerRelayRateLimiter,
+    relay_peer_frames_rate_limited, AcceptedPeerRelay, PeerListenerIdentity, PeerRelayDial,
+    PeerRelayRateLimiter,
 };
 use crate::{
-    bootstrap_scheme_candidates, enumerate_interfaces, establish_transport_paths,
-    load_or_create_device_keypair, request_bootstrap_json, ClientConfig, ClientTransport,
+    bootstrap_scheme_candidates, enumerate_interfaces, establish_single_transport_path,
+    establish_transport_paths, load_or_create_device_keypair, request_bootstrap_json,
+    ClientConfig, ClientTransport, SinglePathResult,
 };
 
 pub struct PeerShareRuntime {
     tasks: Vec<JoinHandle<()>>,
-    _listener_endpoint: Option<quinn::Endpoint>,
+}
+
+/// Sentinel path index for the default-network slot: a provider with
+/// no bound paths at all still relays one leg over the default route,
+/// preserving the old single-upstream behavior.
+const UNPINNED_PATH_INDEX: usize = usize::MAX;
+
+/// Where the provider reads its own path set for relay claims: the
+/// live path map shared with the session worker when running under
+/// Android FFI, else the session-start config bind addresses.
+pub type LivePathAddresses = Arc<std::sync::RwLock<HashMap<usize, String>>>;
+
+#[derive(Clone)]
+pub enum ProviderPathSource {
+    Live(LivePathAddresses),
+    Config(Vec<String>),
+}
+
+impl ProviderPathSource {
+    /// Current (path index, bind address) pairs in ascending index
+    /// order. A single unpinned slot stands in for the default-network
+    /// case (no bound paths at all).
+    fn snapshot(&self) -> Vec<(usize, Option<String>)> {
+        match self {
+            ProviderPathSource::Live(map) => {
+                let guard = map.read().expect("live path map lock poisoned");
+                let mut paths: Vec<(usize, Option<String>)> = guard
+                    .iter()
+                    .map(|(index, address)| (*index, Some(address.clone())))
+                    .collect();
+                paths.sort_by_key(|(index, _)| *index);
+                if paths.is_empty() {
+                    vec![(UNPINNED_PATH_INDEX, None)]
+                } else {
+                    paths
+                }
+            }
+            ProviderPathSource::Config(addresses) => {
+                if addresses.is_empty() {
+                    vec![(UNPINNED_PATH_INDEX, None)]
+                } else {
+                    addresses
+                        .iter()
+                        .enumerate()
+                        .map(|(index, address)| (index, Some(address.clone())))
+                        .collect()
+                }
+            }
+        }
+    }
+
+    /// Current bind address for one claimed path index, if the path is
+    /// still listed. None when the path was removed mid-relay; the
+    /// task then retries until it returns or the leg is evicted.
+    fn address_for(&self, path_index: usize) -> Option<String> {
+        self.snapshot()
+            .into_iter()
+            .find(|(index, _)| *index == path_index)
+            .and_then(|(_, address)| address)
+    }
+}
+
+/// Per-consumer provider-path claims for multipath relays: one relay
+/// leg per provider path. A claim records the introduction expiry of
+/// the leg that holds it, so the takeover rule is total:
+/// - a leg claims the lowest path index with no claim, or whose claim
+///   is held by an OLDER introduction (a newer generation takes over
+///   the path; the old leg keeps its already-established upstream
+///   until it expires, and its release is a no-op because the expiry
+///   no longer matches);
+/// - a leg of the SAME generation cannot take over a path already
+///   claimed by that generation, so dial-until-reject stops exactly
+///   when every path has a leg.
+#[derive(Default)]
+struct RelayPathClaims {
+    /// consumer device key -> (provider path index -> claim expiry secs)
+    claims: HashMap<String, HashMap<usize, u64>>,
+}
+
+impl RelayPathClaims {
+    fn consumer_count(&self) -> usize {
+        self.claims.len()
+    }
+
+    fn has_consumer(&self, consumer: &str) -> bool {
+        self.claims.contains_key(consumer)
+    }
+
+    /// Claim the lowest free path index for `consumer` from `paths`
+    /// (provider path indexes in ascending order). Returns the claimed
+    /// index, or None when every path is held by a live-or-newer
+    /// claim. Never creates an entry for a consumer that claims
+    /// nothing, so the consumer count stays exact.
+    fn claim(
+        &mut self,
+        consumer: &str,
+        paths: &[usize],
+        expires_at: u64,
+    ) -> Option<usize> {
+        let candidate = paths.iter().copied().find(|path_index| {
+            self.claims
+                .get(consumer)
+                .and_then(|held| held.get(path_index))
+                .map_or(true, |held_expiry| *held_expiry < expires_at)
+        });
+        let index = candidate?;
+        self.claims
+            .entry(consumer.to_owned())
+            .or_default()
+            .insert(index, expires_at);
+        Some(index)
+    }
+
+    /// Release a claim, but only if it still belongs to the ending
+    /// leg (same expiry): a newer leg may have taken the path over.
+    /// Drops the consumer entry when its last claim is released, so
+    /// the consumer count (the provider's cap) stays exact.
+    fn release(&mut self, consumer: &str, path_index: usize, expires_at: u64) {
+        if let Some(held) = self.claims.get_mut(consumer) {
+            if held.get(&path_index).copied() == Some(expires_at) {
+                held.remove(&path_index);
+            }
+            if held.is_empty() {
+                self.claims.remove(consumer);
+            }
+        }
+    }
 }
 
 pub type PeerShareEventLogger = Arc<dyn Fn(String) + Send + Sync>;
@@ -259,10 +387,400 @@ impl Drop for PeerShareRuntime {
     }
 }
 
+/// Accept loop for one peer-share listener endpoint: verify introductions,
+/// claim provider paths, and spawn relay tasks. One loop runs per bound
+/// endpoint; the advertise watcher spawns a new loop on re-bind and aborts
+/// loops whose IP is no longer assigned, so existing legs on a surviving
+/// endpoint are never disturbed by a re-bind.
+#[allow(clippy::too_many_arguments)]
+async fn run_peer_accept_loop(
+    endpoint: quinn::Endpoint,
+    server_key: String,
+    identity: PeerListenerIdentity,
+    logger: Option<PeerShareEventLogger>,
+    max_consumers: usize,
+    bandwidth_kbps: u64,
+    path_claims: Arc<std::sync::Mutex<RelayPathClaims>>,
+    active_relays: Arc<AtomicUsize>,
+    path_source: ProviderPathSource,
+    config: ClientConfig,
+) {
+    while let Some(incoming) = endpoint.accept().await {
+        let connection = match incoming.await {
+            Ok(connection) => connection,
+            Err(err) => {
+                warn!(error = %err, "peer-share QUIC accept failed");
+                emit_peer_share_event(
+                    logger.as_ref(),
+                    format!("QUIC accept failed: {err}"),
+                );
+                continue;
+            }
+        };
+
+        let AcceptedPeerRelay {
+            transport: mut peer,
+            introduction,
+        } = match accept_peer_relay(&server_key, &identity, connection).await {
+            Ok(peer) => peer,
+            Err(err) => {
+                warn!(error = %err, "peer-share introduction verification failed");
+                emit_peer_share_event(
+                    logger.as_ref(),
+                    format!("introduction verification failed: {err}"),
+                );
+                continue;
+            }
+        };
+        let consumer_key = introduction.introduction.consumer_device_public_key.clone();
+        let introduction_expires_at = introduction.introduction.expires_at;
+        // Cap counts distinct consumers, not legs: one consumer
+        // with N provider paths holds N legs but one consumer slot.
+        // Claim the lowest provider path not held by a live-or-newer
+        // claim (see RelayPathClaims); a leg with no free path is
+        // rejected with no_path, which is the consumer's stop signal.
+        let snapshot = path_source.snapshot();
+        let snapshot_indexes: Vec<usize> =
+            snapshot.iter().map(|(index, _)| *index).collect();
+        enum RelayAccept {
+            Accepted(usize),
+            NoPath,
+            CapReached,
+        }
+        let decision = {
+            let mut claims = path_claims.lock().expect("relay path claims lock poisoned");
+            if claims.consumer_count() >= max_consumers
+                && !claims.has_consumer(&consumer_key)
+            {
+                RelayAccept::CapReached
+            } else {
+                match claims.claim(&consumer_key, &snapshot_indexes, introduction_expires_at)
+                {
+                    Some(index) => RelayAccept::Accepted(index),
+                    None => RelayAccept::NoPath,
+                }
+            }
+        };
+        let claimed_index = match decision {
+            RelayAccept::Accepted(index) => index,
+            RelayAccept::NoPath | RelayAccept::CapReached => {
+                // The cap rejection keeps the consumer's existing
+                // error path (requeue/retry), while no_path ends the
+                // dial loop with the legs already won.
+                let (status, reason) = match decision {
+                    RelayAccept::NoPath => ("no_path", "no free provider path"),
+                    RelayAccept::CapReached => ("rejected", "consumer cap reached"),
+                    RelayAccept::Accepted(_) => unreachable!(),
+                };
+                warn!(
+                    consumer = %consumer_key,
+                    status = status,
+                    "peer-share relay rejected: {reason}"
+                );
+                emit_peer_share_event(
+                    logger.as_ref(),
+                    format!("relay rejected for consumer={consumer_key}: {reason}"),
+                );
+                if peer
+                    .send_text(&format!(r#"{{"status":"{status}"}}"#))
+                    .await
+                    .is_err()
+                {
+                    warn!(consumer = %consumer_key, "peer-share reject response send failed");
+                }
+                continue;
+            }
+        };
+        if peer.send_text(r#"{"status":"ok"}"#).await.is_err() {
+            // The leg is gone before it started; release the claim
+            // so the path stays available for the next dial.
+            path_claims.lock().expect("relay path claims lock poisoned").release(
+                &consumer_key,
+                claimed_index,
+                introduction_expires_at,
+            );
+            warn!(consumer = %consumer_key, "peer-share accept response send failed");
+            continue;
+        }
+        let _in_flight = active_relays.fetch_add(1, Ordering::SeqCst);
+        info!(
+            consumer = %consumer_key,
+            provider_nonce = %introduction.introduction.provider_instance_nonce,
+            claimed_path = claimed_index,
+            "peer-share relay accepted"
+        );
+        emit_peer_share_event(
+            logger.as_ref(),
+            format!(
+                "accepted relay for consumer={} provider_nonce={} path={}",
+                consumer_key, introduction.introduction.provider_instance_nonce, claimed_index,
+            ),
+        );
+
+        let relay_config = config.clone();
+        let relay_logger = logger.clone();
+        let relay_claims = path_claims.clone();
+        let relay_path_source = path_source.clone();
+        let relay_count = active_relays.clone();
+        tokio::spawn(async move {
+            let mut peer = peer;
+            // Resilience: if the upstream (provider->server) connection fails,
+            // re-establish it instead of terminating the relay permanently.
+            // The peer (consumer->provider QUIC) connection is kept alive
+            // across upstream reconnects.
+            let result = async {
+                let mut retry_delay = std::time::Duration::from_secs(1);
+                const MAX_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
+                loop {
+                    // The introduction is a short-lived credential only
+                    // the consumer can mint. Once it expires the server
+                    // rejects every re-registration, so retrying is
+                    // futile: abandon the relay instead. Dropping the
+                    // peer connection lets the consumer notice the loss
+                    // and mint a fresh introduction. (Observed
+                    // 2026-10-17: ~44 rejected re-registrations over
+                    // 15 minutes against one expired introduction.)
+                    if introduction_expired(&introduction) {
+                        anyhow::bail!(
+                            "peer relay introduction expired; abandoning relay so the consumer can re-introduce"
+                        );
+                    }
+                    // One upstream per claimed provider path: the
+                    // leg pins to its claimed path's current bind
+                    // address (re-read on every re-establishment, so
+                    // a re-addressed path is followed and a removed
+                    // path retries until it returns or the leg is
+                    // evicted consumer-side). The unpinned slot
+                    // keeps the old single-upstream behavior.
+                    let mut upstream =
+                        match establish_relay_upstream(&relay_config, &relay_path_source, claimed_index).await {
+                            Ok(upstream) => upstream,
+                            Err(e) => {
+                                tracing::warn!(error = %e, "provider: failed to establish relay upstream, retrying");
+                                tokio::time::sleep(retry_delay).await;
+                                retry_delay =
+                                    std::cmp::min(retry_delay * 2, MAX_RETRY_DELAY);
+                                continue;
+                            }
+                        };
+                    tracing::warn!("provider: sending relay registration");
+                    if let Err(e) = register_peer_relay_upstream(&mut upstream, introduction.clone()).await {
+                        tracing::warn!(error = %e, "provider: relay registration failed, retrying");
+                        tokio::time::sleep(retry_delay).await;
+                        retry_delay = std::cmp::min(retry_delay * 2, MAX_RETRY_DELAY);
+                        continue;
+                    }
+                    tracing::warn!("provider: relay registration sent");
+                    let mut limiter = PeerRelayRateLimiter::new(bandwidth_kbps);
+                    match relay_peer_frames_rate_limited(&mut peer, &mut upstream, &mut limiter).await {
+                        Ok(()) => {
+                            // Relay completed normally (peer disconnected)
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            // A dead peer must end the task (and free
+                            // its path claim) instead of looping on
+                            // upstream re-establishment until the
+                            // introduction expires: the peer QUIC
+                            // connection reports closed, while a live
+                            // peer with a dead upstream does not.
+                            if peer.connection_closed() {
+                                tracing::warn!("provider: peer connection closed, ending relay");
+                                return Ok(());
+                            }
+                            tracing::warn!(error = %e, "provider: relay upstream failed, re-establishing");
+                            tokio::time::sleep(retry_delay).await;
+                            retry_delay = std::cmp::min(retry_delay * 2, MAX_RETRY_DELAY);
+                            // Continue loop to re-establish upstream
+                        }
+                    }
+                }
+            }
+            .await;
+            relay_count.fetch_sub(1, Ordering::SeqCst);
+            // Release the path claim (a no-op when a newer leg has
+            // already taken the path over) so the path is claimable
+            // by the consumer's next dial.
+            relay_claims.lock().expect("relay path claims lock poisoned").release(
+                &consumer_key,
+                claimed_index,
+                introduction_expires_at,
+            );
+            match result {
+                Ok(()) => {
+                    emit_peer_share_event(
+                        relay_logger.as_ref(),
+                        format!("relay loop completed for consumer={consumer_key}"),
+                    );
+                }
+                Err(err) => {
+                    warn!(error = %err, consumer = %consumer_key, "peer relay terminated");
+                    emit_peer_share_event(
+                        relay_logger.as_ref(),
+                        format!("relay terminated for consumer={consumer_key}: {err}"),
+                    );
+                }
+            }
+        });
+    }
+}
+
+/// How often the advertise watcher re-resolves the provider's advertise
+/// IP. Path changes are rare; a few seconds of staleness is covered by
+/// the consumer's redial/renewal recovery.
+const PEER_ADVERTISE_POLL: Duration = Duration::from_secs(5);
+
+/// One accept loop per bound endpoint, owned by the advertise watcher.
+/// Dropping the set aborts every loop it holds, so aborting the watcher
+/// (e.g. on runtime shutdown) tears down all provider endpoints.
+struct AcceptLoopSet {
+    loops: Vec<(IpAddr, JoinHandle<()>)>,
+}
+
+impl AcceptLoopSet {
+    fn new(loops: Vec<(IpAddr, JoinHandle<()>)>) -> Self {
+        Self { loops }
+    }
+
+    fn push(&mut self, ip: IpAddr, handle: JoinHandle<()>) {
+        self.loops.push((ip, handle));
+    }
+
+    /// Abort loops whose IP is neither the newly advertised one nor
+    /// still assigned to an interface. Loops on surviving addresses
+    /// keep serving their existing legs undisturbed.
+    fn prune(&mut self, current_ip: IpAddr, live_ips: &HashSet<IpAddr>) {
+        let mut kept = Vec::new();
+        for (ip, handle) in self.loops.drain(..) {
+            if keep_accept_loop(ip, current_ip, live_ips) {
+                kept.push((ip, handle));
+            } else {
+                handle.abort();
+            }
+        }
+        self.loops = kept;
+    }
+}
+
+impl Drop for AcceptLoopSet {
+    fn drop(&mut self) {
+        for (_, handle) in self.loops.drain(..) {
+            handle.abort();
+        }
+    }
+}
+
+/// Whether an accept loop survives a re-bind: its IP is the newly
+/// advertised one, or it is still assigned to an interface.
+fn keep_accept_loop(ip: IpAddr, current_ip: IpAddr, live_ips: &HashSet<IpAddr>) -> bool {
+    ip == current_ip || live_ips.contains(&ip)
+}
+
+/// Watch the provider's path set and interfaces; when the advertise IP
+/// changes, bind a new listener on the new address (reusing the original
+/// certificate, so the fingerprint consumers pin never changes) and
+/// re-register the mDNS advertisement under the same instance nonce, so
+/// consumers keep treating this provider as the same peer. The previous
+/// advertisement is shut down before the new one registers (the same
+/// instance name would probe-conflict); if the new registration fails,
+/// the previous advertisement is restored and the next poll retries.
+/// A failed re-bind keeps the old endpoint serving.
+#[allow(clippy::too_many_arguments)]
+async fn run_advertise_watcher(
+    config: ClientConfig,
+    path_source: ProviderPathSource,
+    identity: PeerListenerIdentity,
+    logger: Option<PeerShareEventLogger>,
+    max_consumers: usize,
+    bandwidth_kbps: u64,
+    path_claims: Arc<std::sync::Mutex<RelayPathClaims>>,
+    active_relays: Arc<AtomicUsize>,
+    cert_der: Vec<u8>,
+    key_der: Vec<u8>,
+    port: u16,
+    initial_ip: IpAddr,
+    initial_advertisement: PeerShareAdvertisement,
+    initial_advertiser: PeerShareAdvertiser,
+    initial_loops: Vec<(IpAddr, JoinHandle<()>)>,
+) {
+    let mut loops = AcceptLoopSet::new(initial_loops);
+    let mut current_ip = initial_ip;
+    let mut current_advertisement = initial_advertisement;
+    let mut advertiser: Option<PeerShareAdvertiser> = Some(initial_advertiser);
+    loop {
+        sleep(PEER_ADVERTISE_POLL).await;
+        let interfaces = enumerate_interfaces();
+        let Some(desired) = desired_advertise_ip(&config, &path_source, &interfaces) else {
+            continue;
+        };
+        if desired == current_ip {
+            continue;
+        }
+        // Bind first: if the new address cannot be bound, keep serving
+        // the old one and retry on the next poll.
+        let new_endpoint = match bind_peer_listener_endpoint(
+            cert_der.clone(),
+            key_der.clone(),
+            SocketAddr::new(desired, port),
+            config.socket_protect.as_ref(),
+        ) {
+            Ok(endpoint) => endpoint,
+            Err(err) => {
+                warn!(error = %err, desired = %desired, "peer-share re-bind failed, keeping old endpoint");
+                continue;
+            }
+        };
+        let mut new_advertisement = current_advertisement.clone();
+        new_advertisement.endpoint = SocketAddr::new(desired, port).to_string();
+        if let Some(old) = advertiser.take() {
+            let _ = old.shutdown();
+        }
+        match PeerShareAdvertiser::start(&new_advertisement) {
+            Ok(new_adv) => {
+                advertiser = Some(new_adv);
+                let handle = tokio::spawn(run_peer_accept_loop(
+                    new_endpoint,
+                    config.client.server_public_key.clone(),
+                    identity.clone(),
+                    logger.clone(),
+                    max_consumers,
+                    bandwidth_kbps,
+                    path_claims.clone(),
+                    active_relays.clone(),
+                    path_source.clone(),
+                    config.clone(),
+                ));
+                loops.push(desired, handle);
+                let live_ips: HashSet<IpAddr> = interfaces
+                    .iter()
+                    .flat_map(|interface| interface.ips.iter())
+                    .map(|network| network.ip())
+                    .collect();
+                loops.prune(desired, &live_ips);
+                current_ip = desired;
+                current_advertisement = new_advertisement;
+                info!(endpoint = %current_advertisement.endpoint, "peer-share re-advertised on new path");
+                emit_peer_share_event(
+                    logger.as_ref(),
+                    format!("re-advertised endpoint={}", current_advertisement.endpoint),
+                );
+            }
+            Err(err) => {
+                warn!(error = %err, desired = %desired, "peer-share re-advertise failed, restoring previous advertisement");
+                match PeerShareAdvertiser::start(&current_advertisement) {
+                    Ok(old_adv) => advertiser = Some(old_adv),
+                    Err(err) => warn!(error = %err, "peer-share previous advertisement restore failed; next poll retries"),
+                }
+            }
+        }
+    }
+}
+
 pub async fn start_peer_share_runtime(
     config: &ClientConfig,
     peer_transport_tx: tokio::sync::mpsc::UnboundedSender<ClientTransport>,
     event_logger: Option<PeerShareEventLogger>,
+    provider_paths: Option<ProviderPathSource>,
 ) -> anyhow::Result<PeerShareRuntime> {
     let private_key_path = crate::expand_home_path(&config.client.private_key_path);
     let public_key_path = crate::expand_home_path(&config.client.public_key_path);
@@ -271,13 +789,35 @@ pub async fn start_peer_share_runtime(
     let is_provider = mode == PeerShareMode::Both || mode == PeerShareMode::ProviderOnly;
     let is_consumer = mode == PeerShareMode::Both || mode == PeerShareMode::ConsumerOnly;
 
-    // Provider side: QUIC listener + mDNS advertiser + accept task
-    let (listener_endpoint, listener_identity, advertisement, advertiser) = if is_provider {
-        let (endpoint, identity, adv) = build_listener_runtime(config, &device_keypair)?;
+    // Provider side: QUIC listener + mDNS advertiser + accept loops.
+    // The listener certificate/key, advertise IP, and port are carried
+    // alongside so the advertise watcher can re-bind the same identity
+    // on a new address when the provider's paths change.
+    let (
+        listener_endpoint,
+        listener_identity,
+        advertisement,
+        advertiser,
+        listener_cert_der,
+        listener_key_der,
+        listener_advertise_ip,
+        listener_port,
+    ) = if is_provider {
+        let (endpoint, identity, adv, cert_der, key_der, advertise_ip, port) =
+            build_listener_runtime(config, &device_keypair, provider_paths.as_ref())?;
         let advertiser = PeerShareAdvertiser::start(&adv)?;
-        (Some(endpoint), Some(identity), Some(adv), Some(advertiser))
+        (
+            Some(endpoint),
+            Some(identity),
+            Some(adv),
+            Some(advertiser),
+            Some(cert_der),
+            Some(key_der),
+            Some(advertise_ip),
+            Some(port),
+        )
     } else {
-        (None, None, None, None)
+        (None, None, None, None, None, None, None, None)
     };
     // Consumer side: mDNS browser
     let browser = if is_consumer {
@@ -307,161 +847,60 @@ pub async fn start_peer_share_runtime(
         );
     }
 
-    let accept_task = if is_provider {
-        let accept_endpoint = listener_endpoint.clone().expect("provider mode requires listener");
-        let accept_config = config.clone();
+    // Provider side: accept loops + advertise watcher. One accept loop
+    // runs per bound endpoint; the watcher spawns a new loop on re-bind
+    // and aborts loops whose IP is no longer assigned, so a path change
+    // never disturbs legs on a surviving endpoint. The initial loop is
+    // handed to the watcher, which owns the loop set; dropping the
+    // runtime aborts the watcher, whose Drop aborts the loops.
+    let watcher_task = if is_provider {
         let accept_server_key = config.client.server_public_key.clone();
         let accept_identity = listener_identity.clone().expect("provider mode requires identity");
         let accept_logger = event_logger.clone();
         let accept_max_consumers = config.client.peer_share_max_consumers.max(1) as usize;
         let accept_bandwidth_kbps = config.client.peer_share_relay_bandwidth_kbps;
         let active_relays = Arc::new(AtomicUsize::new(0));
-        let advertiser = advertiser;
-        Some(tokio::spawn(async move {
-        let _advertiser = advertiser;
-        while let Some(incoming) = accept_endpoint.accept().await {
-            let connection = match incoming.await {
-                Ok(connection) => connection,
-                Err(err) => {
-                    warn!(error = %err, "peer-share QUIC accept failed");
-                    emit_peer_share_event(
-                        accept_logger.as_ref(),
-                        format!("QUIC accept failed: {err}"),
-                    );
-                    continue;
-                }
-            };
-
-            let AcceptedPeerRelay {
-                transport: mut peer,
-                introduction,
-            } = match accept_peer_relay(&accept_server_key, &accept_identity, connection).await {
-                Ok(peer) => peer,
-                Err(err) => {
-                    warn!(error = %err, "peer-share introduction verification failed");
-                    emit_peer_share_event(
-                        accept_logger.as_ref(),
-                        format!("introduction verification failed: {err}"),
-                    );
-                    continue;
-                }
-            };
-            let consumer_key = introduction.introduction.consumer_device_public_key.clone();
-            // Enforce the provider's concurrent-consumer cap before spending
-            // resources on a dedicated upstream transport.
-            let in_flight = active_relays.fetch_add(1, Ordering::SeqCst);
-            if in_flight >= accept_max_consumers {
-                active_relays.fetch_sub(1, Ordering::SeqCst);
-                warn!(
-                    consumer = %consumer_key,
-                    max = accept_max_consumers,
-                    "peer-share consumer cap reached; rejecting relay"
-                );
-                emit_peer_share_event(
-                    accept_logger.as_ref(),
-                    format!("consumer cap reached; rejecting relay for consumer={consumer_key}"),
-                );
-                continue;
-            }
-            info!(
-                consumer = %consumer_key,
-                provider_nonce = %introduction.introduction.provider_instance_nonce,
-                "peer-share relay accepted"
-            );
-            emit_peer_share_event(
-                accept_logger.as_ref(),
-                format!(
-                    "accepted relay for consumer={} provider_nonce={}",
-                    consumer_key, introduction.introduction.provider_instance_nonce,
-                ),
-            );
-
-            let relay_config = accept_config.clone();
-            let relay_logger = accept_logger.clone();
-            let relay_count = active_relays.clone();
-            tokio::spawn(async move {
-                let mut peer = peer;
-                // Resilience: if the upstream (provider->server) connection fails,
-                // re-establish it instead of terminating the relay permanently.
-                // The peer (consumer->provider QUIC) connection is kept alive
-                // across upstream reconnects.
-                let result = async {
-                    let mut retry_delay = std::time::Duration::from_secs(1);
-                    const MAX_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
-                    loop {
-                        // The introduction is a short-lived credential only
-                        // the consumer can mint. Once it expires the server
-                        // rejects every re-registration, so retrying is
-                        // futile: abandon the relay instead. Dropping the
-                        // peer connection lets the consumer notice the loss
-                        // and mint a fresh introduction. (Observed
-                        // 2026-10-17: ~44 rejected re-registrations over
-                        // 15 minutes against one expired introduction.)
-                        if introduction_expired(&introduction) {
-                            anyhow::bail!(
-                                "peer relay introduction expired; abandoning relay so the consumer can re-introduce"
-                            );
-                        }
-                        let mut upstreams = match establish_peer_upstream_paths(&relay_config).await {
-                            Ok(u) => u,
-                            Err(e) => {
-                                tracing::warn!(error = %e, "provider: failed to establish upstream paths, retrying");
-                                tokio::time::sleep(retry_delay).await;
-                                retry_delay = std::cmp::min(retry_delay * 2, MAX_RETRY_DELAY);
-                                continue;
-                            }
-                        };
-                        if upstreams.is_empty() {
-                            anyhow::bail!(
-                                "peer-share relay accept produced no upstream transport paths"
-                            );
-                        }
-                        let mut upstream = upstreams.remove(0);
-                        tracing::warn!("provider: sending relay registration");
-                        if let Err(e) = register_peer_relay_upstream(&mut upstream, introduction.clone()).await {
-                            tracing::warn!(error = %e, "provider: relay registration failed, retrying");
-                            tokio::time::sleep(retry_delay).await;
-                            retry_delay = std::cmp::min(retry_delay * 2, MAX_RETRY_DELAY);
-                            continue;
-                        }
-                        tracing::warn!("provider: relay registration sent");
-                        let mut limiter = PeerRelayRateLimiter::new(accept_bandwidth_kbps);
-                        match relay_peer_frames_rate_limited(&mut peer, &mut upstream, &mut limiter).await {
-                            Ok(()) => {
-                                // Relay completed normally (peer disconnected)
-                                return Ok(());
-                            }
-                            Err(e) => {
-                                tracing::warn!(error = %e, "provider: relay upstream failed, re-establishing");
-                                // Check if peer is still alive before retrying
-                                // If peer.recv() would fail immediately, the peer is gone
-                                tokio::time::sleep(retry_delay).await;
-                                retry_delay = std::cmp::min(retry_delay * 2, MAX_RETRY_DELAY);
-                                // Continue loop to re-establish upstream
-                            }
-                        }
-                    }
-                }
-                .await;
-                relay_count.fetch_sub(1, Ordering::SeqCst);
-                match result {
-                    Ok(()) => {
-                        emit_peer_share_event(
-                            relay_logger.as_ref(),
-                            format!("relay loop completed for consumer={consumer_key}"),
-                        );
-                    }
-                    Err(err) => {
-                        warn!(error = %err, consumer = %consumer_key, "peer relay terminated");
-                        emit_peer_share_event(
-                            relay_logger.as_ref(),
-                            format!("relay terminated for consumer={consumer_key}: {err}"),
-                        );
-                    }
-                }
-            });
-        }
-    }))
+        // One claim set for the whole provider (shared with the relay
+        // tasks for release on end). The provider-path source falls back
+        // to the session-start config bind addresses when no live map
+        // was supplied (non-FFI clients).
+        let path_claims = Arc::new(std::sync::Mutex::new(RelayPathClaims::default()));
+        let path_source = provider_paths.unwrap_or_else(|| {
+            ProviderPathSource::Config(config.client.path_bind_addresses.clone())
+        });
+        let initial_ip = listener_advertise_ip.expect("provider mode requires advertise IP");
+        let initial_endpoint = listener_endpoint
+            .clone()
+            .expect("provider mode requires listener");
+        let initial_handle = tokio::spawn(run_peer_accept_loop(
+            initial_endpoint,
+            accept_server_key,
+            accept_identity.clone(),
+            accept_logger.clone(),
+            accept_max_consumers,
+            accept_bandwidth_kbps,
+            path_claims.clone(),
+            active_relays.clone(),
+            path_source.clone(),
+            config.clone(),
+        ));
+        Some(tokio::spawn(run_advertise_watcher(
+            config.clone(),
+            path_source,
+            accept_identity,
+            accept_logger,
+            accept_max_consumers,
+            accept_bandwidth_kbps,
+            path_claims,
+            active_relays,
+            listener_cert_der.expect("provider mode requires listener cert"),
+            listener_key_der.expect("provider mode requires listener key"),
+            listener_port.expect("provider mode requires listener port"),
+            initial_ip,
+            advertisement.clone().expect("provider mode requires advertisement"),
+            advertiser.expect("provider mode requires advertiser"),
+            vec![(initial_ip, initial_handle)],
+        )))
     } else {
         None
     };
@@ -601,21 +1040,95 @@ pub async fn start_peer_share_runtime(
                 format!("introduction issued for peer={peer_id}"),
             );
 
-            let transport = match connect_peer_relay(
-                &browse_server_key,
-                &advertisement.device_public_key,
-                &introduction,
-                browse_config.socket_protect.as_ref(),
-                browse_bind_ip,
-            )
-            .await
-            {
-                Ok(transport) => transport,
-                Err(err) => {
-                    warn!(error = %err, peer = %peer_id, "peer-share relay dial failed");
+            // One leg per provider path: dial legs with the same
+            // introduction until the provider answers no_path (every
+            // path has a leg) or a dial fails. A failed first leg
+            // keeps the old error path; a failed later leg keeps the
+            // legs already won (they converge to the full set at the
+            // next renewal, at most one introduction cycle away).
+            let relay_expires_at = introduction.introduction.expires_at;
+            let mut legs_dialed = 0usize;
+            let mut generation = 0u64;
+            let mut dial_failed = false;
+            let mut transport_channel_closed = false;
+            loop {
+                match connect_peer_relay(
+                    &browse_server_key,
+                    &advertisement.device_public_key,
+                    &introduction,
+                    browse_config.socket_protect.as_ref(),
+                    browse_bind_ip,
+                )
+                .await
+                {
+                    Ok(PeerRelayDial::Accepted(transport)) => {
+                        emit_peer_share_event(
+                            browse_logger.as_ref(),
+                            format!("relay dial succeeded for peer={peer_id}"),
+                        );
+                        if peer_transport_tx
+                            .send(ClientTransport::peer_relay(
+                                transport,
+                                peer_id.clone(),
+                                closed_peer_tx.clone(),
+                                relay_expires_at,
+                            ))
+                            .is_err()
+                        {
+                            transport_channel_closed = true;
+                            break;
+                        }
+                        legs_dialed += 1;
+                        generation = legs.note_dial(&peer_id, relay_expires_at);
+                    }
+                    Ok(PeerRelayDial::NoPath) => {
+                        break;
+                    }
+                    Err(err) => {
+                        if legs_dialed == 0 {
+                            warn!(error = %err, peer = %peer_id, "peer-share relay dial failed");
+                            emit_peer_share_event(
+                                browse_logger.as_ref(),
+                                format!("relay dial failed for peer={peer_id}: {err}"),
+                            );
+                            if is_redial {
+                                redials.requeue_failed(&advertisement);
+                            }
+                            if is_renewal {
+                                schedule_renewal_retry(&legs, &renewal_tx, &peer_id);
+                            }
+                            sleep(PEER_RUNTIME_RETRY_DELAY).await;
+                            dial_failed = true;
+                        } else {
+                            warn!(
+                                error = %err,
+                                peer = %peer_id,
+                                legs = legs_dialed,
+                                "peer-share additional leg dial failed; keeping legs won"
+                            );
+                            emit_peer_share_event(
+                                browse_logger.as_ref(),
+                                format!(
+                                    "additional leg dial failed for peer={peer_id}: {err}; keeping {legs_dialed} legs"
+                                ),
+                            );
+                        }
+                        break;
+                    }
+                }
+            }
+            if transport_channel_closed {
+                break;
+            }
+            if legs_dialed == 0 {
+                if !dial_failed {
+                    // NoPath on the very first leg: the provider has no
+                    // free path at all right now. Retry later like any
+                    // failed dial instead of spinning on discovery.
+                    warn!(peer = %peer_id, "peer-share relay dial refused: no free provider path");
                     emit_peer_share_event(
                         browse_logger.as_ref(),
-                        format!("relay dial failed for peer={peer_id}: {err}"),
+                        format!("relay dial refused for peer={peer_id}: no free provider path"),
                     );
                     if is_redial {
                         redials.requeue_failed(&advertisement);
@@ -624,28 +1137,10 @@ pub async fn start_peer_share_runtime(
                         schedule_renewal_retry(&legs, &renewal_tx, &peer_id);
                     }
                     sleep(PEER_RUNTIME_RETRY_DELAY).await;
-                    continue;
                 }
-            };
-            emit_peer_share_event(
-                browse_logger.as_ref(),
-                format!("relay dial succeeded for peer={peer_id}"),
-            );
-
-            let relay_expires_at = introduction.introduction.expires_at;
-            if peer_transport_tx
-                .send(ClientTransport::peer_relay(
-                    transport,
-                    peer_id.clone(),
-                    closed_peer_tx.clone(),
-                    relay_expires_at,
-                ))
-                .is_err()
-            {
-                break;
+                continue;
             }
             redials.forget(&peer_id);
-            let generation = legs.note_dial(&peer_id, relay_expires_at);
             spawn_renewal_notice(
                 &renewal_tx,
                 peer_id.clone(),
@@ -665,24 +1160,24 @@ pub async fn start_peer_share_runtime(
     };
 
     let mut tasks = Vec::new();
-    if let Some(task) = accept_task {
+    if let Some(task) = watcher_task {
         tasks.push(task);
     }
     if let Some(task) = browse_task {
         tasks.push(task);
     }
 
-    Ok(PeerShareRuntime {
-        tasks,
-        _listener_endpoint: listener_endpoint,
-    })
+    // Endpoints are owned by their accept loops (spawned by the watcher),
+    // never by the runtime struct, so pruning an endpoint actually tears
+    // it down instead of lingering on a struct-kept clone.
+    Ok(PeerShareRuntime { tasks })
 }
 
-async fn establish_peer_upstream_paths(
-    config: &ClientConfig,
-) -> anyhow::Result<Vec<ClientTransport>> {
-    let mut peer_config = config.clone();
-    let filtered: Vec<String> = peer_config
+/// Upstream protocols for relay legs: QUIC/WebSocket only, no
+/// NaiveTCP (the old single-upstream restriction, kept for pinned
+/// upstreams too).
+fn relay_upstream_protocols(config: &ClientConfig) -> Vec<String> {
+    let filtered: Vec<String> = config
         .client
         .preferred_protocols
         .iter()
@@ -694,11 +1189,58 @@ async fn establish_peer_upstream_paths(
         })
         .cloned()
         .collect();
-    peer_config.client.preferred_protocols = if filtered.is_empty() {
+    if filtered.is_empty() {
         vec!["wss".to_owned(), "h3".to_owned()]
     } else {
         filtered
+    }
+}
+
+/// Establish one relay upstream pinned to a claimed provider path:
+/// the path's current bind address (re-read per attempt) via the
+/// single-path dial. A stale/unassignable bind address fails fast
+/// inside that dial (pre-flight), so the task's retry loop paces
+/// re-establishment instead of burning establish timeouts. The
+/// unpinned slot falls back to the old any-path upstream.
+async fn establish_relay_upstream(
+    config: &ClientConfig,
+    paths: &ProviderPathSource,
+    claimed_index: usize,
+) -> anyhow::Result<ClientTransport> {
+    if claimed_index == UNPINNED_PATH_INDEX {
+        let mut upstreams = establish_peer_upstream_paths(config).await?;
+        return upstreams
+            .into_iter()
+            .next()
+            .context("peer-share relay accept produced no upstream transport paths");
+    }
+    let mut relay_config = config.clone();
+    relay_config.client.preferred_protocols = relay_upstream_protocols(config);
+    let Some(address) = paths.address_for(claimed_index) else {
+        anyhow::bail!("claimed provider path {claimed_index} is no longer listed");
     };
+    let mut observer = |_: String| {};
+    match establish_single_transport_path(
+        &relay_config,
+        claimed_index,
+        1,
+        Some(&address),
+        &mut observer,
+    )
+    .await?
+    {
+        SinglePathResult::Connected(transport) => Ok(transport),
+        SinglePathResult::Failed(reason) => Err(anyhow::anyhow!(
+            "relay upstream for path {claimed_index} failed: {reason}"
+        )),
+    }
+}
+
+async fn establish_peer_upstream_paths(
+    config: &ClientConfig,
+) -> anyhow::Result<Vec<ClientTransport>> {
+    let mut peer_config = config.clone();
+    peer_config.client.preferred_protocols = relay_upstream_protocols(config);
     Ok(establish_transport_paths(&peer_config, 1)
         .await?
         .into_iter()
@@ -706,13 +1248,36 @@ async fn establish_peer_upstream_paths(
         .collect())
 }
 
+/// Bind a peer-share QUIC listener endpoint with an existing certificate.
+/// Re-binds reuse the original cert, so the listener fingerprint consumers
+/// pin never changes across re-advertises.
+fn bind_peer_listener_endpoint(
+    cert_der: Vec<u8>,
+    key_der: Vec<u8>,
+    bind_addr: SocketAddr,
+    socket_protect: Option<&SocketProtectFn>,
+) -> anyhow::Result<quinn::Endpoint> {
+    quinn::Endpoint::new(
+        Default::default(),
+        Some(build_peer_server_config(cert_der, key_der)),
+        bind_peer_listener_socket(bind_addr, socket_protect)?,
+        Arc::new(quinn::TokioRuntime),
+    )
+    .map_err(|err| anyhow::anyhow!("failed to bind peer-share listener on {bind_addr}: {err}"))
+}
+
 fn build_listener_runtime(
     config: &ClientConfig,
     device_keypair: &DeviceKeypair,
+    provider_paths: Option<&ProviderPathSource>,
 ) -> anyhow::Result<(
     quinn::Endpoint,
     PeerListenerIdentity,
     PeerShareAdvertisement,
+    Vec<u8>,
+    Vec<u8>,
+    IpAddr,
+    u16,
 )> {
     let cert = generate_simple_self_signed(vec!["127.0.0.1".to_owned()])
         .context("failed to generate peer-share listener certificate")?;
@@ -730,21 +1295,36 @@ fn build_listener_runtime(
                     config.client.peer_share_bind_address
                 )
             })?;
-    let advertise_ip = resolve_advertise_ip(config, &enumerate_interfaces(), bind_addr)?;
+    // The initial selection prefers the live path set when one was
+    // supplied (same basis the advertise watcher re-resolves on), so the
+    // first advertisement already matches the watcher's steady state.
+    let binds: Vec<String> = match provider_paths {
+        Some(ProviderPathSource::Live(map)) => map
+            .read()
+            .expect("live path map lock poisoned")
+            .values()
+            .cloned()
+            .collect(),
+        Some(ProviderPathSource::Config(addresses)) => addresses.clone(),
+        None => config.client.path_bind_addresses.clone(),
+    };
+    let advertise_ip = resolve_advertise_ip(
+        &config.client.peer_share_advertise_ip,
+        bind_addr,
+        &binds,
+        &enumerate_interfaces(),
+    )?;
     let listener_bind_addr = match bind_addr.ip() {
         IpAddr::V4(ip) if ip.is_unspecified() => SocketAddr::new(advertise_ip, bind_addr.port()),
         IpAddr::V6(ip) if ip.is_unspecified() => SocketAddr::new(advertise_ip, bind_addr.port()),
         _ => bind_addr,
     };
-    let endpoint = quinn::Endpoint::new(
-        Default::default(),
-        Some(build_peer_server_config(cert_der, key_der)),
-        bind_peer_listener_socket(listener_bind_addr, config.socket_protect.as_ref())?,
-        Arc::new(quinn::TokioRuntime),
-    )
-    .map_err(|err| {
-        anyhow::anyhow!("failed to bind peer-share listener on {listener_bind_addr}: {err}")
-    })?;
+    let endpoint = bind_peer_listener_endpoint(
+        cert_der.clone(),
+        key_der.clone(),
+        listener_bind_addr,
+        config.socket_protect.as_ref(),
+    )?;
     let listen_addr = endpoint.local_addr()?;
     let endpoint_str = SocketAddr::new(advertise_ip, listen_addr.port()).to_string();
     let instance_nonce = create_auth_challenge();
@@ -763,7 +1343,15 @@ fn build_listener_runtime(
         listener_cert_fingerprint: fingerprint,
         capabilities: vec!["relay".to_owned(), "quic".to_owned()],
     };
-    Ok((endpoint, listener_identity, advertisement))
+    Ok((
+        endpoint,
+        listener_identity,
+        advertisement,
+        cert_der,
+        key_der,
+        advertise_ip,
+        listen_addr.port(),
+    ))
 }
 
 fn bind_peer_listener_socket(
@@ -900,21 +1488,15 @@ fn should_accept_discovered_peer(
 }
 
 fn resolve_advertise_ip(
-    config: &ClientConfig,
-    interfaces: &[NetworkInterface],
+    explicit_ip: &str,
     listen_addr: SocketAddr,
+    binds: &[String],
+    interfaces: &[NetworkInterface],
 ) -> anyhow::Result<IpAddr> {
-    if !config.client.peer_share_advertise_ip.trim().is_empty() {
-        return config
-            .client
-            .peer_share_advertise_ip
+    if !explicit_ip.trim().is_empty() {
+        return explicit_ip
             .parse()
-            .with_context(|| {
-                format!(
-                    "invalid peer_share_advertise_ip: {}",
-                    config.client.peer_share_advertise_ip
-                )
-            });
+            .with_context(|| format!("invalid peer_share_advertise_ip: {explicit_ip}"));
     }
 
     match listen_addr.ip() {
@@ -928,20 +1510,50 @@ fn resolve_advertise_ip(
         .flat_map(|interface| interface.ips.iter())
         .map(|network| network.ip())
         .collect();
-    // Prefer an address on the same link as one of the client's server
-    // paths. Interface enumeration order is arbitrary, and on Android it
-    // includes the VPN's own tunnel interface — whose address is not a
-    // LAN address a peer can dial (and is identical on every client), so
-    // first-bindable-wins can advertise the tunnel address and make the
-    // provider unreachable. A candidate sharing a /24 with a configured
-    // path bind address is on the link the client actually uses.
-    if let Some(ip) = prefer_path_subnet_candidate(&candidates, &config.client.path_bind_addresses)
-    {
-        return Ok(ip);
-    }
-    select_advertise_ip(&candidates).ok_or_else(|| {
+    select_advertise_ip_for_binds(binds, &candidates).ok_or_else(|| {
         anyhow::anyhow!("failed to determine a non-loopback peer-share advertise IP")
     })
+}
+
+/// Pick the advertise IP from interface candidates given the provider's
+/// path bind addresses: prefer an address on the same link as one of the
+/// client's server paths, else the default selection. Interface
+/// enumeration order is arbitrary, and on Android it includes the VPN's
+/// own tunnel interface — whose address is not a LAN address a peer can
+/// dial (and is identical on every client), so first-bindable-wins can
+/// advertise the tunnel address and make the provider unreachable. A
+/// candidate sharing a /24 with a path bind address is on the link the
+/// client actually uses.
+fn select_advertise_ip_for_binds(binds: &[String], candidates: &[IpAddr]) -> Option<IpAddr> {
+    prefer_path_subnet_candidate(candidates, binds).or_else(|| select_advertise_ip(candidates))
+}
+
+/// Recompute the provider's advertise IP from the CURRENT path set and
+/// interfaces (the advertise watcher's view). Returns None when no
+/// bindable address exists or a configured value cannot be parsed; the
+/// caller then keeps the current advertisement. Pinned configurations
+/// (explicit advertise IP or explicit bind address) always return the
+/// pinned IP, so the watcher is a no-op for them. The live path set is
+/// used for the subnet preference (not the session-start config), so a
+/// path change that moves the provider to a new subnet re-selects onto
+/// the new link instead of clinging to the old one.
+fn desired_advertise_ip(
+    config: &ClientConfig,
+    path_source: &ProviderPathSource,
+    interfaces: &[NetworkInterface],
+) -> Option<IpAddr> {
+    let binds: Vec<String> = match path_source {
+        ProviderPathSource::Live(map) => map.read().ok()?.values().cloned().collect(),
+        ProviderPathSource::Config(addresses) => addresses.clone(),
+    };
+    let bind_addr = config.client.peer_share_bind_address.parse::<SocketAddr>().ok()?;
+    resolve_advertise_ip(
+        &config.client.peer_share_advertise_ip,
+        bind_addr,
+        &binds,
+        interfaces,
+    )
+    .ok()
 }
 
 /// Pick the first bindable IPv4 candidate that shares its /24 with one of
@@ -1040,11 +1652,11 @@ mod tests {
     use bonded_core::auth::verify_signature;
 
     use super::{
-        build_peer_introduction_request, introduction_expired, peer_share_peer_id,
-        prefer_path_subnet_candidate, renewal_delay, resolve_advertise_ip,
-        select_advertise_ip, should_accept_discovered_peer, PeerLegTracker, RedialQueue,
-        PEER_REDISCOVERY_MAX_ATTEMPTS, PEER_RELAY_RENEWAL_LEAD_SECS,
-        PEER_RELAY_RENEWAL_MIN_DELAY,
+        build_peer_introduction_request, introduction_expired, keep_accept_loop,
+        peer_share_peer_id, prefer_path_subnet_candidate, renewal_delay, resolve_advertise_ip,
+        select_advertise_ip, select_advertise_ip_for_binds, should_accept_discovered_peer,
+        PeerLegTracker, RedialQueue, RelayPathClaims, PEER_REDISCOVERY_MAX_ATTEMPTS,
+        PEER_RELAY_RENEWAL_LEAD_SECS, PEER_RELAY_RENEWAL_MIN_DELAY,
     };
     use bonded_core::auth::DeviceKeypair;
     use bonded_core::config::{ClientConfig, PeerShareMode};
@@ -1076,6 +1688,45 @@ mod tests {
         // A close for an unknown peer still signals rediscovery (the
         // pre-tracker behaviour for late close notices).
         assert!(tracker.note_close("peer-never-seen"));
+    }
+
+    #[test]
+    fn relay_path_claims_take_paths_in_order_then_stop() {
+        let mut claims = RelayPathClaims::default();
+        assert_eq!(claims.claim("consumer-a", &[0, 1], 1_000), Some(0));
+        assert_eq!(claims.claim("consumer-a", &[0, 1], 1_000), Some(1));
+        assert_eq!(claims.claim("consumer-a", &[0, 1], 1_000), None);
+        assert_eq!(claims.consumer_count(), 1);
+        assert!(claims.has_consumer("consumer-a"));
+    }
+
+    #[test]
+    fn relay_path_claims_newer_generation_takes_over_older_releases_cleanly() {
+        let mut claims = RelayPathClaims::default();
+        assert_eq!(claims.claim("consumer-a", &[0, 1], 1_000), Some(0));
+        // Same generation cannot take over its own claim.
+        assert_eq!(claims.claim("consumer-a", &[0, 1], 1_000), Some(1));
+        assert_eq!(claims.claim("consumer-a", &[0, 1], 1_000), None);
+        // Renewal generation takes over path 0; the old leg's release
+        // is then a no-op because the expiry no longer matches.
+        assert_eq!(claims.claim("consumer-a", &[0, 1], 1_300), Some(0));
+        claims.release("consumer-a", 0, 1_000);
+        assert_eq!(claims.claim("consumer-a", &[0, 1], 1_300), Some(1));
+        assert_eq!(claims.claim("consumer-a", &[0, 1], 1_300), None);
+        // Releasing the newer legs empties the consumer entry, so the
+        // consumer count (the provider's cap) stays exact.
+        claims.release("consumer-a", 0, 1_300);
+        claims.release("consumer-a", 1, 1_300);
+        assert_eq!(claims.consumer_count(), 0);
+        assert!(!claims.has_consumer("consumer-a"));
+    }
+
+    #[test]
+    fn relay_path_claims_failed_claim_creates_no_consumer_entry() {
+        let mut claims = RelayPathClaims::default();
+        assert_eq!(claims.claim("consumer-a", &[], 1_000), None);
+        assert_eq!(claims.consumer_count(), 0);
+        assert!(!claims.has_consumer("consumer-a"));
     }
 
     #[test]
@@ -1250,12 +1901,11 @@ mod tests {
 
     #[test]
     fn advertise_ip_uses_explicit_override() {
-        let mut config = ClientConfig::default();
-        config.client.peer_share_advertise_ip = "127.0.0.1".to_owned();
         let ip = resolve_advertise_ip(
-            &config,
-            &Vec::<NetworkInterface>::new(),
+            "127.0.0.1",
             SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 54443),
+            &[],
+            &Vec::<NetworkInterface>::new(),
         )
         .expect("override should parse");
         assert_eq!(ip, IpAddr::V4(Ipv4Addr::LOCALHOST));
@@ -1328,5 +1978,57 @@ mod tests {
     fn advertise_ip_rejects_loopback_only() {
         let candidates = vec![IpAddr::V4(Ipv4Addr::LOCALHOST)];
         assert_eq!(select_advertise_ip(&candidates), None);
+    }
+
+    #[test]
+    fn advertise_ip_for_binds_prefers_path_subnet_over_first_bindable() {
+        // Same shape as the Android failure mode, through the shared
+        // selection helper the watcher re-resolves on: the tunnel
+        // address sorts first in enumeration, but the Wi-Fi address
+        // shares a /24 with a live path bind and must win.
+        let candidates = vec![
+            IpAddr::V4(Ipv4Addr::new(10, 8, 0, 2)),
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 140)),
+        ];
+        let binds = vec!["192.168.1.140".to_owned()];
+        assert_eq!(
+            select_advertise_ip_for_binds(&binds, &candidates),
+            Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 140)))
+        );
+        // Without a matching bind, the first bindable address wins.
+        assert_eq!(
+            select_advertise_ip_for_binds(&[], &candidates),
+            Some(IpAddr::V4(Ipv4Addr::new(10, 8, 0, 2)))
+        );
+    }
+
+    #[test]
+    fn accept_loop_prune_keeps_current_and_live_only() {
+        let current = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10));
+        let live: std::collections::HashSet<IpAddr> = [
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)),
+        ]
+        .into_iter()
+        .collect();
+        // The newly advertised IP survives even if enumeration has not
+        // caught up with it yet.
+        assert!(keep_accept_loop(
+            IpAddr::V4(Ipv4Addr::new(172, 16, 0, 9)),
+            IpAddr::V4(Ipv4Addr::new(172, 16, 0, 9)),
+            &live
+        ));
+        // A surviving address keeps its loop (existing legs undisturbed).
+        assert!(keep_accept_loop(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)),
+            current,
+            &live
+        ));
+        // A dead address loses its loop.
+        assert!(!keep_accept_loop(
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 99)),
+            current,
+            &live
+        ));
     }
 }

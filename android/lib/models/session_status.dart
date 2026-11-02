@@ -16,6 +16,11 @@ class PathStat {
   /// (older servers never report one).
   final String? serverSeenAddress;
 
+  /// Provider device key for peer-relay transports; null for direct
+  /// transports. Several legs share one peer id when the provider has
+  /// several paths.
+  final String? peerId;
+
   const PathStat({
     required this.pathIndex,
     required this.kind,
@@ -25,6 +30,7 @@ class PathStat {
     required this.inboundBytes,
     required this.lastRttMs,
     required this.serverSeenAddress,
+    this.peerId,
   });
 
   factory PathStat.fromMap(Map<dynamic, dynamic> map) {
@@ -40,10 +46,18 @@ class PathStat {
           (map['serverSeenAddress'] as String?)?.trim().isNotEmpty == true
           ? map['serverSeenAddress'] as String
           : null,
+      peerId: (map['peerId'] as String?)?.trim().isNotEmpty == true
+          ? map['peerId'] as String
+          : null,
     );
   }
 
   bool get isDirect => pathIndex != null;
+
+  /// True for peer-relay transports. Relays are full transports for
+  /// spreading and failover; they are only listed separately in the
+  /// UI, not ranked below direct paths.
+  bool get isPeerRelay => peerId != null;
 
   /// Just the IP of [serverSeenAddress] (the public egress address for
   /// this path), without the ephemeral source port.
@@ -176,8 +190,14 @@ class SessionStatus {
   bool get isConnecting => state == 'connecting';
   bool get isError => state == 'error';
 
-  /// Direct paths only (peer relays are not user-facing paths).
+  /// Direct paths only; peer relays live in [peerTransports] and get
+  /// their own list in the UI.
   List<PathStat> get directPaths => paths.where((p) => p.isDirect).toList();
+
+  /// Peer-relay transports (one per provider path), listed separately
+  /// from direct paths in the UI.
+  List<PathStat> get peerTransports =>
+      paths.where((p) => p.isPeerRelay).toList();
 
   PathStat? get activePath {
     for (final path in paths) {

@@ -28,6 +28,25 @@ pub struct AcceptedPeerRelay {
     pub introduction: SignedPeerShareIntroduction,
 }
 
+/// The provider's verdict on a dialed leg, parsed from its
+/// accept-response text. Pure, so the dial loop's stop signal is
+/// unit-testable without a QUIC connection.
+#[derive(Debug, PartialEq, Eq)]
+enum RelayAcceptVerdict {
+    Ok,
+    NoPath,
+    Rejected,
+}
+
+fn parse_relay_accept_response(text: &str) -> anyhow::Result<RelayAcceptVerdict> {
+    let response: PeerRelayAcceptResponse = serde_json::from_str(text)?;
+    Ok(match response.status.as_str() {
+        "ok" => RelayAcceptVerdict::Ok,
+        "no_path" => RelayAcceptVerdict::NoPath,
+        _ => RelayAcceptVerdict::Rejected,
+    })
+}
+
 pub fn verify_consumer_introduction(
     server_public_key: &str,
     expected_provider_device_public_key: &str,
@@ -73,7 +92,7 @@ pub async fn connect_peer_relay(
     introduction: &SignedPeerShareIntroduction,
     socket_protect: Option<&SocketProtectFn>,
     bind_ip: Option<IpAddr>,
-) -> anyhow::Result<QuicTransport> {
+) -> anyhow::Result<PeerRelayDial> {
     verify_consumer_introduction(
         server_public_key,
         expected_provider_device_public_key,
@@ -117,14 +136,28 @@ pub async fn connect_peer_relay(
     transport
         .send_text(&serde_json::to_string(introduction)?)
         .await?;
-    let response: PeerRelayAcceptResponse = serde_json::from_str(&transport.recv_text().await?)?;
-    if response.status != "ok" {
-        anyhow::bail!("peer relay listener rejected introduction");
+    match parse_relay_accept_response(&transport.recv_text().await?)? {
+        RelayAcceptVerdict::Ok => Ok(PeerRelayDial::Accepted(transport)),
+        RelayAcceptVerdict::NoPath => Ok(PeerRelayDial::NoPath),
+        RelayAcceptVerdict::Rejected => {
+            anyhow::bail!("peer relay listener rejected introduction")
+        }
     }
-
-    Ok(transport)
 }
 
+/// Outcome of dialing a peer relay: either the provider accepted the
+/// leg, or it has no free provider path left for this consumer (the
+/// dial-until-reject stop signal: the consumer already holds a leg for
+/// every provider path).
+pub enum PeerRelayDial {
+    Accepted(QuicTransport),
+    NoPath,
+}
+
+/// Verify a dialed leg's introduction against the listener identity.
+/// Unlike the old accept path, this does NOT send the accept response:
+/// the accept task sends it only after the consumer-cap and path-claim
+/// checks, so a rejected leg never looks accepted to the consumer.
 pub async fn accept_peer_relay(
     server_public_key: &str,
     listener: &PeerListenerIdentity,
@@ -134,7 +167,6 @@ pub async fn accept_peer_relay(
     let introduction: SignedPeerShareIntroduction =
         serde_json::from_str(&transport.recv_text().await?)?;
     verify_provider_introduction(server_public_key, listener, &introduction)?;
-    transport.send_text(r#"{"status":"ok"}"#).await?;
     Ok(AcceptedPeerRelay {
         transport,
         introduction,
@@ -306,9 +338,10 @@ fn parse_peer_endpoint(endpoint: &str) -> anyhow::Result<SocketAddr> {
 #[cfg(test)]
 mod tests {
     use super::{
-        accept_peer_relay, connect_peer_relay, register_peer_relay_upstream, relay_peer_frames,
-        verify_consumer_introduction, verify_provider_introduction, AcceptedPeerRelay,
-        PeerListenerIdentity, PeerRelayRateLimiter,
+        accept_peer_relay, connect_peer_relay, parse_relay_accept_response,
+        register_peer_relay_upstream, relay_peer_frames, verify_consumer_introduction,
+        verify_provider_introduction, AcceptedPeerRelay, PeerListenerIdentity, PeerRelayDial,
+        PeerRelayRateLimiter, RelayAcceptVerdict,
     };
     use bonded_core::auth::{sign_bytes, DeviceKeypair};
     use bonded_core::peer_share::{
@@ -483,6 +516,10 @@ mod tests {
                 accept_peer_relay(&server_public_key, &listener_identity, connection)
                     .await
                     .expect("provider should accept peer relay introduction");
+            transport
+                .send_text(r#"{"status":"ok"}"#)
+                .await
+                .expect("provider should send accept response");
             let frame = transport
                 .recv()
                 .await
@@ -507,7 +544,7 @@ mod tests {
             let _ = shutdown_rx.await;
         });
 
-        let mut consumer = connect_peer_relay(
+        let PeerRelayDial::Accepted(mut consumer) = connect_peer_relay(
             &server_identity.public_key_b64,
             &provider_key,
             &introduction,
@@ -515,7 +552,9 @@ mod tests {
             None,
         )
         .await
-        .expect("consumer should connect peer relay");
+        .expect("consumer should connect peer relay") else {
+            panic!("provider should accept the relay leg");
+        };
         consumer
             .send(SessionFrame {
                 header: SessionHeader {
@@ -593,6 +632,9 @@ mod tests {
             } = accept_peer_relay(&server_public_key, &listener_identity, connection)
                 .await
                 .expect("provider should accept peer relay introduction");
+            peer.send_text(r#"{"status":"ok"}"#)
+                .await
+                .expect("provider should send accept response");
             let mut upstream = provider_upstream;
             let relay_result = timeout(
                 Duration::from_secs(5),
@@ -603,7 +645,7 @@ mod tests {
             relay_result.expect_err("relay loop should stop once test channels close");
         });
 
-        let mut consumer = connect_peer_relay(
+        let PeerRelayDial::Accepted(mut consumer) = connect_peer_relay(
             &server_identity.public_key_b64,
             &provider_key,
             &introduction,
@@ -611,7 +653,9 @@ mod tests {
             None,
         )
         .await
-        .expect("consumer should connect peer relay");
+        .expect("consumer should connect peer relay") else {
+            panic!("provider should accept the relay leg");
+        };
         consumer
             .send(SessionFrame {
                 header: SessionHeader {
@@ -790,5 +834,26 @@ mod tests {
         fn kind(&self) -> TransportKind {
             self.kind
         }
+    }
+
+    #[test]
+    fn accept_response_parsing_maps_statuses() {
+        assert_eq!(
+            parse_relay_accept_response(r#"{"status":"ok"}"#).unwrap(),
+            RelayAcceptVerdict::Ok
+        );
+        assert_eq!(
+            parse_relay_accept_response(r#"{"status":"no_path"}"#).unwrap(),
+            RelayAcceptVerdict::NoPath
+        );
+        assert_eq!(
+            parse_relay_accept_response(r#"{"status":"rejected"}"#).unwrap(),
+            RelayAcceptVerdict::Rejected
+        );
+        assert_eq!(
+            parse_relay_accept_response(r#"{"status":"weird"}"#).unwrap(),
+            RelayAcceptVerdict::Rejected
+        );
+        assert!(parse_relay_accept_response("not json").is_err());
     }
 }

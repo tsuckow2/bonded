@@ -63,6 +63,8 @@ data class SessionPathStat(
         val lastRttMs: Long,
         /** "IP:port" source address the server sees for this path, or null. */
         val serverSeenAddress: String?,
+        /** Provider device key for peer-relay transports; null for direct transports. */
+        val peerId: String? = null,
 )
 
 class BondedVpnService : VpnService() {
@@ -581,6 +583,9 @@ class BondedVpnService : VpnService() {
                             serverSeenAddress =
                                     if (item.isNull("serverSeenAddress")) null
                                     else item.optString("serverSeenAddress").takeIf { it.isNotEmpty() },
+                            peerId =
+                                    if (item.isNull("peerId")) null
+                                    else item.optString("peerId").takeIf { it.isNotEmpty() },
                     )
             )
         }
@@ -1311,6 +1316,7 @@ class BondedVpnService : VpnService() {
                                         "inboundBytes" to path.inboundBytes,
                                         "lastRttMs" to path.lastRttMs,
                                         "serverSeenAddress" to path.serverSeenAddress,
+                                        "peerId" to path.peerId,
                                 )
                             },
             )

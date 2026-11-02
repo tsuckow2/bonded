@@ -463,6 +463,11 @@ struct AndroidPathStat {
     /// the path's public egress address. `None` until a stamped pong
     /// arrives — servers older than the pong stamp never send one.
     server_seen_address: Option<String>,
+    /// Provider device key for peer-relay transports; `None` for
+    /// direct transports. The peer-connections list groups legs by
+    /// this id (several legs share one peer id when the provider has
+    /// several paths).
+    peer_id: Option<String>,
 }
 
 #[cfg(any(target_os = "android", test))]
@@ -626,8 +631,13 @@ fn snapshot_json(snapshot: &AndroidSessionSnapshot) -> String {
                 .as_ref()
                 .map(|addr| format!("\"{}\"", escape_json(addr)))
                 .unwrap_or_else(|| "null".to_owned());
+            let peer_id = stat
+                .peer_id
+                .as_ref()
+                .map(|id| format!("\"{}\"", escape_json(id)))
+                .unwrap_or_else(|| "null".to_owned());
             format!(
-                "{{\"pathIndex\":{},\"kind\":\"{}\",\"active\":{},\"paused\":{},\"outboundBytes\":{},\"inboundBytes\":{},\"lastRttMs\":{},\"serverSeenAddress\":{}}}",
+                "{{\"pathIndex\":{},\"kind\":\"{}\",\"active\":{},\"paused\":{},\"outboundBytes\":{},\"inboundBytes\":{},\"lastRttMs\":{},\"serverSeenAddress\":{},\"peerId\":{}}}",
                 path_index,
                 escape_json(&stat.kind),
                 stat.active,
@@ -636,6 +646,7 @@ fn snapshot_json(snapshot: &AndroidSessionSnapshot) -> String {
                 stat.inbound_bytes,
                 stat.last_rtt_ms,
                 server_seen,
+                peer_id,
             )
         })
         .collect::<Vec<_>>()
@@ -680,21 +691,6 @@ fn client_transport_kind(transport: &ClientTransport) -> &'static str {
         ClientTransport::PeerRelay { .. } => "PeerRelay",
         ClientTransport::WireGuard(_) => "WireGuard",
     }
-}
-
-/// Indices of the direct (non-peer-relay) transports, in vec order.
-/// These are the paths eligible for multipath flow spreading; relay
-/// transports keep active/standby semantics.
-#[cfg(any(target_os = "android", test))]
-fn direct_transport_indices(transports: &[ClientTransport]) -> Vec<usize> {
-    transports
-        .iter()
-        .enumerate()
-        .filter(|(_, transport)| {
-            !matches!(transport, ClientTransport::PeerRelay { .. })
-        })
-        .map(|(index, _)| index)
-        .collect()
 }
 
 /// Diff a path-set change against the worker's desired-path map
@@ -958,6 +954,12 @@ fn publish_path_stats(
                     last_rtt_ms: prior.map(|stat| stat.last_rtt_ms).unwrap_or(0),
                     server_seen_address: prior
                         .and_then(|stat| stat.server_seen_address.clone()),
+                    peer_id: match transport {
+                        ClientTransport::PeerRelay { peer_id, .. } => {
+                            Some(peer_id.clone())
+                        }
+                        _ => None,
+                    },
                 }
             })
             .collect();
@@ -1256,6 +1258,32 @@ fn start_android_session(
                     return;
                 }
             };
+            // Desired direct paths, by durable path index: the bind
+            // address for every path this session wants, whether or
+            // not it established (a path missing at start is still
+            // desired — the supervisor dials it). This map is the
+            // path-set change's source of truth, shared with the
+            // supervisor (which reads it at dial time, since the
+            // session-start config is frozen) and with the peer-share
+            // runtime (which reads it to claim one relay upstream per
+            // live provider path). Paths with no config entry are
+            // unbound (default-network dials) and have no entry here;
+            // they are never removed by a path-set diff. Created here,
+            // ahead of the peer runtime start, so the runtime can
+            // share it.
+            let path_addresses: Arc<
+                std::sync::RwLock<std::collections::HashMap<usize, String>>,
+            > = Arc::new(std::sync::RwLock::new(
+                (0..requested_paths)
+                    .filter_map(|path_index| {
+                        config
+                            .client
+                            .path_bind_addresses
+                            .get(path_index)
+                            .map(|address| (path_index, address.clone()))
+                    })
+                    .collect(),
+            ));
             let (peer_transport_tx, mut peer_transport_rx) = tokio::sync::mpsc::unbounded_channel();
             let _peer_transport_hold = peer_transport_tx.clone();
             let _peer_share_runtime = if config.client.peer_share_enabled {
@@ -1275,7 +1303,13 @@ fn start_android_session(
                             .max(session_snapshot.accepted_peer_relay_count);
                     });
                 });
-                match peer_runtime::start_peer_share_runtime(&config, peer_transport_tx, Some(peer_logger)).await {
+                match peer_runtime::start_peer_share_runtime(
+                    &config,
+                    peer_transport_tx,
+                    Some(peer_logger),
+                    Some(peer_runtime::ProviderPathSource::Live(path_addresses.clone())),
+                )
+                .await {
                     Ok(runtime) => Some(runtime),
                     Err(err) => {
                         // Peer-share is an enhancement, not the session itself:
@@ -1465,28 +1499,6 @@ fn start_android_session(
             // them (see order_candidates_for_send).
             let mut paused_paths: std::collections::HashSet<usize> =
                 std::collections::HashSet::new();
-            // Desired direct paths, by durable path index: the bind
-            // address for every path this session wants, whether or
-            // not it established (a path missing at start is still
-            // desired — the supervisor dials it). This map is the
-            // path-set change's source of truth, shared with the
-            // supervisor (which reads it at dial time, since the
-            // session-start config is frozen). Paths with no config
-            // entry are unbound (default-network dials) and have no
-            // entry here; they are never removed by a path-set diff.
-            let path_addresses: Arc<
-                std::sync::RwLock<std::collections::HashMap<usize, String>>,
-            > = Arc::new(std::sync::RwLock::new(
-                (0..requested_paths)
-                    .filter_map(|path_index| {
-                        config
-                            .client
-                            .path_bind_addresses
-                            .get(path_index)
-                            .map(|address| (path_index, address.clone()))
-                    })
-                    .collect(),
-            ));
             let (path_lost_tx, path_lost_rx) =
                 tokio::sync::mpsc::unbounded_channel::<usize>();
             let (redial_outcome_tx, mut redial_outcome_rx) =
@@ -1527,7 +1539,7 @@ fn start_android_session(
             let mut session = SessionState::new(session_id);
             let mut ping_sequence = 0u64;
             let mut last_ping_sent_ms: Option<u64> = None;
-            // Consecutive heartbeat ping failures per direct standby
+            // Consecutive heartbeat ping failures per standby
             // transport index. Indices are only stable while the
             // transport set keeps its size, so the map is cleared
             // whenever the count changes (checked each tick).
@@ -1978,22 +1990,28 @@ fn start_android_session(
 
                                 let packet_len = packet.len() as u64;
                                 // Multipath spreading: pin this packet's
-                                // flow to a direct transport by hash, so
-                                // every direct path carries real traffic
-                                // instead of only the active one. Candidates
-                                // are the hashed pick first, then the other
-                                // direct transports, then the active
-                                // transport as a last resort (which also
-                                // covers the relay-only case). With a
-                                // single direct transport this reduces to
-                                // exactly the pre-multipath behavior.
+                                // flow to a transport by hash, so every
+                                // path carries real traffic instead of
+                                // only the active one. Transports are
+                                // treated equally here — direct and
+                                // peer-relay alike — so future load
+                                // balancing and failover changes inherit
+                                // that equality instead of re-adding a
+                                // direct-only filter. Candidates are the
+                                // hashed pick first, then the other
+                                // transports, then the active transport
+                                // as a last resort. With a single
+                                // transport this reduces to exactly the
+                                // pre-multipath behavior.
                                 let flow = bonded_core::flow::flow_hash(&packet);
                                 let frame = session.create_outbound_frame(Bytes::from(packet), 0);
                                 // Paused paths go last in the try-list:
                                 // they stay connected, but a healthy path
-                                // is always tried first.
+                                // is always tried first. (Relays never
+                                // report paused: pause is per path index
+                                // and relays have none.)
                                 let mut candidates = order_candidates_for_send(
-                                    direct_transport_indices(&transports),
+                                    (0..transports.len()).collect(),
                                     |vec_index| {
                                         path_index_map
                                             .path_of(vec_index)
@@ -2295,16 +2313,13 @@ fn start_android_session(
                                         path_index,
                                         err
                                     );
-                                    // Standby direct paths only: the
+                                    // Standby transports only: the
                                     // active path's failures drive
-                                    // failover directly, and peer relays
-                                    // have their own retirement below.
-                                    if path_index != active_index
-                                        && !matches!(
-                                            transport,
-                                            ClientTransport::PeerRelay { .. }
-                                        )
-                                    {
+                                    // failover directly. Relay legs count
+                                    // here exactly like direct standbys
+                                    // (their expiry/closed-connection
+                                    // retirement below still applies).
+                                    if path_index != active_index {
                                         *standby_ping_failures
                                             .entry(path_index)
                                             .or_default() += 1;
@@ -2343,19 +2358,17 @@ fn start_android_session(
                             let expired = transports[index].peer_relay_expired(now_secs);
                             let connection_closed =
                                 transports[index].peer_relay_connection_closed();
-                            // A direct standby whose heartbeat ping has
+                            // A standby whose heartbeat ping has
                             // failed on two consecutive ticks is dead:
                             // evict it so the snapshot stops counting it
                             // and failover never promotes a corpse. (The
                             // server reaps silently, so an un-evicted
                             // zombie otherwise lingers indefinitely; the
                             // removal below also notifies the F4 path
-                            // supervisor, which re-dials the path in
-                            // place.)
-                            let standby_dead = !matches!(
-                                transports[index],
-                                ClientTransport::PeerRelay { .. }
-                            ) && standby_ping_failures
+                            // supervisor for direct paths, which re-dials
+                            // the path in place, and closes a relay leg
+                            // so the peer runtime re-discovers it.)
+                            let standby_dead = standby_ping_failures
                                 .get(&index)
                                 .copied()
                                 .unwrap_or(0)

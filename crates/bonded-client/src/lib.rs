@@ -231,6 +231,7 @@ impl ClientRuntime {
                     &self.config,
                     peer_transport_tx,
                     None,
+                    None,
                 )
                 .await
                 {
@@ -2508,22 +2509,6 @@ fn build_tun_config(tun_name: &str) -> Configuration {
     config
 }
 
-/// Indices of the direct (non-peer-relay) transports, in vec order.
-/// These are the paths eligible for multipath flow spreading; relay
-/// transports keep active/standby semantics. (Mirror of the helper in
-/// bonded-ffi's Android worker.)
-#[cfg(target_os = "linux")]
-fn direct_transport_indices(transports: &[ClientTransport]) -> Vec<usize> {
-    transports
-        .iter()
-        .enumerate()
-        .filter(|(_, transport)| {
-            !matches!(transport, ClientTransport::PeerRelay { .. })
-        })
-        .map(|(index, _)| index)
-        .collect()
-}
-
 /// Poll every transport's `recv()` concurrently and return the frames
 /// that complete: the first one awaited, plus whatever else is already
 /// buffered (bounded drain, no waiting). Every transport impl's `recv()`
@@ -2640,16 +2625,17 @@ async fn run_linux_packet_loop(
 
                 let packet = Bytes::copy_from_slice(&tun_buf[..read]);
                 let frame = state.create_outbound_frame(packet.clone(), 0);
-                // Multipath spreading: pin the flow to a direct
-                // transport by hash (see the Android worker in
-                // bonded-ffi for the full rationale). Candidates are
-                // the hashed pick first, then the other direct
-                // transports, then the active transport as a last
-                // resort. A failed candidate is removed and the next
-                // one is tried with the same frame; failing the last
-                // remaining transport ends the session, as before.
+                // Multipath spreading: pin the flow to a transport
+                // by hash (see the Android worker in bonded-ffi for
+                // the full rationale). Transports are treated equally
+                // here — direct and peer-relay alike. Candidates are
+                // the hashed pick first, then the other transports,
+                // then the active transport as a last resort. A failed
+                // candidate is removed and the next one is tried with
+                // the same frame; failing the last remaining transport
+                // ends the session, as before.
                 let flow = bonded_core::flow::flow_hash(&packet);
-                let mut candidates = direct_transport_indices(&transports);
+                let mut candidates: Vec<usize> = (0..transports.len()).collect();
                 if candidates.is_empty() {
                     candidates.push(active_index);
                 } else {

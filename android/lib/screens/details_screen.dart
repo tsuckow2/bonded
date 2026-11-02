@@ -143,6 +143,10 @@ class _DetailsScreenState extends State<DetailsScreen> {
                 ],
               ),
             ],
+            if (_status.peerTransports.isNotEmpty) ...[
+              const SizedBox(height: 12),
+              _Card(title: 'Peer connections', rows: _peerRows()),
+            ],
             if (_pairedServer != null) ...[
               const SizedBox(height: 12),
               _Card(
@@ -244,6 +248,32 @@ class _DetailsScreenState extends State<DetailsScreen> {
   static String _shortKey(String value) {
     if (value.length <= 20) return value;
     return '${value.substring(0, 12)}...${value.substring(value.length - 8)}';
+  }
+
+  /// One row per relay leg for the Peer connections card, legs
+  /// numbered within their peer in snapshot order.
+  List<(String, String)> _peerRows() {
+    final legNumber = <String, int>{};
+    final rows = <(String, String)>[];
+    for (final path in _status.peerTransports) {
+      final leg =
+          (legNumber[path.peerId ?? ''] = (legNumber[path.peerId ?? ''] ?? 0) + 1);
+      final label = 'Peer ${_shortKey(path.peerId ?? '')} · leg $leg';
+      rows.add((
+        label,
+        [
+          path.kind,
+          if (path.active) 'active',
+          if (path.lastRttMs > 0) '${path.lastRttMs} ms',
+          '↓ ${_fmtBytes(path.inboundBytes)}',
+          '↑ ${_fmtBytes(path.outboundBytes)}',
+        ].join(' · '),
+      ));
+      if (path.serverSeenAddress != null) {
+        rows.add(('$label — server sees', path.serverSeenAddress!));
+      }
+    }
+    return rows;
   }
 
   static String _display(String value) => value.isEmpty ? 'Not set' : value;
