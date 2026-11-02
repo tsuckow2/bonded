@@ -62,6 +62,17 @@ class MainActivity : FlutterActivity() {
             storageDir: String,
     ): Boolean
 
+    private external fun nativeMintInvite(
+            serverAddress: String,
+            serverIdentityPublicKey: String,
+            storageDir: String,
+            targetDeviceKey: String,
+    ): String?
+
+    private external fun nativeDevicePublicKey(
+            storageDir: String,
+    ): String?
+
     private external fun nativeLastError(): String?
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -204,6 +215,79 @@ class MainActivity : FlutterActivity() {
                 }
         android.util.Log.e("BondedMain", message)
         return false to message
+    }
+
+    private fun mintInviteTokenNative(
+            serverAddress: String,
+            serverIdentityPublicKey: String,
+            targetDeviceKey: String,
+    ): Pair<String?, String?> {
+        val token =
+                try {
+                    nativeMintInvite(
+                            serverAddress,
+                            serverIdentityPublicKey,
+                            filesDir.absolutePath,
+                            targetDeviceKey,
+                    )
+                } catch (_: UnsatisfiedLinkError) {
+                    android.util.Log.e("BondedMain", "nativeMintInvite unavailable")
+                    return null to "Native library is unavailable (UnsatisfiedLinkError)"
+                } catch (t: Throwable) {
+                    android.util.Log.e("BondedMain", "nativeMintInvite threw", t)
+                    return null to "${t::class.java.simpleName}: ${t.message ?: "unknown error"}"
+                }
+
+        if (token != null) {
+            return token to null
+        }
+
+        val nativeDetail =
+                try {
+                    nativeLastError()
+                } catch (_: Throwable) {
+                    null
+                }
+        val message =
+                if (!nativeDetail.isNullOrBlank()) {
+                    "Failed to mint invite token via native runtime: $nativeDetail"
+                } else {
+                    "Failed to mint invite token via native runtime"
+                }
+        android.util.Log.e("BondedMain", message)
+        return null to message
+    }
+
+    private fun getDevicePublicKeyNative(): Pair<String?, String?> {
+        val key =
+                try {
+                    nativeDevicePublicKey(filesDir.absolutePath)
+                } catch (_: UnsatisfiedLinkError) {
+                    android.util.Log.e("BondedMain", "nativeDevicePublicKey unavailable")
+                    return null to "Native library is unavailable (UnsatisfiedLinkError)"
+                } catch (t: Throwable) {
+                    android.util.Log.e("BondedMain", "nativeDevicePublicKey threw", t)
+                    return null to "${t::class.java.simpleName}: ${t.message ?: "unknown error"}"
+                }
+
+        if (key != null) {
+            return key to null
+        }
+
+        val nativeDetail =
+                try {
+                    nativeLastError()
+                } catch (_: Throwable) {
+                    null
+                }
+        val message =
+                if (!nativeDetail.isNullOrBlank()) {
+                    "Failed to get device public key via native runtime: $nativeDetail"
+                } else {
+                    "Failed to get device public key via native runtime"
+                }
+        android.util.Log.e("BondedMain", message)
+        return null to message
     }
 
     private fun savePairedServer(
@@ -700,6 +784,56 @@ class MainActivity : FlutterActivity() {
                                 } else {
                                     result.success(UUID.randomUUID().toString())
                                 }
+                            }
+                        }
+                        "mintInviteToken" -> {
+                            val args = call.arguments as? Map<*, *>
+                            val serverAddress = args?.get("serverAddress") as? String
+                            val serverIdentityPublicKey =
+                                (args?.get("serverIdentityPublicKey") as? String)
+                                    ?: (args?.get("serverPublicKey") as? String)
+                            val targetDeviceKey = args?.get("targetDeviceKey") as? String
+
+                            if (serverAddress.isNullOrBlank() ||
+                                            serverIdentityPublicKey.isNullOrBlank() ||
+                                            targetDeviceKey.isNullOrBlank()
+                            ) {
+                                result.error(
+                                        "invalid_args",
+                                        "serverAddress, serverIdentityPublicKey, and targetDeviceKey are required",
+                                        null
+                                )
+                            } else {
+                                val minted =
+                                    mintInviteTokenNative(
+                                        serverAddress,
+                                        serverIdentityPublicKey,
+                                        targetDeviceKey,
+                                    )
+                                if (minted.first == null) {
+                                    result.error(
+                                            "mint_failed",
+                                            minted.second,
+                                            mapOf(
+                                                    "serverAddress" to serverAddress,
+                                                    "nativeDetail" to nativeLastError(),
+                                            ),
+                                    )
+                                } else {
+                                    result.success(minted.first)
+                                }
+                            }
+                        }
+                        "getDevicePublicKey" -> {
+                            val key = getDevicePublicKeyNative()
+                            if (key.first == null) {
+                                result.error(
+                                        "device_key_failed",
+                                        key.second,
+                                        mapOf("nativeDetail" to nativeLastError()),
+                                )
+                            } else {
+                                result.success(key.first)
                             }
                         }
                         "storePairedServer" -> {

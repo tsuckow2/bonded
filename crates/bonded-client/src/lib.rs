@@ -45,6 +45,7 @@ use tun::Configuration;
 
 pub mod cert_proof;
 pub mod diagnostics;
+pub mod mint_invite;
 pub mod peer_discovery;
 pub mod peer_listener;
 pub mod peer_runtime;
@@ -2575,7 +2576,10 @@ async fn perform_websocket_auth_handshake(
     Ok(())
 }
 
-pub(crate) fn load_or_create_device_keypair(
+/// Load the device keypair, creating it on first run. Also used by the
+/// Android frontend (FFI) for pairing flows that need the device identity
+/// outside a live session.
+pub fn load_or_create_device_keypair(
     private_key_path: &Path,
     public_key_path: &Path,
 ) -> anyhow::Result<DeviceKeypair> {

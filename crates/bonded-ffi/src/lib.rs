@@ -2544,6 +2544,49 @@ fn redeem_invite_token(
     })
 }
 
+/// Mint a bound invite for another device (QR-pairing flow), authenticated
+/// by this device's existing pairing with the server. Load-only on the
+/// keypair: minting requires a pairing, so a missing key is an error, not
+/// a reason to create a fresh (unauthorized) identity.
+#[cfg(any(target_os = "android", test))]
+fn mint_invite_token(
+    server_address: &str,
+    server_public_key: &str,
+    storage_dir: &str,
+    target_device_key: &str,
+) -> anyhow::Result<String> {
+    let config = android_client_config(server_address, "", server_public_key, storage_dir);
+    let public_key_path = std::path::Path::new(&config.client.public_key_path);
+    if !public_key_path.exists() {
+        anyhow::bail!("device is not paired to this server (no device key found)");
+    }
+    let keypair = bonded_client::load_or_create_device_keypair(
+        std::path::Path::new(&config.client.private_key_path),
+        public_key_path,
+    )?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(bonded_client::mint_invite::mint_invite_for_device(
+        &config,
+        &keypair,
+        target_device_key,
+    ))
+}
+
+/// This device's public key, creating the keypair if this is the first run.
+/// The keypair is global per storage dir (not per server), so a TV can
+/// display its identity in a pairing QR before it knows any server.
+#[cfg(any(target_os = "android", test))]
+fn device_public_key(storage_dir: &str) -> anyhow::Result<String> {
+    let config = android_client_config("", "", "", storage_dir);
+    let keypair = bonded_client::load_or_create_device_keypair(
+        std::path::Path::new(&config.client.private_key_path),
+        std::path::Path::new(&config.client.public_key_path),
+    )?;
+    Ok(keypair.public_key_b64)
+}
+
 /// Complete server-side session binding on an authenticated pairing
 /// connection with a PING/PONG discovery exchange. The server binds the
 /// session to the first frame it receives after authentication (see
@@ -2642,6 +2685,84 @@ pub extern "system" fn Java_com_bonded_bonded_1app_MainActivity_nativeRedeemInvi
                 *last_error = Some(message);
             }
             0
+        }
+    }
+}
+
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_bonded_bonded_1app_MainActivity_nativeMintInvite(
+    mut env: jni::JNIEnv,
+    _obj: jni::objects::JObject,
+    server_address: jni::objects::JString,
+    server_public_key: jni::objects::JString,
+    storage_dir: jni::objects::JString,
+    target_device_key: jni::objects::JString,
+) -> jni::sys::jstring {
+    let server_address: String = match env.get_string(&server_address) {
+        Ok(value) => value.into(),
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let server_public_key: String = match env.get_string(&server_public_key) {
+        Ok(value) => value.into(),
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let storage_dir: String = match env.get_string(&storage_dir) {
+        Ok(value) => value.into(),
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let target_device_key: String = match env.get_string(&target_device_key) {
+        Ok(value) => value.into(),
+        Err(_) => return std::ptr::null_mut(),
+    };
+
+    match mint_invite_token(
+        &server_address,
+        &server_public_key,
+        &storage_dir,
+        &target_device_key,
+    ) {
+        Ok(token) => match env.new_string(token) {
+            Ok(jstr) => jstr.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        },
+        Err(err) => {
+            let message = format!(
+                "nativeMintInvite failed: {err}; server_address={server_address}"
+            );
+            alog_error!("{message}");
+            if let Ok(mut last_error) = LAST_NATIVE_ERROR.lock() {
+                *last_error = Some(message);
+            }
+            std::ptr::null_mut()
+        }
+    }
+}
+
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_bonded_bonded_1app_MainActivity_nativeDevicePublicKey(
+    mut env: jni::JNIEnv,
+    _obj: jni::objects::JObject,
+    storage_dir: jni::objects::JString,
+) -> jni::sys::jstring {
+    let storage_dir: String = match env.get_string(&storage_dir) {
+        Ok(value) => value.into(),
+        Err(_) => return std::ptr::null_mut(),
+    };
+
+    match device_public_key(&storage_dir) {
+        Ok(key) => match env.new_string(key) {
+            Ok(jstr) => jstr.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        },
+        Err(err) => {
+            let message = format!("nativeDevicePublicKey failed: {err}");
+            alog_error!("{message}");
+            if let Ok(mut last_error) = LAST_NATIVE_ERROR.lock() {
+                *last_error = Some(message);
+            }
+            std::ptr::null_mut()
         }
     }
 }
