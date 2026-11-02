@@ -19,7 +19,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
 use bonded_core::auth::verify_signature;
-use bonded_core::auth::{sign_bytes, DeviceKeypair};
+use bonded_core::auth::{sign_bytes, DeviceKeypair, MintInviteRequest};
 use bonded_core::diagnostics::{
     diagnostics_device_dir_name, DiagnosticsUploadRequest, DIAGNOSTICS_FILES_PER_DEVICE,
     MAX_DIAGNOSTICS_LOG_BYTES,
@@ -98,6 +98,10 @@ pub struct BootstrapContext {
     /// Root directory for uploaded client diagnostics, one subdirectory
     /// per device key. Created on first upload.
     pub diagnostics_dir: PathBuf,
+
+    /// Invite tokens file. The mint-invite endpoint persists bound tokens
+    /// here; the auth handshake redeem path reads the same file live.
+    pub invite_tokens_file: PathBuf,
 }
 
 impl BootstrapContext {
@@ -500,6 +504,7 @@ pub(crate) fn route_bootstrap_request(
             peer_share_introduction_response(ctx, body)
         }
         ("POST", "/v1/bootstrap/diagnostics") => diagnostics_upload_response(ctx, body),
+        ("POST", "/v1/bootstrap/mint-invite") => mint_invite_response(ctx, body),
         _ => (StatusCode::NOT_FOUND, r#"{"error":"not found"}"#.to_owned()),
     }
 }
@@ -718,6 +723,86 @@ fn diagnostics_upload_response(ctx: &BootstrapContext, body: &str) -> (StatusCod
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 r#"{"error":"failed to store diagnostics upload"}"#.to_owned(),
+            )
+        }
+    }
+}
+
+/// `POST /v1/bootstrap/mint-invite`
+///
+/// A paired device asks the server to mint a single-use invite bound to
+/// another device's key (the QR-pairing flow: a phone pairs its TV). The
+/// request envelope mirrors the diagnostics upload: the minter's device
+/// key must already be authorized, and the signature must verify over the
+/// canonical payload. The minted token is bound, so intercepting it is
+/// useless to anyone but the target device — this matters because the
+/// phone delivers the token to the TV over plaintext LAN HTTP.
+fn mint_invite_response(ctx: &BootstrapContext, body: &str) -> (StatusCode, String) {
+    let request: MintInviteRequest = match serde_json::from_str(body.trim()) {
+        Ok(request) => request,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                r#"{"error":"invalid JSON body"}"#.to_owned(),
+            )
+        }
+    };
+
+    if request.device_public_key.is_empty()
+        || request.target_device_public_key.is_empty()
+        || request.signature.is_empty()
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            r#"{"error":"device_public_key, target_device_public_key, and signature are required"}"#.to_owned(),
+        );
+    }
+    if !ctx.authorized_keys.is_authorized(&request.device_public_key) {
+        warn!(
+            device = %request.device_public_key,
+            "mint-invite from unauthorized device"
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            r#"{"error":"device is not authorized"}"#.to_owned(),
+        );
+    }
+    let signed_payload = match request.signed_payload() {
+        Ok(payload) => payload,
+        Err(err) => {
+            error!(error = %err, "failed to serialize mint-invite payload");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                r#"{"error":"failed to serialize mint-invite payload"}"#.to_owned(),
+            );
+        }
+    };
+    if let Err(err) = verify_signature(
+        &request.device_public_key,
+        &signed_payload,
+        &request.signature,
+    ) {
+        warn!(error = %err, "mint-invite signature verification failed");
+        return (
+            StatusCode::UNAUTHORIZED,
+            r#"{"error":"invalid device signature"}"#.to_owned(),
+        );
+    }
+
+    match crate::invite_tokens::mint_invite_token(
+        &ctx.invite_tokens_file,
+        &request.target_device_public_key,
+        600,
+    ) {
+        Ok(created) => (
+            StatusCode::OK,
+            format!(r#"{{"invite_token":"{}"}}"#, created.token),
+        ),
+        Err(err) => {
+            error!(error = %err, "failed to mint invite token");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                r#"{"error":"failed to mint invite token"}"#.to_owned(),
             )
         }
     }
@@ -1213,6 +1298,7 @@ mod tests {
             wireguard_peer_lease_secs: 3600,
             authorized_keys: AuthorizedKeysStore::default(),
             diagnostics_dir: std::env::temp_dir().join("bonded-diagnostics-test"),
+            invite_tokens_file: std::env::temp_dir().join("bonded-invites-test.toml"),
         })
     }
 
@@ -1352,6 +1438,7 @@ mod tests {
             wireguard_peer_lease_secs: 3600,
             authorized_keys: AuthorizedKeysStore::default(),
             diagnostics_dir: std::env::temp_dir().join("bonded-diagnostics-test"),
+            invite_tokens_file: std::env::temp_dir().join("bonded-invites-test.toml"),
         });
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1461,6 +1548,7 @@ mod tests {
             wireguard_peer_lease_secs: 3600,
             authorized_keys,
             diagnostics_dir: diagnostics_dir.clone(),
+            invite_tokens_file: std::env::temp_dir().join(format!("bonded-invites-{name}-{stamp}.toml")),
         });
         (ctx, diagnostics_dir)
     }
@@ -1551,6 +1639,104 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    fn signed_mint_request(
+        device: &DeviceKeypair,
+        target_key: &str,
+    ) -> MintInviteRequest {
+        let mut request = MintInviteRequest {
+            device_public_key: device.public_key_b64.clone(),
+            target_device_public_key: target_key.to_owned(),
+            requested_at_unix: 1_760_000_000,
+            signature: String::new(),
+        };
+        request.signature = sign_bytes(
+            device,
+            &request.signed_payload().expect("payload should serialize"),
+        )
+        .expect("request should sign");
+        request
+    }
+
+    fn post_mint(
+        ctx: &BootstrapContext,
+        request: &MintInviteRequest,
+    ) -> (StatusCode, String) {
+        route_bootstrap_request(
+            "POST",
+            "/v1/bootstrap/mint-invite",
+            &serde_json::to_string(request).expect("request should serialize"),
+            ctx,
+            None,
+        )
+    }
+
+    #[test]
+    fn mint_invite_mints_bound_token_redeemable_only_by_target() {
+        let minter = DeviceKeypair::generate();
+        let tv = DeviceKeypair::generate();
+        let (ctx, dir) = diagnostics_test_ctx(&[&minter], "mint-ok");
+        let request = signed_mint_request(&minter, &tv.public_key_b64);
+
+        let (status, body) = post_mint(&ctx, &request);
+        assert_eq!(status, StatusCode::OK);
+        let token = serde_json::from_str::<serde_json::Value>(&body)
+            .expect("mint body should be JSON")["invite_token"]
+            .as_str()
+            .expect("invite_token should be a string")
+            .to_owned();
+        assert!(!token.is_empty());
+
+        // The minted token is bound: a wrong-key redeem fails WITHOUT
+        // consuming it, and the target key then redeems it.
+        assert!(
+            !crate::invite_tokens::redeem_invite_token(
+                &ctx.invite_tokens_file,
+                &token,
+                &minter.public_key_b64
+            )
+            .expect("wrong-key redeem should report false")
+        );
+        assert!(
+            crate::invite_tokens::redeem_invite_token(
+                &ctx.invite_tokens_file,
+                &token,
+                &tv.public_key_b64
+            )
+            .expect("right-key redeem should succeed")
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_file(&ctx.invite_tokens_file);
+    }
+
+    #[test]
+    fn mint_invite_rejects_unauthorized_device() {
+        let device = DeviceKeypair::generate();
+        let tv = DeviceKeypair::generate();
+        let (ctx, dir) = diagnostics_test_ctx(&[], "mint-unauth");
+        let request = signed_mint_request(&device, &tv.public_key_b64);
+
+        assert_eq!(post_mint(&ctx, &request).0, StatusCode::FORBIDDEN);
+        assert!(
+            !ctx.invite_tokens_file.exists(),
+            "rejected mint must not create a token"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mint_invite_rejects_bad_signature() {
+        let device = DeviceKeypair::generate();
+        let tv = DeviceKeypair::generate();
+        let (ctx, dir) = diagnostics_test_ctx(&[&device], "mint-badsig");
+        let mut request = signed_mint_request(&device, &tv.public_key_b64);
+        request.target_device_public_key = "tampered".to_owned();
+
+        assert_eq!(post_mint(&ctx, &request).0, StatusCode::UNAUTHORIZED);
+        assert!(!ctx.invite_tokens_file.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn diagnostics_store_prunes_to_retention_cap() {
         let device = DeviceKeypair::generate();
@@ -1605,6 +1791,7 @@ mod tests {
             wireguard_peer_lease_secs: 3600,
             authorized_keys,
             diagnostics_dir: std::env::temp_dir().join("bonded-diagnostics-test"),
+            invite_tokens_file: std::env::temp_dir().join("bonded-invites-test.toml"),
         });
 
         let unsigned = serde_json::json!({

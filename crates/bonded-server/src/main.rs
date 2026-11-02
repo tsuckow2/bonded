@@ -283,6 +283,7 @@ async fn main() -> anyhow::Result<()> {
             .parent()
             .map(|parent| parent.join("diagnostics"))
             .unwrap_or_else(|| std::path::PathBuf::from("diagnostics")),
+        invite_tokens_file: std::path::PathBuf::from(websocket_invites.clone()),
     });
     if let (Some(wireguard_bind), Some(wireguard_keypair), Some(wireguard_peers)) = (
         cfg.server.wireguard_bind.clone(),

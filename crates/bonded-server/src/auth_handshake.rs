@@ -47,7 +47,7 @@ pub async fn perform_auth_handshake(
         let redeemed = if hello.invite_token.trim().is_empty() {
             false
         } else {
-            redeem_invite_token(invite_tokens_file, &hello.invite_token)
+            redeem_invite_token(invite_tokens_file, &hello.invite_token, &hello.public_key_b64)
                 .context("failed to redeem invite token")?
         };
 
@@ -116,7 +116,7 @@ pub async fn perform_websocket_auth_handshake(
         let redeemed = if hello.invite_token.trim().is_empty() {
             false
         } else {
-            redeem_invite_token(invite_tokens_file, &hello.invite_token)
+            redeem_invite_token(invite_tokens_file, &hello.invite_token, &hello.public_key_b64)
                 .context("failed to redeem invite token")?
         };
 
@@ -188,6 +188,7 @@ pub async fn perform_quic_auth_handshake(
             redeem_invite_token(
                 std::path::Path::new(invite_tokens_file),
                 &hello.invite_token,
+                &hello.public_key_b64,
             )
             .context("QUIC: failed to redeem invite token")?
         };
@@ -501,6 +502,94 @@ uses_remaining = 1
 
         let reloaded = AuthorizedKeysStore::load(&path).expect("store should reload");
         assert!(reloaded.is_authorized(&keypair.public_key_b64));
+
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(invites);
+    }
+
+    async fn client_handshake_attempt(
+        addr: std::net::SocketAddr,
+        keypair: &DeviceKeypair,
+        invite_token: &str,
+    ) -> anyhow::Result<String> {
+        let stream = TcpStream::connect(addr).await?;
+        let (read_half, mut write_half) = stream.into_split();
+        let mut reader = BufReader::new(read_half);
+
+        let hello = ClientHello {
+            public_key_b64: keypair.public_key_b64.clone(),
+            invite_token: invite_token.to_owned(),
+        };
+        let hello_json = serde_json::to_string(&hello)?;
+        write_half
+            .write_all(format!("{hello_json}\n").as_bytes())
+            .await?;
+
+        let mut line = String::new();
+        reader.read_line(&mut line).await?;
+        if let Ok(challenge) = serde_json::from_str::<ServerChallenge>(line.trim_end()) {
+            let signature_b64 = sign_auth_challenge(keypair, &challenge.challenge_b64)?;
+            let proof = ClientProof { signature_b64 };
+            let proof_json = serde_json::to_string(&proof)?;
+            write_half
+                .write_all(format!("{proof_json}\n").as_bytes())
+                .await?;
+            let mut result_line = String::new();
+            reader.read_line(&mut result_line).await?;
+            let result: ServerAuthResult = serde_json::from_str(result_line.trim_end())?;
+            return Ok(result.status);
+        }
+        let result: ServerAuthResult = serde_json::from_str(line.trim_end())?;
+        Ok(result.status)
+    }
+
+    #[tokio::test]
+    async fn handshake_enforces_bound_invite_key() {
+        let tv = DeviceKeypair::generate();
+        let attacker = DeviceKeypair::generate();
+        let path = temp_file_path("auth-handshake-bound-auth");
+        let invites = temp_file_path("auth-handshake-bound-invites");
+        fs::write(&path, "devices = []\n").expect("authorized keys file should be written");
+        fs::write(
+            &invites,
+            format!(
+                "[[tokens]]\ntoken = \"bound-token\"\nexpires_at = \"unix:9999999999\"\nuses_remaining = 1\nbound_device_public_key = \"{}\"\n",
+                tv.public_key_b64
+            ),
+        )
+        .expect("invite tokens file should be written");
+
+        let store = AuthorizedKeysStore::load(&path).expect("store should load");
+
+        // Wrong key: unauthorized, and the token must survive the attempt.
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener should bind");
+        let addr = listener.local_addr().expect("local addr should resolve");
+        let invites_for_server = invites.clone();
+        let store_for_server = AuthorizedKeysStore::load(&path).expect("store should load");
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept should succeed");
+            perform_auth_handshake(stream, store_for_server, &invites_for_server).await
+        });
+        let status = client_handshake_attempt(addr, &attacker, "bound-token")
+            .await
+            .expect("wrong-key attempt should get a verdict");
+        assert_eq!(status, "unauthorized");
+        assert!(server_task.await.expect("server task should join").is_err());
+
+        // Right key: the surviving token redeems and the handshake succeeds.
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener should bind");
+        let addr = listener.local_addr().expect("local addr should resolve");
+        let invites_for_server = invites.clone();
+        let store_for_server = AuthorizedKeysStore::load(&path).expect("store should load");
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept should succeed");
+            perform_auth_handshake(stream, store_for_server, &invites_for_server).await
+        });
+        let status = client_handshake_attempt(addr, &tv, "bound-token")
+            .await
+            .expect("right-key attempt should get a verdict");
+        assert_eq!(status, "ok");
+        assert!(server_task.await.expect("server task should join").is_ok());
 
         let _ = fs::remove_file(path);
         let _ = fs::remove_file(invites);

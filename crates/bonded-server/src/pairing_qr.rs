@@ -101,6 +101,7 @@ mod tests {
             token: "token-123".to_owned(),
             expires_at: "unix:123".to_owned(),
             uses_remaining: 1,
+            bound_device_public_key: None,
         };
 
         let json = build_pairing_payload_json("bonded.example.com:8080", &invite, "pub-key")
@@ -118,6 +119,7 @@ mod tests {
             token: "token-123".to_owned(),
             expires_at: "unix:123".to_owned(),
             uses_remaining: 1,
+            bound_device_public_key: None,
         };
 
         let payload = build_pairing_payload_json("", &invite, "pub-key");
@@ -130,6 +132,7 @@ mod tests {
             token: "token-123".to_owned(),
             expires_at: "unix:123".to_owned(),
             uses_remaining: 1,
+            bound_device_public_key: None,
         };
 
         let link = build_pairing_deep_link("bonded.example.com:8443", &invite, "pub+key/with=special");

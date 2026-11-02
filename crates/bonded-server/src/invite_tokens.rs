@@ -32,15 +32,39 @@ pub fn ensure_startup_invite(path: impl AsRef<Path>) -> anyhow::Result<InviteTok
     Ok(created)
 }
 
-pub fn redeem_invite_token(path: impl AsRef<Path>, token: &str) -> anyhow::Result<bool> {
+pub fn redeem_invite_token(
+    path: impl AsRef<Path>,
+    token: &str,
+    presented_key_b64: &str,
+) -> anyhow::Result<bool> {
     let path = path.as_ref();
     let mut manager = load_manager(path)?;
-    let redeemed = manager.redeem(token).is_ok();
+    let redeemed = manager.redeem(token, presented_key_b64).is_ok();
     if redeemed {
         persist_manager(path, &manager)?;
     }
 
     Ok(redeemed)
+}
+
+/// Mint a single-use invite bound to one device key (the QR-pairing flow:
+/// a paired phone asks the server for an invite its TV can redeem). The
+/// token is persisted to the same file the auth handshake redeem path
+/// reads, so it is usable immediately with no restart.
+pub fn mint_invite_token(
+    path: impl AsRef<Path>,
+    bound_key_b64: &str,
+    validity_secs: u64,
+) -> anyhow::Result<InviteToken> {
+    let path = path.as_ref();
+    let mut manager = load_manager(path)?;
+    let expires_at = format!(
+        "unix:{}",
+        unix_timestamp_after(Duration::from_secs(validity_secs))?
+    );
+    let created = manager.issue_bound_token(expires_at, 1, Some(bound_key_b64.to_owned()));
+    persist_manager(path, &manager)?;
+    Ok(created)
 }
 
 fn load_manager(path: &Path) -> anyhow::Result<InviteTokenManager> {
@@ -132,8 +156,24 @@ uses_remaining = 1
         )
         .expect("seed token file should be written");
 
-        assert!(redeem_invite_token(&path, "one-shot").expect("redeem should succeed"));
-        assert!(!redeem_invite_token(&path, "one-shot").expect("second redeem should fail"));
+        assert!(redeem_invite_token(&path, "one-shot", "any-key").expect("redeem should succeed"));
+        assert!(!redeem_invite_token(&path, "one-shot", "any-key").expect("second redeem should fail"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn mint_invite_token_is_bound_and_redeemable_only_by_its_target() {
+        use super::mint_invite_token;
+        let path = temp_file_path("invite-mint");
+        let created = mint_invite_token(&path, "tv-key", 600).expect("mint should succeed");
+        assert!(!created.token.is_empty());
+        assert_eq!(created.uses_remaining, 1);
+
+        assert!(!redeem_invite_token(&path, &created.token, "other-key")
+            .expect("wrong-key redeem should report false"));
+        assert!(redeem_invite_token(&path, &created.token, "tv-key")
+            .expect("right-key redeem should succeed"));
 
         let _ = fs::remove_file(path);
     }
