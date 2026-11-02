@@ -192,8 +192,11 @@ class BondedVpnService : VpnService() {
                                 .setMtu(1420)
                                 .addAddress("10.8.0.2", 32)
                                 .addRoute("0.0.0.0", 0)
-                                .addDnsServer("8.8.8.8")
-                                .addDnsServer("1.1.1.1")
+                                // DNS goes through the tunnel to the bonded server itself,
+                                // which resolves with its own resolvers. No public fallback
+                                // is added on purpose: a fallback would leak queries around
+                                // the server whenever tunnel DNS is slow or down.
+                                .addDnsServer("10.8.0.1")
 
                 // Keep the app process itself outside the VPN so control-plane sockets
                 // (session establishment, pairing, health probes) are never captured.
