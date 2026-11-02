@@ -309,7 +309,7 @@ impl Default for ClientSection {
             path_bind_addresses: Vec::new(),
             server_public_key: String::new(),
             invite_token: String::new(),
-            preferred_protocols: vec!["wss".to_owned(), "h3".to_owned(), "wireguard".to_owned()],
+            preferred_protocols: vec!["h3".to_owned(), "wireguard".to_owned(), "wss".to_owned()],
             allow_insecure_debug_transports: false,
             private_key_path: DEFAULT_CLIENT_PRIVATE_KEY_PATH.to_owned(),
             public_key_path: DEFAULT_CLIENT_PUBLIC_KEY_PATH.to_owned(),
@@ -420,7 +420,7 @@ https_bind = "127.0.0.1:9000"
         let cfg = ClientConfig::default();
         assert_eq!(
             cfg.client.preferred_protocols,
-            vec!["wss", "h3", "wireguard"]
+            vec!["h3", "wireguard", "wss"]
         );
         assert!(!cfg.client.allow_insecure_debug_transports);
         assert!(!cfg.client.peer_share_enabled);

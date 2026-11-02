@@ -539,7 +539,7 @@ fn android_client_config(
     config.client.server_resolved_address = resolved_server_address.to_owned();
     config.client.server_public_key = server_public_key.to_owned();
     config.client.preferred_protocols =
-        vec!["wss".to_owned(), "h3".to_owned(), "wireguard".to_owned()];
+        vec!["h3".to_owned(), "wireguard".to_owned(), "wss".to_owned()];
     config.client.allow_insecure_debug_transports = false;
     config.client.private_key_path = storage_root
         .join("bonded-device-key.pem")

@@ -1190,7 +1190,7 @@ fn relay_upstream_protocols(config: &ClientConfig) -> Vec<String> {
         .cloned()
         .collect();
     if filtered.is_empty() {
-        vec!["wss".to_owned(), "h3".to_owned()]
+        vec!["h3".to_owned(), "wss".to_owned()]
     } else {
         filtered
     }

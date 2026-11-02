@@ -13,6 +13,7 @@ use bytes::Buf;
 #[cfg(target_os = "linux")]
 use bytes::Bytes;
 use bytes::Bytes as RawBytes;
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use h3::client;
 use http::Request;
 use pnet_datalink::NetworkInterface;
@@ -22,7 +23,7 @@ use rustls::ClientConfig as RustlsClientConfig;
 use serde::Deserialize;
 use serde_json::json;
 use std::fs;
-use std::future::poll_fn;
+use std::future::{poll_fn, Future};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket as StdUdpSocket};
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
@@ -395,6 +396,103 @@ pub enum SinglePathResult {
 /// fail-closed: a well-formed cert proof that does not verify can only
 /// come from a real bonded server holding a different key (or a relay
 /// of one), never from a merely broken network.
+/// Outcome of [`race_preferred`].
+struct RaceOutcome<T> {
+    /// (rank, transport) of the winning attempt, if any.
+    winner: Option<(usize, T)>,
+    /// (rank, error text) for every failed attempt, in completion order.
+    errors: Vec<(usize, String)>,
+    /// Error text of the first identity-mismatch failure, if any.
+    identity_error: Option<String>,
+    /// Ranks still pending when the race settled (superseded, cancelled).
+    superseded: Vec<usize>,
+}
+
+/// Race several protocol attempts to a preference-ordered winner.
+///
+/// All attempts run concurrently. The winner is the most-preferred
+/// attempt that succeeds: a rank-0 success wins immediately; a
+/// less-preferred success is held as provisional while a more-preferred
+/// attempt is still pending, up to `grace`, so a blackholed preferred
+/// protocol costs at most `grace` extra instead of its full timeout.
+/// If no better-ranked attempt can still arrive, the provisional wins
+/// at once. Remaining attempts are dropped (cancelled) when the race
+/// settles, and their ranks are reported as superseded.
+async fn race_preferred<T, F>(
+    mut pending: FuturesUnordered<F>,
+    mut remaining: Vec<usize>,
+    grace: Duration,
+) -> RaceOutcome<T>
+where
+    F: Future<Output = (usize, Result<T, (String, bool)>)>,
+{
+    let mut provisional: Option<(usize, T)> = None;
+    let mut errors: Vec<(usize, String)> = Vec::new();
+    let mut identity_error: Option<String> = None;
+    let mut grace_deadline: Option<tokio::time::Instant> = None;
+    while !pending.is_empty() {
+        let item = match grace_deadline {
+            Some(deadline) => {
+                tokio::select! {
+                    biased;
+                    item = pending.next() => item,
+                    _ = tokio::time::sleep_until(deadline) => None,
+                }
+            }
+            None => pending.next().await,
+        };
+        let Some((rank, result)) = item else {
+            break;
+        };
+        remaining.retain(|r| *r != rank);
+        match result {
+            Ok(transport) => {
+                if rank == 0 {
+                    let mut superseded = remaining;
+                    if let Some((best, _)) = provisional {
+                        superseded.push(best);
+                    }
+                    return RaceOutcome {
+                        winner: Some((rank, transport)),
+                        errors,
+                        identity_error,
+                        superseded,
+                    };
+                }
+                match &provisional {
+                    Some((best, _)) if *best <= rank => {}
+                    _ => {
+                        provisional = Some((rank, transport));
+                        if grace_deadline.is_none() {
+                            grace_deadline = Some(tokio::time::Instant::now() + grace);
+                        }
+                    }
+                }
+            }
+            Err((msg, is_identity)) => {
+                if is_identity && identity_error.is_none() {
+                    identity_error = Some(msg.clone());
+                }
+                errors.push((rank, msg));
+            }
+        }
+        // Nothing better can still arrive: settle on the provisional now
+        // instead of waiting out the grace (a failure can eliminate the
+        // last better-ranked pending attempt just as a success can).
+        if let Some((best, _)) = &provisional {
+            if remaining.iter().all(|r| *r > *best) {
+                break;
+            }
+        }
+    }
+    RaceOutcome {
+        winner: provisional,
+        errors,
+        identity_error,
+        superseded: remaining,
+    }
+}
+
 pub async fn establish_single_transport_path<F>(
     config: &ClientConfig,
     path_index: usize,
@@ -450,115 +548,144 @@ where
             }
         }
 
-        let mut connected: Option<ClientTransport> = None;
-        for protocol in rotated_protocols(&protocols, path_index) {
+        // Initiate every configured protocol at once, in preference order
+        // (the sanitized list order — no per-path rotation: there is no
+        // need to spread the transport TYPE across paths; traffic
+        // spreading happens across paths regardless of type). The winner
+        // is the most-preferred protocol that succeeds; see race_preferred.
+        let pending = FuturesUnordered::new();
+        let mut rank_protocol: Vec<String> = Vec::new();
+        for protocol in &protocols {
+            if !matches!(
+                protocol.as_str(),
+                "naive_tcp" | "wss" | "websocket_tls" | "h3" | "quic" | "wireguard" | "wg"
+            ) {
+                continue;
+            }
+            let rank = rank_protocol.len();
+            rank_protocol.push(protocol.clone());
             observer(format!(
                 "transport attempt path_index={path_index} requested_paths={target} protocol={protocol} bind_address={}",
                 bind_address.unwrap_or("<default>")
             ));
-            let attempt = match (protocol.as_str(), bind_address) {
-                ("naive_tcp", Some(bind)) => timeout(
-                    PATH_ESTABLISH_TIMEOUT,
-                    establish_naive_tcp_session_with_bind(config, bind),
-                )
-                .await
-                .map_err(anyhow::Error::from)
-                .and_then(|result| result)
-                .map(NaiveTcpTransport::from_stream)
-                .map(ClientTransport::NaiveTcp),
-                ("naive_tcp", None) => {
-                    timeout(PATH_ESTABLISH_TIMEOUT, establish_naive_tcp_session(config))
-                        .await
-                        .map_err(anyhow::Error::from)
-                        .and_then(|result| result)
-                        .map(NaiveTcpTransport::from_stream)
-                        .map(ClientTransport::NaiveTcp)
-                }
-                ("wss" | "websocket_tls", Some(bind)) => timeout(
-                    PATH_ESTABLISH_TIMEOUT,
-                    establish_websocket_session_with_bind(config, bind),
-                )
-                .await
-                .map_err(anyhow::Error::from)
-                .and_then(|result| result)
-                .map(|transport| ClientTransport::WebSocket(Box::new(transport))),
-                ("wss" | "websocket_tls", None) => {
-                    timeout(PATH_ESTABLISH_TIMEOUT, establish_websocket_session(config))
-                        .await
-                        .map_err(anyhow::Error::from)
-                        .and_then(|result| result)
-                        .map(|transport| ClientTransport::WebSocket(Box::new(transport)))
-                }
-                ("h3" | "quic", Some(bind)) => timeout(
-                    PATH_ESTABLISH_TIMEOUT,
-                    establish_quic_session_with_bind(config, bind),
-                )
-                .await
-                .map_err(anyhow::Error::from)
-                .and_then(|result| result)
-                .map(|transport| ClientTransport::Quic(Box::new(transport))),
-                ("h3" | "quic", None) => {
-                    timeout(PATH_ESTABLISH_TIMEOUT, establish_quic_session(config))
-                        .await
-                        .map_err(anyhow::Error::from)
-                        .and_then(|result| result)
-                        .map(|transport| ClientTransport::Quic(Box::new(transport)))
-                }
-                ("wireguard" | "wg", Some(bind)) => timeout(
-                    PATH_ESTABLISH_TIMEOUT,
-                    establish_wireguard_session_with_bind(config, bind),
-                )
-                .await
-                .map_err(anyhow::Error::from)
-                .and_then(|result| result)
-                .map(|transport| ClientTransport::WireGuard(Box::new(transport))),
-                ("wireguard" | "wg", None) => {
-                    timeout(PATH_ESTABLISH_TIMEOUT, establish_wireguard_session(config))
-                        .await
-                        .map_err(anyhow::Error::from)
-                        .and_then(|result| result)
-                        .map(|transport| ClientTransport::WireGuard(Box::new(transport)))
-                }
-                _ => continue,
-            };
-
-            match attempt {
-                Ok(path) => {
-                    observer(format!(
-                        "transport established path_index={path_index} requested_paths={target} protocol={protocol} bind_address={}",
-                        bind_address.unwrap_or("<default>")
-                    ));
-                    connected = Some(path);
-                    break;
-                }
-                Err(err) => {
-                    if identity_error.is_none()
-                        && cert_proof::is_identity_mismatch_error(&err)
-                    {
-                        identity_error = Some(format!("{err:#}"));
-                        // Machine-readable marker for the platform layer:
-                        // lets the app attribute the interception to this
-                        // path and surface it as a user-visible warning
-                        // (the FFI session observer watches for this line
-                        // and records it in the session snapshot).
-                        observer(format!(
-                            "server-identity-mismatch path_index={path_index} detail={err:#}"
-                        ));
+            let protocol = protocol.clone();
+            pending.push(async move {
+                let attempt = match (protocol.as_str(), bind_address) {
+                    ("naive_tcp", Some(bind)) => timeout(
+                        PATH_ESTABLISH_TIMEOUT,
+                        establish_naive_tcp_session_with_bind(config, bind),
+                    )
+                    .await
+                    .map_err(anyhow::Error::from)
+                    .and_then(|result| result)
+                    .map(NaiveTcpTransport::from_stream)
+                    .map(ClientTransport::NaiveTcp),
+                    ("naive_tcp", None) => {
+                        timeout(PATH_ESTABLISH_TIMEOUT, establish_naive_tcp_session(config))
+                            .await
+                            .map_err(anyhow::Error::from)
+                            .and_then(|result| result)
+                            .map(NaiveTcpTransport::from_stream)
+                            .map(ClientTransport::NaiveTcp)
                     }
-                    let bind_context = bind_address
-                        .map(|bind| format!(", bind_address={bind}"))
-                        .unwrap_or_default();
-                    observer(format!(
-                        "transport attempt failed path_index={path_index} requested_paths={target} protocol={protocol} bind_address={} error={err:#}",
-                        bind_address.unwrap_or("<default>")
-                    ));
-                    attempt_errors.push(format!(
-                        "protocol={protocol}, path_index={path_index}{bind_context}: {:#}",
-                        err
-                    ));
-                }
-            }
+                    ("wss" | "websocket_tls", Some(bind)) => timeout(
+                        PATH_ESTABLISH_TIMEOUT,
+                        establish_websocket_session_with_bind(config, bind),
+                    )
+                    .await
+                    .map_err(anyhow::Error::from)
+                    .and_then(|result| result)
+                    .map(|transport| ClientTransport::WebSocket(Box::new(transport))),
+                    ("wss" | "websocket_tls", None) => {
+                        timeout(PATH_ESTABLISH_TIMEOUT, establish_websocket_session(config))
+                            .await
+                            .map_err(anyhow::Error::from)
+                            .and_then(|result| result)
+                            .map(|transport| ClientTransport::WebSocket(Box::new(transport)))
+                    }
+                    ("h3" | "quic", Some(bind)) => timeout(
+                        PATH_ESTABLISH_TIMEOUT,
+                        establish_quic_session_with_bind(config, bind),
+                    )
+                    .await
+                    .map_err(anyhow::Error::from)
+                    .and_then(|result| result)
+                    .map(|transport| ClientTransport::Quic(Box::new(transport))),
+                    ("h3" | "quic", None) => {
+                        timeout(PATH_ESTABLISH_TIMEOUT, establish_quic_session(config))
+                            .await
+                            .map_err(anyhow::Error::from)
+                            .and_then(|result| result)
+                            .map(|transport| ClientTransport::Quic(Box::new(transport)))
+                    }
+                    ("wireguard" | "wg", Some(bind)) => timeout(
+                        PATH_ESTABLISH_TIMEOUT,
+                        establish_wireguard_session_with_bind(config, bind),
+                    )
+                    .await
+                    .map_err(anyhow::Error::from)
+                    .and_then(|result| result)
+                    .map(|transport| ClientTransport::WireGuard(Box::new(transport))),
+                    ("wireguard" | "wg", None) => {
+                        timeout(PATH_ESTABLISH_TIMEOUT, establish_wireguard_session(config))
+                            .await
+                            .map_err(anyhow::Error::from)
+                            .and_then(|result| result)
+                            .map(|transport| ClientTransport::WireGuard(Box::new(transport)))
+                    }
+                    _ => unreachable!("unknown protocols are filtered before racing"),
+                };
+                (
+                    rank,
+                    attempt.map_err(|err| {
+                        (
+                            format!("{err:#}"),
+                            cert_proof::is_identity_mismatch_error(&err),
+                        )
+                    }),
+                )
+            });
         }
+        let outcome = race_preferred(
+            pending,
+            (0..rank_protocol.len()).collect(),
+            PROTOCOL_RACE_GRACE,
+        )
+        .await;
+        if let Some(detail) = &outcome.identity_error {
+            observer(format!(
+                "server-identity-mismatch path_index={path_index} detail={detail}"
+            ));
+            identity_error = Some(detail.clone());
+        }
+        for (rank, msg) in &outcome.errors {
+            let protocol = &rank_protocol[*rank];
+            let bind_context = bind_address
+                .map(|bind| format!(", bind_address={bind}"))
+                .unwrap_or_default();
+            observer(format!(
+                "transport attempt failed path_index={path_index} requested_paths={target} protocol={protocol} bind_address={} error={msg}",
+                bind_address.unwrap_or("<default>")
+            ));
+            attempt_errors.push(format!(
+                "protocol={protocol}, path_index={path_index}{bind_context}: {msg}"
+            ));
+        }
+        for rank in &outcome.superseded {
+            let protocol = &rank_protocol[*rank];
+            observer(format!(
+                "transport attempt superseded path_index={path_index} requested_paths={target} protocol={protocol} bind_address={}",
+                bind_address.unwrap_or("<default>")
+            ));
+        }
+        if let Some((rank, _)) = &outcome.winner {
+            let protocol = &rank_protocol[*rank];
+            observer(format!(
+                "transport established path_index={path_index} requested_paths={target} protocol={protocol} bind_address={}",
+                bind_address.unwrap_or("<default>")
+            ));
+        }
+        let connected = outcome.winner.map(|(_, path)| path);
 
         // Fail closed on identity evidence from any attempt: a well-formed
         // proof that does not verify can only come from a real bonded server
@@ -616,12 +743,19 @@ fn server_identity_failure(host: &str, port: u16, detail: &str) -> anyhow::Error
 
 const PATH_ESTABLISH_TIMEOUT: Duration = Duration::from_secs(8);
 
+/// How long a less-preferred success waits for a more-preferred attempt
+/// still pending in the protocol race before settling. Long enough to
+/// cover a couple of loss-recovery cycles at ordinary RTTs, short enough
+/// that a blackholed preferred protocol costs at most this long extra
+/// instead of its full establish timeout.
+const PROTOCOL_RACE_GRACE: Duration = Duration::from_secs(5);
+
 fn sanitize_preferred_protocols(
     protocols: &[String],
     allow_insecure_debug_transports: bool,
 ) -> Vec<String> {
     let source = if protocols.is_empty() {
-        vec!["wss".to_owned(), "h3".to_owned(), "wireguard".to_owned()]
+        vec!["h3".to_owned(), "wireguard".to_owned(), "wss".to_owned()]
     } else {
         protocols.to_vec()
     };
@@ -634,21 +768,10 @@ fn sanitize_preferred_protocols(
         .collect();
 
     if filtered.is_empty() {
-        vec!["wss".to_owned(), "h3".to_owned(), "wireguard".to_owned()]
+        vec!["h3".to_owned(), "wireguard".to_owned(), "wss".to_owned()]
     } else {
         filtered
     }
-}
-
-fn rotated_protocols(protocols: &[String], start: usize) -> Vec<String> {
-    if protocols.is_empty() {
-        return Vec::new();
-    }
-
-    let len = protocols.len();
-    (0..len)
-        .map(|offset| protocols[(start + offset) % len].clone())
-        .collect()
 }
 
 #[derive(Debug, Deserialize)]
@@ -2792,10 +2915,11 @@ mod tests {
     use bonded_core::auth::verify_auth_challenge;
     use bonded_core::auth::{create_auth_challenge, DeviceKeypair};
     use bonded_core::config::ClientConfig;
+    use futures_util::stream::FuturesUnordered;
     use serde_json::json;
     use std::fs;
     use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::TcpListener;
 
@@ -2934,6 +3058,92 @@ mod tests {
         assert_eq!(
             super::sanitize_preferred_protocols(&protocols, true),
             protocols
+        );
+    }
+
+    fn fake_race_attempt(
+        rank: usize,
+        delay: Duration,
+        result: Result<u32, (String, bool)>,
+    ) -> impl std::future::Future<Output = (usize, Result<u32, (String, bool)>)> {
+        async move {
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            (rank, result)
+        }
+    }
+
+    #[tokio::test]
+    async fn preferred_race_rank_zero_wins_immediately() {
+        let pending = FuturesUnordered::new();
+        pending.push(fake_race_attempt(0, Duration::ZERO, Ok(1)));
+        pending.push(fake_race_attempt(1, Duration::ZERO, Ok(2)));
+        let outcome = super::race_preferred(pending, vec![0, 1], Duration::from_secs(5)).await;
+        assert_eq!(outcome.winner, Some((0, 1)));
+        assert!(outcome.errors.is_empty());
+        assert_eq!(outcome.superseded, vec![1]);
+    }
+
+    #[tokio::test]
+    async fn preferred_race_better_wins_within_grace() {
+        let pending = FuturesUnordered::new();
+        pending.push(fake_race_attempt(1, Duration::ZERO, Ok(2)));
+        pending.push(fake_race_attempt(0, Duration::from_millis(100), Ok(1)));
+        let outcome = super::race_preferred(pending, vec![0, 1], Duration::from_secs(5)).await;
+        assert_eq!(outcome.winner, Some((0, 1)));
+        assert_eq!(outcome.superseded, vec![1]);
+    }
+
+    #[tokio::test]
+    async fn preferred_race_grace_expiry_takes_provisional() {
+        let pending = FuturesUnordered::new();
+        pending.push(fake_race_attempt(1, Duration::ZERO, Ok(2)));
+        pending.push(fake_race_attempt(0, Duration::from_secs(60), Ok(1)));
+        let outcome =
+            super::race_preferred(pending, vec![0, 1], Duration::from_millis(500)).await;
+        assert_eq!(outcome.winner, Some((1, 2)));
+        assert_eq!(outcome.superseded, vec![0]);
+    }
+
+    #[tokio::test]
+    async fn preferred_race_all_fail_reports_errors_and_identity() {
+        let pending = FuturesUnordered::new();
+        pending.push(fake_race_attempt(
+            0,
+            Duration::ZERO,
+            Err(("id-mismatch".to_owned(), true)),
+        ));
+        pending.push(fake_race_attempt(
+            1,
+            Duration::ZERO,
+            Err(("boom".to_owned(), false)),
+        ));
+        let outcome = super::race_preferred(pending, vec![0, 1], Duration::from_secs(5)).await;
+        assert!(outcome.winner.is_none());
+        assert_eq!(outcome.errors.len(), 2);
+        assert_eq!(outcome.identity_error.as_deref(), Some("id-mismatch"));
+        assert!(outcome.superseded.is_empty());
+    }
+
+    #[tokio::test]
+    async fn preferred_race_early_exit_skips_grace_wait() {
+        let pending = FuturesUnordered::new();
+        pending.push(fake_race_attempt(1, Duration::ZERO, Ok(2)));
+        pending.push(fake_race_attempt(
+            0,
+            Duration::ZERO,
+            Err(("nope".to_owned(), false)),
+        ));
+        pending.push(fake_race_attempt(2, Duration::from_secs(60), Ok(3)));
+        let start = std::time::Instant::now();
+        let outcome = super::race_preferred(pending, vec![0, 1, 2], Duration::from_secs(5)).await;
+        assert_eq!(outcome.winner, Some((1, 2)));
+        assert_eq!(outcome.superseded, vec![2]);
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "race waited out the grace: {:?}",
+            start.elapsed()
         );
     }
 }
