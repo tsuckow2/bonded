@@ -18,6 +18,11 @@ pub struct InviteToken {
     pub token: String,
     pub expires_at: String,
     pub uses_remaining: u32,
+    /// When set, only this device key (base64) may redeem the token. Absent
+    /// (including in TOML files written before binding existed) means the
+    /// legacy bearer behavior: any presenting key may redeem.
+    #[serde(default)]
+    pub bound_device_public_key: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -26,6 +31,10 @@ pub enum InviteTokenError {
     NotFound,
     #[error("invite token has no remaining uses")]
     Exhausted,
+    #[error("invite token is bound to a different device key")]
+    WrongKey,
+    #[error("invite token has expired")]
+    Expired,
 }
 
 #[derive(Debug, Default)]
@@ -43,20 +52,50 @@ impl InviteTokenManager {
     }
 
     pub fn issue_token(&mut self, expires_at: String, uses_remaining: u32) -> InviteToken {
+        self.issue_bound_token(expires_at, uses_remaining, None)
+    }
+
+    /// Issue a token bound to one device key. A bound token may only be
+    /// redeemed by that key (see [`InviteTokenManager::redeem`]).
+    pub fn issue_bound_token(
+        &mut self,
+        expires_at: String,
+        uses_remaining: u32,
+        bound_device_public_key: Option<String>,
+    ) -> InviteToken {
         let token = InviteToken {
             token: generate_invite_token_value(),
             expires_at,
             uses_remaining,
+            bound_device_public_key,
         };
         self.tokens.insert(token.token.clone(), token.clone());
         token
     }
 
-    pub fn redeem(&mut self, token_value: &str) -> Result<InviteToken, InviteTokenError> {
+    /// Redeem a token for the presenting device key. A bound token redeemed
+    /// by any other key fails with [`InviteTokenError::WrongKey`] WITHOUT
+    /// consuming a use, so a wrong-key attempt cannot burn the rightful
+    /// device's token. Bound tokens also enforce their `unix:<secs>` expiry
+    /// (legacy unbound tokens keep the historical no-expiry-check behavior).
+    pub fn redeem(
+        &mut self,
+        token_value: &str,
+        presented_key_b64: &str,
+    ) -> Result<InviteToken, InviteTokenError> {
         let token = self
             .tokens
             .get_mut(token_value)
             .ok_or(InviteTokenError::NotFound)?;
+
+        if let Some(bound) = &token.bound_device_public_key {
+            if bound != presented_key_b64 {
+                return Err(InviteTokenError::WrongKey);
+            }
+            if bound_token_expired(&token.expires_at) {
+                return Err(InviteTokenError::Expired);
+            }
+        }
 
         if token.uses_remaining == 0 {
             return Err(InviteTokenError::Exhausted);
@@ -72,6 +111,44 @@ impl InviteTokenManager {
 
     pub fn all_tokens(&self) -> Vec<InviteToken> {
         self.tokens.values().cloned().collect()
+    }
+}
+
+/// Bound-token expiry: only the `unix:<secs>` form minted by
+/// [`InviteTokenManager::issue_bound_token`] is understood. Any other form
+/// fails closed (treated as expired) since bound tokens are always minted
+/// by server code in that form.
+fn bound_token_expired(expires_at: &str) -> bool {
+    let secs: u64 = match expires_at.strip_prefix("unix:").and_then(|s| s.parse().ok()) {
+        Some(secs) => secs,
+        None => return true,
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    now >= secs
+}
+
+/// Signed request a paired device sends to `POST /v1/bootstrap/mint-invite`
+/// to mint a single-use invite bound to another device's key (the QR-pairing
+/// flow). Mirrors the diagnostics upload envelope: every field except the
+/// signature itself is the signed payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MintInviteRequest {
+    pub device_public_key: String,
+    pub target_device_public_key: String,
+    pub requested_at_unix: u64,
+    pub signature: String,
+}
+
+impl MintInviteRequest {
+    pub fn signed_payload(&self) -> anyhow::Result<Vec<u8>> {
+        Ok(serde_json::to_vec(&serde_json::json!({
+            "device_public_key": self.device_public_key,
+            "target_device_public_key": self.target_device_public_key,
+            "requested_at_unix": self.requested_at_unix,
+        }))?)
     }
 }
 
@@ -269,6 +346,7 @@ mod tests {
             token: "abc".to_owned(),
             expires_at: "2026-03-31T00:00:00Z".to_owned(),
             uses_remaining: 1,
+            bound_device_public_key: None,
         };
         assert!(token.is_usable());
     }
@@ -279,6 +357,7 @@ mod tests {
             token: "abc".to_owned(),
             expires_at: "2026-03-31T00:00:00Z".to_owned(),
             uses_remaining: 0,
+            bound_device_public_key: None,
         };
         assert!(!token.is_usable());
     }
@@ -306,17 +385,17 @@ mod tests {
         let token = manager.issue_token("2026-04-01T00:00:00Z".to_owned(), 2);
 
         let first = manager
-            .redeem(&token.token)
+            .redeem(&token.token, "any-presenting-key")
             .expect("first redeem should succeed");
         assert_eq!(first.uses_remaining, 1);
 
         let second = manager
-            .redeem(&token.token)
+            .redeem(&token.token, "any-presenting-key")
             .expect("second redeem should succeed");
         assert_eq!(second.uses_remaining, 0);
 
         let err = manager
-            .redeem(&token.token)
+            .redeem(&token.token, "any-presenting-key")
             .expect_err("third redeem should fail");
         assert!(matches!(err, InviteTokenError::Exhausted));
     }
@@ -325,9 +404,65 @@ mod tests {
     fn redeeming_unknown_token_fails() {
         let mut manager = InviteTokenManager::default();
         let err = manager
-            .redeem("missing-token")
+            .redeem("missing-token", "any-presenting-key")
             .expect_err("unknown token should fail");
         assert!(matches!(err, InviteTokenError::NotFound));
+    }
+
+    #[test]
+    fn bound_token_redeems_only_for_its_key_and_wrong_key_does_not_consume() {
+        let mut manager = InviteTokenManager::default();
+        let token = manager.issue_bound_token(
+            "unix:9999999999".to_owned(),
+            1,
+            Some("tv-key".to_owned()),
+        );
+
+        let err = manager
+            .redeem(&token.token, "attacker-key")
+            .expect_err("wrong-key redeem should fail");
+        assert!(matches!(err, InviteTokenError::WrongKey));
+        assert_eq!(
+            manager.get(&token.token).expect("token should survive").uses_remaining,
+            1,
+            "a wrong-key attempt must not burn the token"
+        );
+
+        let redeemed = manager
+            .redeem(&token.token, "tv-key")
+            .expect("right-key redeem should succeed");
+        assert_eq!(redeemed.uses_remaining, 0);
+    }
+
+    #[test]
+    fn bound_token_with_past_expiry_is_rejected_without_consuming() {
+        let mut manager = InviteTokenManager::default();
+        let token = manager.issue_bound_token(
+            "unix:1".to_owned(),
+            1,
+            Some("tv-key".to_owned()),
+        );
+
+        let err = manager
+            .redeem(&token.token, "tv-key")
+            .expect_err("expired bound token should fail");
+        assert!(matches!(err, InviteTokenError::Expired));
+        assert_eq!(
+            manager.get(&token.token).expect("token should survive").uses_remaining,
+            1
+        );
+    }
+
+    #[test]
+    fn legacy_token_without_bound_field_deserializes_unbound() {
+        let parsed: InviteToken = toml::from_str(
+            r#"token = "old"
+expires_at = "unix:9999999999"
+uses_remaining = 1
+"#,
+        )
+        .expect("old TOML shape should parse");
+        assert_eq!(parsed.bound_device_public_key, None);
     }
 
     #[test]
