@@ -10,6 +10,11 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
 
+    <!-- TV support: lets Google Play offer the app on Android TV / Chromecast.
+         required=false keeps phones seeing it; the LEANBACK_LAUNCHER category
+         on MainActivity is what identifies it as TV-enabled. -->
+    <uses-feature android:name="android.software.leanback" android:required="false" />
+
     <application
         android:label="bonded_app"
         android:name="${applicationName}"
@@ -36,6 +41,7 @@
             <intent-filter>
                 <action android:name="android.intent.action.MAIN"/>
                 <category android:name="android.intent.category.LAUNCHER"/>
+                <category android:name="android.intent.category.LEANBACK_LAUNCHER"/>
             </intent-filter>
             <!-- Deep link for pairing: bonded://pair?server=...&token=...&key=...
                  Lets users tap a link (instead of scanning a QR) to open the
