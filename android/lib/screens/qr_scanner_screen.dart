@@ -3,9 +3,13 @@ import 'package:mobile_scanner/mobile_scanner.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 import '../models/pairing_model.dart';
+import '../models/pair_device_model.dart';
 
 class QRScannerScreen extends StatefulWidget {
-  const QRScannerScreen({super.key});
+  /// When true, only TV pairing codes are accepted (pair-device flow).
+  final bool pairDeviceMode;
+
+  const QRScannerScreen({super.key, this.pairDeviceMode = false});
 
   @override
   State<QRScannerScreen> createState() => _QRScannerScreenState();
@@ -40,6 +44,9 @@ class _QRScannerScreenState extends State<QRScannerScreen> {
     super.dispose();
   }
 
+  String get _title =>
+      widget.pairDeviceMode ? 'Scan TV Pairing Code' : 'Scan Server QR Code';
+
   void _onDetect(BarcodeCapture capture) {
     if (_isNavigating) {
       return;
@@ -50,6 +57,23 @@ class _QRScannerScreenState extends State<QRScannerScreen> {
     for (final barcode in barcodes) {
       if (barcode.rawValue != null) {
         final String qrData = barcode.rawValue!;
+        if (widget.pairDeviceMode) {
+          final PairDevicePayload? devicePayload =
+              PairDevicePayload.parseQrData(qrData);
+          if (devicePayload != null) {
+            _isNavigating = true;
+            controller.stop();
+            Navigator.of(context).pushReplacementNamed(
+              '/pair-device-confirm',
+              arguments: devicePayload,
+            );
+          } else {
+            _showError(
+              'This is not a TV pairing code. Show the pairing code on the TV and try again.',
+            );
+          }
+          break;
+        }
         final ServerPairingPayload? payload = ServerPairingPayload.parseQrData(
           qrData,
         );
@@ -82,14 +106,14 @@ class _QRScannerScreenState extends State<QRScannerScreen> {
   Widget build(BuildContext context) {
     if (isLoading) {
       return Scaffold(
-        appBar: AppBar(title: const Text('Scan Server QR Code')),
+        appBar: AppBar(title: Text(_title)),
         body: const Center(child: CircularProgressIndicator()),
       );
     }
 
     if (!hasPermission) {
       return Scaffold(
-        appBar: AppBar(title: const Text('Scan Server QR Code')),
+        appBar: AppBar(title: Text(_title)),
         body: Center(
           child: Column(
             mainAxisAlignment: MainAxisAlignment.center,
@@ -112,7 +136,7 @@ class _QRScannerScreenState extends State<QRScannerScreen> {
     }
 
     return Scaffold(
-      appBar: AppBar(title: const Text('Scan Server QR Code')),
+      appBar: AppBar(title: Text(_title)),
       body: Stack(
         children: [
           MobileScanner(controller: controller, onDetect: _onDetect),
@@ -147,8 +171,10 @@ class _QRScannerScreenState extends State<QRScannerScreen> {
               padding: const EdgeInsets.all(16),
               child: Column(
                 children: [
-                  const Text(
-                    'Position QR code within the frame',
+                  Text(
+                    widget.pairDeviceMode
+                        ? 'Position the TV pairing code within the frame'
+                        : 'Position QR code within the frame',
                     textAlign: TextAlign.center,
                     style: TextStyle(color: Colors.white, fontSize: 16),
                   ),

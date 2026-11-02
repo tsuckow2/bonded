@@ -4,6 +4,8 @@ import 'package:app_links/app_links.dart';
 import 'package:flutter/material.dart';
 import 'screens/home_screen.dart';
 import 'screens/qr_scanner_screen.dart';
+import 'screens/pair_device_confirm_screen.dart';
+import 'screens/pair_tv_screen.dart';
 import 'screens/pairing_confirm_screen.dart';
 import 'screens/details_screen.dart';
 import 'screens/diagnostics_screen.dart';
@@ -13,6 +15,7 @@ import 'screens/network_tests_screen.dart';
 import 'screens/client_logs_screen.dart';
 import 'screens/stress_test_screen.dart';
 import 'models/pairing_model.dart';
+import 'models/pair_device_model.dart';
 
 void main() {
   runApp(const BondedApp());
@@ -101,6 +104,9 @@ class _BondedAppState extends State<BondedApp> {
       routes: {
         '/home': (context) => const HomeScreen(),
         '/qr-scanner': (context) => const QRScannerScreen(),
+        '/qr-scanner-pair-device': (context) =>
+            const QRScannerScreen(pairDeviceMode: true),
+        '/pair-tv': (context) => const PairTvScreen(),
         '/diagnostics': (context) => const DiagnosticsScreen(),
         '/settings': (context) => const SettingsScreen(),
         '/network-tests': (context) => const NetworkTestsScreen(),
@@ -113,6 +119,14 @@ class _BondedAppState extends State<BondedApp> {
           if (payload != null) {
             return MaterialPageRoute(
               builder: (context) => PairingConfirmScreen(payload: payload),
+            );
+          }
+        }
+        if (settings.name == '/pair-device-confirm') {
+          final payload = settings.arguments as PairDevicePayload?;
+          if (payload != null) {
+            return MaterialPageRoute(
+              builder: (context) => PairDeviceConfirmScreen(payload: payload),
             );
           }
         }

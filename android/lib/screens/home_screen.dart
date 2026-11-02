@@ -501,6 +501,37 @@ class _HomeScreenState extends State<HomeScreen> {
               style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w600),
             ),
           ),
+          const SizedBox(height: 16),
+          // ── QR pairing ────────────────────────────────────────
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  const Text(
+                    'Pairing',
+                    style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+                  ),
+                  const SizedBox(height: 12),
+                  OutlinedButton.icon(
+                    onPressed: () => Navigator.of(
+                      context,
+                    ).pushNamed('/qr-scanner-pair-device'),
+                    icon: const Icon(Icons.qr_code_scanner),
+                    label: const Text('Pair a device…'),
+                  ),
+                  const SizedBox(height: 8),
+                  OutlinedButton.icon(
+                    onPressed: () =>
+                        Navigator.of(context).pushNamed('/pair-tv'),
+                    icon: const Icon(Icons.qr_code_2),
+                    label: const Text('Show pairing code for a phone'),
+                  ),
+                ],
+              ),
+            ),
+          ),
           if (_showInterceptionWarning) ...[
             const SizedBox(height: 12),
             _InterceptionWarningCard(
