@@ -329,6 +329,9 @@ pub struct SmoltcpForwarder {
     tcp_flows: SharedTcpFlowMap,
     /// Outbound channel so UDP/ICMP handlers can send frames directly.
     outbound_tx: mpsc::UnboundedSender<SessionFrame>,
+    /// DNS proxy answering queries addressed to the tunnel gateway
+    /// (the client's VPN DNS server) with the server's own resolvers.
+    dns_proxy: crate::dns_proxy::DnsProxy,
     session_id: u64,
     /// Count of packets delivered to ingest_packet (for tests).
     ingested_packets: AtomicU64,
@@ -654,7 +657,8 @@ impl SmoltcpForwarder {
             icmp_tracker,
             udp_flow_map: Arc::new(TokioMutex::new(HashMap::new())),
             tcp_flows,
-            outbound_tx,
+            outbound_tx: outbound_tx.clone(),
+            dns_proxy: crate::dns_proxy::DnsProxy::new(session_id, outbound_tx),
             session_id,
             ingested_packets: AtomicU64::new(0),
         }
@@ -833,6 +837,18 @@ impl SmoltcpForwarder {
         let Some(udp_pkt) = parse_ipv4_udp_packet(&frame.payload) else {
             return;
         };
+        // DNS addressed to the tunnel gateway is resolved by the server
+        // itself, not forwarded to the internet: the client's VPN DNS
+        // server is the gateway, so queries arrive here addressed to it.
+        if udp_pkt.dst_ip == crate::dns_proxy::TUN_DNS_ADDR
+            && udp_pkt.dst_port == crate::dns_proxy::TUN_DNS_PORT
+        {
+            let proxy = self.dns_proxy.clone();
+            tokio::spawn(async move {
+                proxy.handle_query(frame.header, udp_pkt).await;
+            });
+            return;
+        }
         let udp_manager = UdpSessionManager {
             session_id: self.session_id,
             outbound_tx: self.outbound_tx.clone(),
@@ -1812,13 +1828,13 @@ fn parse_ipv4_tcp_tuple_flags(packet: &[u8]) -> Option<(Ipv4Addr, u16, Ipv4Addr,
 // ── UDP handling (direct OS sockets, same pattern as original frame_forwarder) ─
 
 #[derive(Debug, Clone)]
-struct Ipv4UdpPacket {
-    src_ip: Ipv4Addr,
-    dst_ip: Ipv4Addr,
-    src_port: u16,
-    dst_port: u16,
-    payload: Vec<u8>,
-    identification: u16,
+pub(crate) struct Ipv4UdpPacket {
+    pub(crate) src_ip: Ipv4Addr,
+    pub(crate) dst_ip: Ipv4Addr,
+    pub(crate) src_port: u16,
+    pub(crate) dst_port: u16,
+    pub(crate) payload: Vec<u8>,
+    pub(crate) identification: u16,
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -2293,7 +2309,7 @@ fn parse_ipv4_icmp_echo_packet(packet: &[u8]) -> Option<Ipv4IcmpEchoPacket> {
 
 // ── Packet builders ────────────────────────────────────────────────────────────
 
-fn build_ipv4_udp_packet(
+pub(crate) fn build_ipv4_udp_packet(
     src_ip: Ipv4Addr,
     dst_ip: Ipv4Addr,
     src_port: u16,

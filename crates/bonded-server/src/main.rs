@@ -5,6 +5,7 @@ mod acme;
 mod auth_handshake;
 mod authorized_keys;
 mod bootstrap;
+mod dns_proxy;
 mod health;
 mod invite_tokens;
 mod network_runtime;
