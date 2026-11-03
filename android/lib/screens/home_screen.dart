@@ -364,7 +364,7 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
             const SizedBox(height: 8),
             Text(
-              'Scan a server QR code to get started',
+              'Scan a server QR code, or pair this device with your phone',
               style: TextStyle(fontSize: 14, color: Colors.grey[600]),
             ),
             const SizedBox(height: 32),
@@ -378,6 +378,29 @@ class _HomeScreenState extends State<HomeScreen> {
               icon: const Icon(Icons.qr_code_2),
               label: const Text('Scan QR Code'),
               style: ElevatedButton.styleFrom(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 32,
+                  vertical: 16,
+                ),
+              ),
+            ),
+            // Camera-less clients (e.g. a TV) have no server yet by
+            // definition, so the "Show pairing code for a phone" entry
+            // must live here too — the Pairing card in _buildMain only
+            // renders once a server already exists, which made the whole
+            // phone-pairs-TV flow unreachable on a fresh device. The
+            // opposite direction ("Pair a device…") is deliberately NOT
+            // offered here: it needs a paired server to mint from and
+            // just errors on an empty phone.
+            const SizedBox(height: 12),
+            OutlinedButton.icon(
+              onPressed: () async {
+                await Navigator.of(context).pushNamed('/pair-tv');
+                if (mounted) _loadServers();
+              },
+              icon: const Icon(Icons.qr_code_2),
+              label: const Text('Show pairing code for a phone'),
+              style: OutlinedButton.styleFrom(
                 padding: const EdgeInsets.symmetric(
                   horizontal: 32,
                   vertical: 16,

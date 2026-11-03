@@ -35,7 +35,11 @@ void main() {
 
     expect(find.text('Bonded VPN'), findsOneWidget);
     expect(find.text('No paired servers'), findsOneWidget);
-    expect(find.text('Scan a server QR code to get started'), findsOneWidget);
+    expect(
+      find.text('Scan a server QR code, or pair this device with your phone'),
+      findsOneWidget,
+    );
     expect(find.text('Scan QR Code'), findsOneWidget);
+    expect(find.text('Show pairing code for a phone'), findsOneWidget);
   });
 }
