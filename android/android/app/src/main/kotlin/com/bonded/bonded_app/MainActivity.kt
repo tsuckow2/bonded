@@ -702,6 +702,15 @@ class MainActivity : FlutterActivity() {
                                                     AppSettingsStore.selectedServerId(
                                                             this@MainActivity
                                                     ),
+                                            "allowLocalTraffic" to
+                                                    AppSettingsStore.allowLocalTraffic(
+                                                            this@MainActivity
+                                                    ),
+                                            "excludedAppPackages" to
+                                                    AppSettingsStore.excludedAppPackages(
+                                                            this@MainActivity
+                                                    )
+                                                            .toList(),
                                     )
                             )
                         }
@@ -719,7 +728,44 @@ class MainActivity : FlutterActivity() {
                                         args["selectedServerId"] as? String,
                                 )
                             }
+                            (args?.get("allowLocalTraffic") as? Boolean)?.let {
+                                AppSettingsStore.setAllowLocalTraffic(this@MainActivity, it)
+                            }
+                            (args?.get("excludedAppPackages") as? List<*>)?.let { raw ->
+                                AppSettingsStore.setExcludedAppPackages(
+                                        this@MainActivity,
+                                        raw.mapNotNull { it as? String }
+                                                .filter { it.isNotBlank() && it != packageName }
+                                                .toSet(),
+                                )
+                            }
                             result.success(true)
+                        }
+                        // Launchable apps for the exclusion picker. Intent
+                        // queries need no QUERY_ALL_PACKAGES permission, and
+                        // our own package is never listed (it can never be
+                        // excluded: its control-plane traffic must stay
+                        // routable through the VPN).
+                        "getLaunchableApps" -> {
+                            val intent =
+                                    Intent(Intent.ACTION_MAIN)
+                                            .addCategory(Intent.CATEGORY_LAUNCHER)
+                            val apps =
+                                    packageManager
+                                            .queryIntentActivities(intent, 0)
+                                            .mapNotNull { info ->
+                                                val pkg = info.activityInfo?.packageName
+                                                        ?: return@mapNotNull null
+                                                if (pkg == packageName) return@mapNotNull null
+                                                mapOf<String, Any?>(
+                                                        "packageName" to pkg,
+                                                        "label" to
+                                                                info.loadLabel(packageManager)
+                                                                        .toString(),
+                                                )
+                                            }
+                                            .sortedBy { (it["label"] as? String)?.lowercase() }
+                            result.success(apps)
                         }
                         "startVpnService" -> {
                             val args = call.arguments as? Map<*, *>

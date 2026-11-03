@@ -5,7 +5,9 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
 import android.net.VpnService
 import android.net.wifi.WifiManager
 import android.os.Build
@@ -193,12 +195,49 @@ class BondedVpnService : VpnService() {
                                 .setSession("Bonded")
                                 .setMtu(1420)
                                 .addAddress("10.8.0.2", 32)
-                                .addRoute("0.0.0.0", 0)
-                                // DNS goes through the tunnel to the bonded server itself,
-                                // which resolves with its own resolvers. No public fallback
-                                // is added on purpose: a fallback would leak queries around
-                                // the server whenever tunnel DNS is slow or down.
-                                .addDnsServer("10.8.0.1")
+                if (AppSettingsStore.allowLocalTraffic(this)) {
+                    // Local traffic mode: route everything EXCEPT the
+                    // subnets this device is directly attached to. The
+                    // physical interfaces keep their own connected routes,
+                    // which win by longest-prefix match, so LAN traffic
+                    // never enters the TUN. Builder has no exclusion API,
+                    // hence the complement CIDR set. Routes are fixed at
+                    // establish time: joining a new network needs a
+                    // reconnect before its subnet is excluded.
+                    val localSubnets = connectedIpv4Subnets()
+                    val routes = excludeSubnets(localSubnets)
+                    for (route in routes) {
+                        builder.addRoute(route.toAddressString(), route.prefix)
+                    }
+                    android.util.Log.i(
+                            "BondedVPN",
+                            "Local traffic mode: ${localSubnets.size} local subnets excluded, ${routes.size} routes added",
+                    )
+                } else {
+                    builder.addRoute("0.0.0.0", 0)
+                }
+                // DNS goes through the tunnel to the bonded server itself,
+                // which resolves with its own resolvers. No public fallback
+                // is added on purpose: a fallback would leak queries around
+                // the server whenever tunnel DNS is slow or down.
+                builder.addDnsServer("10.8.0.1")
+
+                // User-chosen app exclusions: these apps bypass the VPN
+                // entirely. This is NOT the reverted own-package exclusion
+                // above — our own package is never in this list (the
+                // channel filters it out), so control-plane traffic stays
+                // routable. Uninstalled packages are skipped silently.
+                for (pkg in AppSettingsStore.excludedAppPackages(this)) {
+                    if (pkg == packageName) continue
+                    try {
+                        builder.addDisallowedApplication(pkg)
+                    } catch (e: PackageManager.NameNotFoundException) {
+                        android.util.Log.w(
+                                "BondedVPN",
+                                "Skipping excluded app that is not installed: $pkg",
+                        )
+                    }
+                }
 
                 // Keep the app process itself outside the VPN so control-plane sockets
                 // (session establishment, pairing, health probes) are never captured.
@@ -324,6 +363,36 @@ class BondedVpnService : VpnService() {
                 .setSmallIcon(R.drawable.ic_notification)
                 .setOngoing(true)
                 .build()
+    }
+
+    /**
+     * Connected IPv4 subnets of the physical networks, for local-traffic
+     * mode. Every attached subnet counts as local — including the
+     * cellular interface's carrier range, which holds no internet
+     * destinations anyway. The TUN itself is not listed yet at establish
+     * time, so the tunnel's own 10.8.0.0/24 is never excluded.
+     */
+    private fun connectedIpv4Subnets(): List<Ipv4Cidr> {
+        val manager =
+                getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+                        ?: return emptyList()
+        val subnets = mutableListOf<Ipv4Cidr>()
+        for (network in manager.allNetworks) {
+            val props =
+                    try {
+                        manager.getLinkProperties(network)
+                    } catch (_: Exception) {
+                        null
+                    }
+                            ?: continue
+            for (linkAddress in props.linkAddresses) {
+                val inet = linkAddress.address
+                if (inet is Inet4Address && !inet.isLoopbackAddress) {
+                    subnets.add(Ipv4Cidr.fromBytes(inet.address, linkAddress.prefixLength))
+                }
+            }
+        }
+        return subnets
     }
 
     private fun acquireMulticastLockIfNeeded() {

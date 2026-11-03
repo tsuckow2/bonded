@@ -8,11 +8,15 @@ class AppSettings {
   final bool autoConnectOnOpen;
   final bool autoConnectOnBoot;
   final String? selectedServerId;
+  final bool allowLocalTraffic;
+  final List<String> excludedAppPackages;
 
   const AppSettings({
     this.autoConnectOnOpen = false,
     this.autoConnectOnBoot = false,
     this.selectedServerId,
+    this.allowLocalTraffic = false,
+    this.excludedAppPackages = const [],
   });
 
   AppSettings copyWith({
@@ -20,6 +24,8 @@ class AppSettings {
     bool? autoConnectOnBoot,
     String? selectedServerId,
     bool clearSelectedServerId = false,
+    bool? allowLocalTraffic,
+    List<String>? excludedAppPackages,
   }) {
     return AppSettings(
       autoConnectOnOpen: autoConnectOnOpen ?? this.autoConnectOnOpen,
@@ -27,6 +33,8 @@ class AppSettings {
       selectedServerId: clearSelectedServerId
           ? null
           : (selectedServerId ?? this.selectedServerId),
+      allowLocalTraffic: allowLocalTraffic ?? this.allowLocalTraffic,
+      excludedAppPackages: excludedAppPackages ?? this.excludedAppPackages,
     );
   }
 }
@@ -46,6 +54,11 @@ class AppSettingsService {
                 true
             ? map!['selectedServerId'] as String
             : null,
+        allowLocalTraffic: map?['allowLocalTraffic'] == true,
+        excludedAppPackages: (map?['excludedAppPackages'] as List?)
+                ?.map((e) => e.toString())
+                .toList() ??
+            const [],
       );
     } catch (_) {
       return const AppSettings();
@@ -58,6 +71,8 @@ class AppSettingsService {
         'autoConnectOnOpen': settings.autoConnectOnOpen,
         'autoConnectOnBoot': settings.autoConnectOnBoot,
         'selectedServerId': settings.selectedServerId,
+        'allowLocalTraffic': settings.allowLocalTraffic,
+        'excludedAppPackages': settings.excludedAppPackages,
       });
     } catch (_) {
       // Settings are best-effort; the native surfaces fall back to the

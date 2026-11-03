@@ -88,6 +88,41 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 : null,
           ),
           const Divider(),
+          const ListTile(
+            title: Text(
+              'Traffic routing',
+              style: TextStyle(fontWeight: FontWeight.w700),
+            ),
+          ),
+          SwitchListTile(
+            title: const Text('Allow local traffic'),
+            subtitle: const Text(
+              'Devices on your local network (printers, TVs, file shares) '
+              'bypass the VPN. Applies when you next connect; DNS still '
+              'goes through the tunnel, so local names may not resolve.',
+            ),
+            value: _settings.allowLocalTraffic,
+            onChanged: _settingsLoaded
+                ? (value) =>
+                      _save(_settings.copyWith(allowLocalTraffic: value))
+                : null,
+          ),
+          ListTile(
+            title: const Text('Excluded apps'),
+            subtitle: Text(
+              _settings.excludedAppPackages.isEmpty
+                  ? 'No apps bypass the VPN'
+                  : '${_settings.excludedAppPackages.length} app(s) bypass the VPN',
+            ),
+            trailing: const Icon(Icons.arrow_forward),
+            onTap: _settingsLoaded
+                ? () async {
+                    await Navigator.of(context).pushNamed('/excluded-apps');
+                    if (mounted) _loadSettings();
+                  }
+                : null,
+          ),
+          const Divider(),
           ListTile(
             title: const Text('About Bonded'),
             subtitle: Text(

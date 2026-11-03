@@ -15,6 +15,8 @@ object AppSettingsStore {
     private const val KEY_AUTO_CONNECT_ON_OPEN = "auto_connect_on_open"
     private const val KEY_AUTO_CONNECT_ON_BOOT = "auto_connect_on_boot"
     private const val KEY_SELECTED_SERVER_ID = "selected_server_id"
+    private const val KEY_ALLOW_LOCAL_TRAFFIC = "allow_local_traffic"
+    private const val KEY_EXCLUDED_APP_PACKAGES = "excluded_app_packages"
 
     private fun prefs(context: Context) =
             context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -44,6 +46,25 @@ object AppSettingsStore {
             editor.putString(KEY_SELECTED_SERVER_ID, value)
         }
         editor.apply()
+    }
+
+    /** Local traffic mode: LAN subnets bypass the VPN (applies on next connect). */
+    fun allowLocalTraffic(context: Context): Boolean =
+            prefs(context).getBoolean(KEY_ALLOW_LOCAL_TRAFFIC, false)
+
+    fun setAllowLocalTraffic(context: Context, value: Boolean) {
+        prefs(context).edit().putBoolean(KEY_ALLOW_LOCAL_TRAFFIC, value).apply()
+    }
+
+    /** Packages whose traffic bypasses the VPN entirely. Never contains our own package. */
+    fun excludedAppPackages(context: Context): Set<String> =
+            prefs(context).getStringSet(KEY_EXCLUDED_APP_PACKAGES, emptySet()) ?: emptySet()
+
+    fun setExcludedAppPackages(context: Context, value: Set<String>) {
+        prefs(context)
+                .edit()
+                .putStringSet(KEY_EXCLUDED_APP_PACKAGES, value.toSet())
+                .apply()
     }
 
     /** The record the main screen's dropdown has selected, falling back to
