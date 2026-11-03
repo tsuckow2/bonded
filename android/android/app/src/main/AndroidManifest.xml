@@ -12,8 +12,16 @@
 
     <!-- TV support: lets Google Play offer the app on Android TV / Chromecast.
          required=false keeps phones seeing it; the LEANBACK_LAUNCHER category
-         on MainActivity is what identifies it as TV-enabled. -->
+         on MainActivity is what identifies it as TV-enabled.
+         The faketouch line is the actual TV blocker fix: aapt2 adds
+         android.hardware.faketouch as a REQUIRED feature by default
+         ("default feature for all apps"), and TV devices do not support
+         faketouch, so Play filtered the app from every TV device until
+         this opt-out. Touchscreen is declared not-required for the same
+         reason, per Google's TV hardware docs. -->
     <uses-feature android:name="android.software.leanback" android:required="false" />
+    <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+    <uses-feature android:name="android.hardware.faketouch" android:required="false" />
 
     <application
         android:label="bonded_app"
