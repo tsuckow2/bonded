@@ -24,6 +24,12 @@
 //! sees is real. On dial failure or timeout the client gets a RST instead.
 //! Nothing is ever SYN-ACKed that is not actually open.
 //!
+//! One exception skips the dial entirely: a SYN to the tunnel gateway's
+//! DoT port (10.8.0.1:853) is answered with an immediate RST. Nothing
+//! listens for DoT on the gateway, and dialing it would hang on the
+//! blackholed gateway route until DIAL_TIMEOUT — the client (e.g. an
+//! Android Private DNS probe) should fail fast, not wait ~5 s.
+//!
 //! UDP (direct)
 //! ─────────────
 //! One OS `UdpSocket` per flow, driven by per-flow Tokio tasks. No smoltcp
@@ -812,6 +818,29 @@ impl SmoltcpForwarder {
             dst_port,
         };
 
+        // Explicit gateway-DoT rejection, before any live-flow or dial
+        // handling: nothing listens for DoT on the tunnel gateway, and
+        // dialing it would hang on the blackholed gateway route until
+        // DIAL_TIMEOUT. Answer the SYN with a RST immediately so the
+        // client fails fast (e.g. an Android Private DNS probe), with
+        // no dial entry created and no SYN-ACK ever sent.
+        if is_syn
+            && dst_ip == crate::dns_proxy::TUN_DNS_ADDR
+            && dst_port == crate::dns_proxy::TUN_DOT_PORT
+        {
+            let (syn_seq, syn_payload_len) = parse_tcp_syn_seq(payload).unwrap_or((0, 0));
+            let _ = self.cmd_tx.try_send(PollCommand::RejectSyn {
+                key,
+                syn_seq,
+                syn_payload_len,
+            });
+            let (lock, cvar) = &*self.work;
+            let mut flag = lock.lock().expect("work lock should not be poisoned");
+            *flag = true;
+            cvar.notify_one();
+            return;
+        }
+
         // A live flow owns this tuple: its mapped port is reused (a
         // retransmitted SYN for a live flow must NOT create a second
         // smoltcp socket). Anything else is a new flow (SYN) or a packet
@@ -1158,6 +1187,13 @@ enum PollCommand {
         syn_seq: u32,
         syn_payload_len: u32,
     },
+    /// Explicit rejection of a SYN that was never dialed (gateway DoT):
+    /// answer it with a RST immediately, same shape as DialFailed.
+    RejectSyn {
+        key: TcpFlowKey,
+        syn_seq: u32,
+        syn_payload_len: u32,
+    },
 }
 
 // ── Pending / established connection state ─────────────────────────────────────
@@ -1241,6 +1277,48 @@ fn smoltcp_poll_wait_duration(
     now: SmoltcpInstant,
 ) -> Option<Duration> {
     iface.poll_delay(now, sockets).map(Duration::from)
+}
+
+/// Answer a SYN with a RST through the poll thread's own outbound
+/// channel (own outbound sequence, exactly like smoltcp's egress
+/// packets). Shared by the dial-failure path and the explicit
+/// gateway-DoT rejection: in both cases the port is not open, and no
+/// SYN-ACK was ever sent for the SYN.
+fn emit_syn_rst(
+    session_id: u64,
+    outbound_tx: &mpsc::UnboundedSender<SessionFrame>,
+    outbound_seq: &Arc<AtomicU64>,
+    key: &TcpFlowKey,
+    syn_seq: u32,
+    syn_payload_len: u32,
+) {
+    match build_ipv4_tcp_rst(
+        key.dst_ip,
+        key.client_src_ip,
+        key.dst_port,
+        key.client_src_port,
+        syn_seq,
+        syn_payload_len,
+    ) {
+        Ok(pkt) => {
+            let frame = SessionFrame {
+                header: SessionHeader {
+                    connection_id: session_id as u32,
+                    sequence: outbound_seq.fetch_add(1, Ordering::Relaxed),
+                    flags: 0,
+                },
+                payload: Bytes::from(pkt),
+            };
+            let _ = outbound_tx.send(frame);
+        }
+        Err(err) => {
+            warn!(
+                session_id,
+                error = %err,
+                "failed to build RST for rejected SYN"
+            );
+        }
+    }
 }
 
 fn smoltcp_poll_thread(
@@ -1398,36 +1476,32 @@ fn smoltcp_poll_thread(
                     syn_payload_len,
                 }) => {
                     // Answer the held SYN with a RST: the port is not
-                    // open, and no SYN-ACK was ever sent for it. The RST
-                    // goes out through the thread's own outbound sequence,
-                    // exactly like smoltcp's egress packets.
-                    match build_ipv4_tcp_rst(
-                        key.dst_ip,
-                        key.client_src_ip,
-                        key.dst_port,
-                        key.client_src_port,
+                    // open, and no SYN-ACK was ever sent for it.
+                    emit_syn_rst(
+                        session_id,
+                        &outbound_tx,
+                        &outbound_seq,
+                        &key,
                         syn_seq,
                         syn_payload_len,
-                    ) {
-                        Ok(pkt) => {
-                            let frame = SessionFrame {
-                                header: SessionHeader {
-                                    connection_id: session_id as u32,
-                                    sequence: outbound_seq.fetch_add(1, Ordering::Relaxed),
-                                    flags: 0,
-                                },
-                                payload: Bytes::from(pkt),
-                            };
-                            let _ = outbound_tx.send(frame);
-                        }
-                        Err(err) => {
-                            warn!(
-                                session_id,
-                                error = %err,
-                                "dial-first: failed to build RST for failed dial"
-                            );
-                        }
-                    }
+                    );
+                }
+                Ok(PollCommand::RejectSyn {
+                    key,
+                    syn_seq,
+                    syn_payload_len,
+                }) => {
+                    // Explicit rejection: no dial was ever attempted for
+                    // this tuple, so there is nothing to clean up — just
+                    // answer the SYN with a RST.
+                    emit_syn_rst(
+                        session_id,
+                        &outbound_tx,
+                        &outbound_seq,
+                        &key,
+                        syn_seq,
+                        syn_payload_len,
+                    );
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -3348,6 +3422,74 @@ mod tests {
         assert!(
             !pkts.iter().any(|p| p.flags & TCP_SYN != 0),
             "a refused dial must never be SYN-ACKed"
+        );
+        let rst = pkts
+            .iter()
+            .find(|p| p.flags & TCP_RST != 0)
+            .expect("RST should be present");
+        assert_eq!(rst.flags & (TCP_RST | TCP_ACK), TCP_RST | TCP_ACK);
+        assert_eq!(rst.seq, 0);
+        assert_eq!(rst.ack, client_isn.wrapping_add(1));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gateway_dot_syn_gets_immediate_rst_without_dial() {
+        // A SYN to the tunnel gateway's DoT port must be answered with
+        // a RST immediately, not dialed: nothing listens for DoT on the
+        // gateway, and dialing it would hang on the blackholed gateway
+        // route until DIAL_TIMEOUT. The proof that no dial happened is
+        // synchronous: right after the ingest, with no await in between,
+        // the held-dial map must still be empty (the dial task could
+        // not have run, and the explicit path never inserts an entry).
+        let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<SessionFrame>();
+        let forwarder = SmoltcpForwarder::new(46, outbound_tx, Arc::new(AtomicU64::new(0)));
+
+        let client_ip = Ipv4Addr::new(10, 8, 0, 2);
+        let client_port = 40011u16;
+        let gateway_ip = crate::dns_proxy::TUN_DNS_ADDR;
+        let gateway_dot_port = crate::dns_proxy::TUN_DOT_PORT;
+        let client_isn = 6000u32;
+        let syn = build_ipv4_tcp_packet(
+            client_ip,
+            gateway_ip,
+            client_port,
+            gateway_dot_port,
+            client_isn,
+            0,
+            TCP_SYN,
+            &[],
+        );
+        forwarder.ingest_packet(SessionFrame {
+            header: SessionHeader {
+                connection_id: 1,
+                sequence: 1,
+                flags: 0,
+            },
+            payload: syn.into(),
+        });
+        assert_eq!(
+            forwarder.dial_pending_len(),
+            0,
+            "a gateway-DoT SYN must be rejected outright, never held for a dial"
+        );
+
+        let pkts = collect_tcp_packets_for_flow(
+            &mut outbound_rx,
+            client_ip,
+            client_port,
+            gateway_ip,
+            gateway_dot_port,
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(
+            pkts.iter().any(|p| p.flags & TCP_RST != 0),
+            "a gateway-DoT SYN must be answered with a RST, got flags: {:?}",
+            pkts.iter().map(|p| p.flags).collect::<Vec<_>>()
+        );
+        assert!(
+            !pkts.iter().any(|p| p.flags & TCP_SYN != 0),
+            "a gateway-DoT SYN must never be SYN-ACKed"
         );
         let rst = pkts
             .iter()

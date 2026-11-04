@@ -25,6 +25,11 @@ use crate::smoltcp_forwarder::{build_ipv4_udp_packet, Ipv4UdpPacket};
 pub const TUN_DNS_ADDR: Ipv4Addr = Ipv4Addr::new(10, 8, 0, 1);
 /// DNS port.
 pub const TUN_DNS_PORT: u16 = 53;
+/// DNS-over-TLS port. No DoT listener exists on the gateway: TCP SYNs
+/// to it are answered with an immediate RST by the smoltcp forwarder
+/// (see its explicit gateway-DoT rejection) instead of being dialed,
+/// which would hang on the blackholed gateway route until DIAL_TIMEOUT.
+pub const TUN_DOT_PORT: u16 = 853;
 
 /// How long to wait for one upstream resolver before trying the next.
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(2);
