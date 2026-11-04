@@ -17,6 +17,13 @@
 //! synchronous poll() never blocks async tasks). Established connections are
 //! bridged to real OS `TcpStream`s via per-connection async Tokio tasks.
 //!
+//! Dial-first handshake: a client's SYN is never answered until the upstream
+//! connection exists. The SYN is held while a Tokio task dials the original
+//! destination (bounded by `DIAL_TIMEOUT`); only on success is a smoltcp
+//! socket created and the buffered SYN injected, so the SYN-ACK the client
+//! sees is real. On dial failure or timeout the client gets a RST instead.
+//! Nothing is ever SYN-ACKed that is not actually open.
+//!
 //! UDP (direct)
 //! ─────────────
 //! One OS `UdpSocket` per flow, driven by per-flow Tokio tasks. No smoltcp
@@ -71,6 +78,21 @@ const MAPPED_PORT_LAST: u32 = 65535;
 /// not established within this window, so a half-open flow whose handshake
 /// silently vanished cannot squat on its mapped port and flow record.
 const PENDING_CONN_TIMEOUT: Duration = Duration::from_secs(120);
+/// Upstream dial budget for the dial-first handshake: a client's SYN is
+/// held until the upstream connection succeeds or this elapses, so a port
+/// that is not actually open is never SYN-ACKed. The dial runs from the
+/// server to the internet, so tunnel RTT does not consume it.
+const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
+/// Cap on concurrent held SYNs awaiting an upstream dial. Past this, new
+/// SYNs are dropped and the client retransmits (standard overload behavior).
+const MAX_PENDING_DIALS: usize = 1024;
+/// A dial-pending entry older than this is treated as stale: the next SYN
+/// for its tuple starts a fresh dial instead of being dropped as a
+/// retransmission (guards against a dial task that died without cleanup).
+const DIAL_PENDING_STALE: Duration = Duration::from_secs(30);
+/// TCP flag bits (production code; the tests module has its own copies).
+const TCP_FLAG_RST: u8 = 0x04;
+const TCP_FLAG_ACK: u8 = 0x10;
 
 #[repr(u8)]
 enum TcpBridgeDumpDirection {
@@ -335,6 +357,22 @@ pub struct SmoltcpForwarder {
     session_id: u64,
     /// Count of packets delivered to ingest_packet (for tests).
     ingested_packets: AtomicU64,
+    /// SYNs held while their upstream dial runs, keyed by full client
+    /// tuple. Shared with the dial tasks, which remove their entry when
+    /// the dial resolves; a client RST cancels an entry early.
+    dial_pending: Arc<Mutex<HashMap<TcpFlowKey, DialPending>>>,
+    /// Upstream dial budget for the dial-first handshake.
+    dial_timeout: Duration,
+}
+
+/// One client SYN held while its upstream dial runs.
+struct DialPending {
+    /// The client's original SYN packet, buffered for injection once the
+    /// upstream dial succeeds.
+    syn: Vec<u8>,
+    /// When the SYN was held; entries older than DIAL_PENDING_STALE are
+    /// treated as stale by the next SYN for the tuple.
+    created_at: Instant,
 }
 
 // ── Session-level outbound routing ──────────────────────────────────────────
@@ -661,7 +699,18 @@ impl SmoltcpForwarder {
             dns_proxy: crate::dns_proxy::DnsProxy::new(session_id, outbound_tx),
             session_id,
             ingested_packets: AtomicU64::new(0),
+            dial_pending: Arc::new(Mutex::new(HashMap::new())),
+            dial_timeout: DIAL_TIMEOUT,
         }
+    }
+
+    /// Number of SYNs currently held awaiting an upstream dial (tests only).
+    #[cfg(test)]
+    fn dial_pending_len(&self) -> usize {
+        self.dial_pending
+            .lock()
+            .expect("dial pending lock should not be poisoned")
+            .len()
     }
 
     /// Ingest one raw IPv4 frame from the client.
@@ -763,62 +812,147 @@ impl SmoltcpForwarder {
             dst_port,
         };
 
-        // Resolve (or, for a SYN, allocate) the flow's smoltcp-side mapped
-        // port. A retransmitted SYN for a live flow reuses its mapping and
-        // must NOT create a second smoltcp socket.
-        let mut create_mapped_port = None;
+        // A live flow owns this tuple: its mapped port is reused (a
+        // retransmitted SYN for a live flow must NOT create a second
+        // smoltcp socket). Anything else is a new flow (SYN) or a packet
+        // for a flow that does not exist yet (non-SYN).
         let mapped_port = {
-            let mut flows = self
+            let flows = self
                 .tcp_flows
                 .lock()
                 .expect("tcp flow map lock should not be poisoned");
-            if let Some(&existing) = flows.by_tuple.get(&key) {
-                Some(existing)
-            } else if is_syn {
-                match flows.allocate() {
-                    Some(mapped) => {
-                        flows.by_tuple.insert(key, mapped);
-                        create_mapped_port = Some(mapped);
-                        Some(mapped)
-                    }
-                    None => None,
-                }
-            } else {
-                None
-            }
+            flows.by_tuple.get(&key).copied()
         };
 
-        if let Some(mapped) = create_mapped_port {
-            // Pre-create the smoltcp socket listening on the mapped port
-            // BEFORE injecting the SYN (same command channel, FIFO).
-            let _ = self.cmd_tx.try_send(PollCommand::CreateTcpSocket {
-                mapped_port: mapped,
-                original_dst_ip: dst_ip,
-                dst_port,
-                client_src_ip: src_ip,
-                client_src_port: src_port,
-            });
+        if let Some(mapped) = mapped_port {
+            // Rewrite dst_ip → SMOLTCP_IP and dst_port → the flow's
+            // mapped port (no TCP checksum fix needed; smoltcp is
+            // configured to skip Rx checksum verification).
+            if let Some(rewritten) = rewrite_dst_inbound(payload, mapped) {
+                self.inject_tcp_packet(rewritten);
+            }
+            return;
         }
 
-        match mapped_port {
-            Some(mapped) => {
-                // Rewrite dst_ip → SMOLTCP_IP and dst_port → the flow's
-                // mapped port (no TCP checksum fix needed; smoltcp is
-                // configured to skip Rx checksum verification).
-                if let Some(rewritten) = rewrite_dst_inbound(payload, mapped) {
-                    self.inject_tcp_packet(rewritten);
+        if is_syn {
+            // Dial-first: hold the SYN until the upstream dial resolves,
+            // so a port that is not actually open is never SYN-ACKed.
+            // A retransmitted SYN for a held dial is dropped; a stale
+            // held entry is replaced by a fresh dial.
+            let mut held = self
+                .dial_pending
+                .lock()
+                .expect("dial pending lock should not be poisoned");
+            if let Some(entry) = held.get(&key) {
+                if entry.created_at.elapsed() < DIAL_PENDING_STALE {
+                    return;
                 }
+                held.remove(&key);
             }
-            None => {
-                // No live flow for this packet (non-SYN for an unknown or
-                // already-torn-down flow, or the mapped-port pool is
-                // exhausted): preserve the historical behavior — rewrite
-                // only the destination IP and let smoltcp disposition it.
-                if let Some(rewritten) = rewrite_dst_ip_inbound(payload) {
-                    self.inject_tcp_packet(rewritten);
-                }
+            if held.len() >= MAX_PENDING_DIALS {
+                return;
+            }
+            held.insert(
+                key,
+                DialPending {
+                    syn: payload.to_vec(),
+                    created_at: Instant::now(),
+                },
+            );
+            drop(held);
+            self.spawn_upstream_dial(key, SocketAddrV4::new(dst_ip, dst_port));
+            return;
+        }
+
+        // Non-SYN for a tuple with no live flow: if a dial is held, a RST
+        // cancels it (the client gave up while the dial ran); anything
+        // else is dropped — no socket exists yet to deliver it to. (A
+        // late packet for a torn-down flow used to reach smoltcp and
+        // earn a RST that the egress path dropped as unmatched, so the
+        // client-visible behavior is unchanged.)
+        if let Some((_, _, _, _, flags)) = parse_ipv4_tcp_tuple_flags(payload) {
+            if flags & TCP_FLAG_RST != 0 {
+                self.dial_pending
+                    .lock()
+                    .expect("dial pending lock should not be poisoned")
+                    .remove(&key);
             }
         }
+    }
+
+    /// Dial with a budget. A timeout surfaces as `ErrorKind::TimedOut`,
+    /// so the caller treats it exactly like any other dial failure (RST,
+    /// never SYN-ACK). Factored out so tests can prove the budget is
+    /// enforced without a real hanging destination (this sandbox has
+    /// none: loopback connects complete synchronously and everything
+    /// else is proxy-instant or EPERM-fast).
+    async fn dial_with_timeout<F, Fut>(
+        connect: F,
+        timeout_dur: Duration,
+    ) -> std::io::Result<TcpStream>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = std::io::Result<TcpStream>>,
+    {
+        match timeout(timeout_dur, connect()).await {
+            Ok(result) => result,
+            Err(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "dial timed out",
+            )),
+        }
+    }
+
+    /// Spawn the upstream dial for a held SYN. On success the dial task
+    /// hands the smoltcp thread a DialSucceeded command carrying the
+    /// pre-connected stream; on failure or timeout it hands it a
+    /// DialFailed command. If the held entry was cancelled (client RST)
+    /// before the dial resolved, the task drops its result silently —
+    /// the client's retransmission, if any, starts a fresh dial.
+    fn spawn_upstream_dial(&self, key: TcpFlowKey, dst: SocketAddrV4) {
+        let cmd_tx = self.cmd_tx.clone();
+        let work = self.work.clone();
+        let dial_pending = self.dial_pending.clone();
+        let dial_timeout = self.dial_timeout;
+        tokio::spawn(async move {
+            let result = Self::dial_with_timeout(|| TcpStream::connect(dst), dial_timeout).await;
+            // Take the held entry: None means the client cancelled (RST)
+            // while the dial ran.
+            let entry = dial_pending
+                .lock()
+                .expect("dial pending lock should not be poisoned")
+                .remove(&key);
+            let Some(entry) = entry else {
+                return;
+            };
+            let command = match result {
+                Ok(stream) => PollCommand::DialSucceeded {
+                    key,
+                    syn: entry.syn,
+                    stream,
+                },
+                Err(_) => {
+                    let (syn_seq, syn_payload_len) =
+                        parse_tcp_syn_seq(&entry.syn).unwrap_or((0, 0));
+                    PollCommand::DialFailed {
+                        key,
+                        syn_seq,
+                        syn_payload_len,
+                    }
+                }
+            };
+            if cmd_tx.try_send(command).is_err() {
+                warn!(
+                    dst = %dst,
+                    "dial-first: smoltcp command channel full, dial outcome dropped"
+                );
+                return;
+            }
+            let (lock, cvar) = &*work;
+            let mut flag = lock.lock().expect("work lock should not be poisoned");
+            *flag = true;
+            cvar.notify_one();
+        });
     }
 
     /// Hand one (already rewritten) inbound packet to the smoltcp poll
@@ -1009,14 +1143,20 @@ fn free_tcp_flow(flows: &SharedTcpFlowMap, key: &TcpFlowKey) {
 enum PollCommand {
     /// Raw (inbound-rewritten) IPv4 packet to inject into smoltcp.
     InjectPacket(Vec<u8>),
-    /// Pre-create a TCP socket listening on the flow's unique mapped port
-    /// before the SYN arrives.
-    CreateTcpSocket {
-        mapped_port: u16,
-        original_dst_ip: Ipv4Addr,
-        dst_port: u16,
-        client_src_ip: Ipv4Addr,
-        client_src_port: u16,
+    /// An upstream dial succeeded: create the flow's smoltcp socket,
+    /// inject the buffered SYN, and hold the pre-connected stream for
+    /// the bridge task once the handshake establishes.
+    DialSucceeded {
+        key: TcpFlowKey,
+        syn: Vec<u8>,
+        stream: TcpStream,
+    },
+    /// An upstream dial failed or timed out: answer the held SYN with a
+    /// RST so the client sees a genuinely closed port (never a SYN-ACK).
+    DialFailed {
+        key: TcpFlowKey,
+        syn_seq: u32,
+        syn_payload_len: u32,
     },
 }
 
@@ -1140,6 +1280,11 @@ fn smoltcp_poll_thread(
     // Sockets waiting to transition from Listen → Established.
     // Key: SocketHandle.  Using a Vec to avoid HashMap overhead for few conns.
     let mut pending: Vec<PendingTcpConn> = Vec::new();
+    // Pre-connected upstream streams, keyed by client tuple, held from a
+    // successful dial until the handshake establishes (promotion moves
+    // the stream into the bridge task) or the flow dies (teardown drops
+    // it). Only the smoltcp thread touches this map.
+    let mut pending_streams: HashMap<TcpFlowKey, TcpStream> = HashMap::new();
     // Established connections.
     let mut active: HashMap<SocketHandle, ActiveTcpConn> = HashMap::new();
     // Track which handles have been moved to active (to skip in pending scan).
@@ -1194,39 +1339,94 @@ fn smoltcp_poll_thread(
                     }
                     device.rx.push_back(pkt);
                 }
-                Ok(PollCommand::CreateTcpSocket {
-                    mapped_port,
-                    original_dst_ip,
-                    dst_port,
-                    client_src_ip,
-                    client_src_port,
-                }) => {
+                Ok(PollCommand::DialSucceeded { key, syn, stream }) => {
+                    // A duplicate dial can race the first one's completion
+                    // (a retransmission landing between the dial task's
+                    // take and this handler): if the tuple already owns a
+                    // flow, drop the duplicate stream and SYN.
+                    let mapped = {
+                        let mut flows = tcp_flows
+                            .lock()
+                            .expect("tcp flow map lock should not be poisoned");
+                        if flows.by_tuple.contains_key(&key) {
+                            None
+                        } else {
+                            match flows.allocate() {
+                                Some(mapped) => {
+                                    flows.by_tuple.insert(key, mapped);
+                                    Some(mapped)
+                                }
+                                None => None,
+                            }
+                        }
+                    };
+                    let Some(mapped) = mapped else {
+                        continue;
+                    };
+                    // Rewrite the buffered SYN to the flow's mapped port
+                    // before creating the socket; a rewrite failure tears
+                    // the flow back down immediately.
+                    let Some(rewritten) = rewrite_dst_inbound(&syn, mapped) else {
+                        free_tcp_flow(&tcp_flows, &key);
+                        continue;
+                    };
                     let rx_buf = stcp::SocketBuffer::new(vec![0u8; TCP_SOCKET_RX_BUF]);
                     let tx_buf = stcp::SocketBuffer::new(vec![0u8; TCP_SOCKET_TX_BUF]);
                     let mut socket = stcp::Socket::new(rx_buf, tx_buf);
-                    if socket.listen(mapped_port).is_ok() {
+                    if socket.listen(mapped).is_ok() {
                         let handle = sockets.add(socket);
                         pending.push(PendingTcpConn {
                             handle,
-                            mapped_port,
-                            original_dst_ip,
-                            dst_port,
-                            client_src_ip,
-                            client_src_port,
+                            mapped_port: mapped,
+                            original_dst_ip: key.dst_ip,
+                            dst_port: key.dst_port,
+                            client_src_ip: key.client_src_ip,
+                            client_src_port: key.client_src_port,
                             created_at: Instant::now(),
                         });
+                        pending_streams.insert(key, stream);
+                        device.rx.push_back(rewritten);
                     } else {
                         // No socket will ever own this mapping; free it so
                         // the port returns to the pool immediately.
-                        free_tcp_flow(
-                            &tcp_flows,
-                            &TcpFlowKey {
-                                client_src_ip,
-                                client_src_port,
-                                dst_ip: original_dst_ip,
-                                dst_port,
-                            },
-                        );
+                        free_tcp_flow(&tcp_flows, &key);
+                    }
+                }
+                Ok(PollCommand::DialFailed {
+                    key,
+                    syn_seq,
+                    syn_payload_len,
+                }) => {
+                    // Answer the held SYN with a RST: the port is not
+                    // open, and no SYN-ACK was ever sent for it. The RST
+                    // goes out through the thread's own outbound sequence,
+                    // exactly like smoltcp's egress packets.
+                    match build_ipv4_tcp_rst(
+                        key.dst_ip,
+                        key.client_src_ip,
+                        key.dst_port,
+                        key.client_src_port,
+                        syn_seq,
+                        syn_payload_len,
+                    ) {
+                        Ok(pkt) => {
+                            let frame = SessionFrame {
+                                header: SessionHeader {
+                                    connection_id: session_id as u32,
+                                    sequence: outbound_seq.fetch_add(1, Ordering::Relaxed),
+                                    flags: 0,
+                                },
+                                payload: Bytes::from(pkt),
+                            };
+                            let _ = outbound_tx.send(frame);
+                        }
+                        Err(err) => {
+                            warn!(
+                                session_id,
+                                error = %err,
+                                "dial-first: failed to build RST for failed dial"
+                            );
+                        }
                     }
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
@@ -1344,6 +1544,21 @@ fn smoltcp_poll_thread(
         for &idx in newly_established.iter().rev() {
             let p = pending.remove(idx);
 
+            // The handshake completed, so the dial-first stream must be
+            // waiting. If it is not (should be impossible — sockets are
+            // only created after a dial), tear the flow down rather than
+            // reverting to accept-first.
+            let Some(stream) = pending_streams.remove(&p.key()) else {
+                warn!(
+                    session_id,
+                    dst = %format!("{}:{}", p.original_dst_ip, p.dst_port),
+                    "dial-first: established flow without a pre-connected stream; tearing down"
+                );
+                sockets.remove(p.handle);
+                free_tcp_flow(&tcp_flows, &p.key());
+                continue;
+            };
+
             // No tuple-conflict check is needed (or possible) here: the
             // flow owns a unique mapped port, so it can never be confused
             // with another flow — including one from the same client port
@@ -1369,6 +1584,7 @@ fn smoltcp_poll_thread(
                     session_id_copy,
                     conn_id_copy,
                     dst,
+                    stream,
                     to_bridge_rx,
                     from_bridge_tx,
                     work_notify,
@@ -1520,6 +1736,8 @@ fn smoltcp_poll_thread(
         for h in closed {
             if let Some(conn) = active.remove(&h) {
                 free_tcp_flow(&tcp_flows, &conn.key());
+                // Normally already taken at promotion; drop defensively.
+                pending_streams.remove(&conn.key());
             }
             promoted.remove(&h);
             sockets.remove(h);
@@ -1546,6 +1764,9 @@ fn smoltcp_poll_thread(
             let p = pending.remove(idx);
             sockets.remove(p.handle);
             free_tcp_flow(&tcp_flows, &p.key());
+            // The handshake never completed: drop the pre-connected
+            // stream instead of leaking an open upstream connection.
+            pending_streams.remove(&p.key());
         }
 
         // Clean up promoted handles that are no longer in pending.
@@ -1574,6 +1795,7 @@ async fn tcp_bridge_task(
     session_id: u64,
     conn_id: u32,
     dst: SocketAddrV4,
+    stream: TcpStream,
     mut from_smoltcp: tokio::sync::mpsc::UnboundedReceiver<Bytes>,
     to_smoltcp: std::sync::mpsc::Sender<Bytes>,
     work: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
@@ -1581,17 +1803,13 @@ async fn tcp_bridge_task(
     _outbound_tx: mpsc::UnboundedSender<SessionFrame>,
     tcp_bridge_dump: Option<Arc<TcpBridgeDumpWriter>>,
 ) {
-    let stream = match TcpStream::connect(dst).await {
-        Ok(s) => s,
-        Err(err) => {
-            warn!(session_id, %dst, error = %err, "TCP bridge: connect failed");
-            return;
-        }
-    };
+    // The stream is pre-connected by the dial-first handshake: the client
+    // was only SYN-ACKed after this dial succeeded. `dst` is kept for
+    // logging; the stream itself is the upstream connection.
     if let Err(err) = stream.set_nodelay(true) {
         warn!(session_id, %dst, error = %err, "TCP bridge: failed to enable TCP_NODELAY");
     }
-    debug!(session_id, %dst, "TCP bridge: connected");
+    debug!(session_id, %dst, "TCP bridge: connected (pre-dialed)");
 
     let (mut reader, mut writer) = stream.into_split();
     let to_smoltcp_read = to_smoltcp.clone();
@@ -2343,6 +2561,74 @@ pub(crate) fn build_ipv4_udp_packet(
     Ok(pkt)
 }
 
+/// Build a TCP RST|ACK answering a client's SYN whose upstream dial failed
+/// or timed out. seq=0, ack=SYN seq + 1 + SYN payload bytes: the ACK number
+/// validates the RST against the client's SYN-SENT state, so the client
+/// sees a genuinely closed port instead of a handshake that later stalls.
+/// (A RST is only ever sent for a held SYN — never after a SYN-ACK — so
+/// the client cannot mistake it for a mid-connection reset.)
+fn build_ipv4_tcp_rst(
+    src_ip: Ipv4Addr,
+    dst_ip: Ipv4Addr,
+    src_port: u16,
+    dst_port: u16,
+    syn_seq: u32,
+    syn_payload_len: u32,
+) -> anyhow::Result<Vec<u8>> {
+    let total_len = 40usize;
+    let mut pkt = vec![0u8; total_len];
+    pkt[0] = 0x45;
+    pkt[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+    pkt[6..8].copy_from_slice(&0x4000u16.to_be_bytes());
+    pkt[8] = 64;
+    pkt[9] = 6;
+    pkt[12..16].copy_from_slice(&src_ip.octets());
+    pkt[16..20].copy_from_slice(&dst_ip.octets());
+    pkt[20..22].copy_from_slice(&src_port.to_be_bytes());
+    pkt[22..24].copy_from_slice(&dst_port.to_be_bytes());
+    pkt[24..28].copy_from_slice(&0u32.to_be_bytes());
+    pkt[28..32].copy_from_slice(
+        &syn_seq
+            .wrapping_add(1)
+            .wrapping_add(syn_payload_len)
+            .to_be_bytes(),
+    );
+    pkt[32] = 0x50; // data offset 5, no options
+    pkt[33] = TCP_FLAG_RST | TCP_FLAG_ACK;
+    // window 0, urgent pointer 0 (already zeroed).
+    let ip_cksum = ipv4_checksum(&pkt[..20]);
+    pkt[10..12].copy_from_slice(&ip_cksum.to_be_bytes());
+    let tcp_cksum = tcp_udp_checksum_ipv4(src_ip, dst_ip, 6, &pkt[20..]);
+    pkt[36..38].copy_from_slice(&tcp_cksum.to_be_bytes());
+    Ok(pkt)
+}
+
+/// Extract a SYN's sequence number and payload length (for the RST ACK
+/// number: ack = seq + 1 + payload bytes). Returns None for packets that
+/// are not IPv4/TCP or are too short.
+fn parse_tcp_syn_seq(packet: &[u8]) -> Option<(u32, u32)> {
+    if packet.len() < 40 {
+        return None;
+    }
+    let version = packet[0] >> 4;
+    let ihl = (packet[0] & 0x0f) as usize;
+    if version != 4 || ihl < 5 || packet[9] != 6 {
+        return None;
+    }
+    let ihl_bytes = ihl * 4;
+    if packet.len() < ihl_bytes + 20 {
+        return None;
+    }
+    let tcp = &packet[ihl_bytes..];
+    let seq = u32::from_be_bytes([tcp[4], tcp[5], tcp[6], tcp[7]]);
+    let tcp_hlen = ((tcp[12] >> 4) as usize) * 4;
+    if tcp_hlen < 20 || packet.len() < ihl_bytes + tcp_hlen {
+        return None;
+    }
+    let payload_len = packet.len() - ihl_bytes - tcp_hlen;
+    Some((seq, payload_len as u32))
+}
+
 fn build_ipv4_icmp_packet(
     src_ip: Ipv4Addr,
     dst_ip: Ipv4Addr,
@@ -2403,6 +2689,7 @@ mod tests {
 
     const TCP_FIN: u8 = 0x01;
     const TCP_SYN: u8 = 0x02;
+    const TCP_RST: u8 = 0x04;
     const TCP_ACK: u8 = 0x10;
     const TCP_PSH: u8 = 0x08;
 
@@ -2967,6 +3254,314 @@ mod tests {
     /// blackholed. Production evidence (2026-10-17): hundreds of dropped
     /// packets on real sessions; FAST-style clients — many parallel flows to
     /// many CDN IPs on :443 with ephemeral-port reuse — hit it constantly.
+    /// Collect every outbound TCP packet for one flow for `window`,
+    /// parsed. Used to prove a refused/timeout dial yields a RST and
+    /// never a SYN-ACK.
+    async fn collect_tcp_packets_for_flow(
+        outbound_rx: &mut mpsc::UnboundedReceiver<SessionFrame>,
+        client_ip: Ipv4Addr,
+        client_port: u16,
+        server_ip: Ipv4Addr,
+        server_port: u16,
+        window: Duration,
+    ) -> Vec<ParsedTcpPacket> {
+        let mut out = Vec::new();
+        let deadline = Instant::now() + window;
+        loop {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .unwrap_or(Duration::ZERO);
+            if remaining.is_zero() {
+                break;
+            }
+            match timeout(remaining, outbound_rx.recv()).await {
+                Ok(Some(frame)) => {
+                    let Some(pkt) = parse_ipv4_tcp_packet(&frame.payload) else {
+                        continue;
+                    };
+                    if pkt.src_ip == server_ip
+                        && pkt.dst_ip == client_ip
+                        && pkt.src_port == server_port
+                        && pkt.dst_port == client_port
+                    {
+                        out.push(pkt);
+                    }
+                }
+                _ => break,
+            }
+        }
+        out
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dial_first_refused_destination_gets_rst_not_syn_ack() {
+        // Bind a port and release it: the dial below is refused.
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("test TCP listener should bind");
+        let server_port = listener
+            .local_addr()
+            .expect("listener should have local addr")
+            .port();
+        drop(listener);
+
+        let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<SessionFrame>();
+        let forwarder = SmoltcpForwarder::new(45, outbound_tx, Arc::new(AtomicU64::new(0)));
+
+        let client_ip = Ipv4Addr::new(10, 8, 0, 2);
+        let client_port = 40010u16;
+        let server_ip = Ipv4Addr::LOCALHOST;
+        let client_isn = 5000u32;
+        let syn = build_ipv4_tcp_packet(
+            client_ip,
+            server_ip,
+            client_port,
+            server_port,
+            client_isn,
+            0,
+            TCP_SYN,
+            &[],
+        );
+        forwarder.ingest_packet(SessionFrame {
+            header: SessionHeader {
+                connection_id: 1,
+                sequence: 1,
+                flags: 0,
+            },
+            payload: syn.into(),
+        });
+
+        let pkts = collect_tcp_packets_for_flow(
+            &mut outbound_rx,
+            client_ip,
+            client_port,
+            server_ip,
+            server_port,
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(
+            pkts.iter().any(|p| p.flags & TCP_RST != 0),
+            "a refused dial must answer the SYN with a RST, got flags: {:?}",
+            pkts.iter().map(|p| p.flags).collect::<Vec<_>>()
+        );
+        assert!(
+            !pkts.iter().any(|p| p.flags & TCP_SYN != 0),
+            "a refused dial must never be SYN-ACKed"
+        );
+        let rst = pkts
+            .iter()
+            .find(|p| p.flags & TCP_RST != 0)
+            .expect("RST should be present");
+        assert_eq!(rst.flags & (TCP_RST | TCP_ACK), TCP_RST | TCP_ACK);
+        assert_eq!(rst.seq, 0);
+        assert_eq!(rst.ack, client_isn.wrapping_add(1));
+    }
+
+    #[tokio::test]
+    async fn dial_with_timeout_enforces_budget() {
+        // A future that never resolves must surface as a timeout error,
+        // not hang: this pins the budget wiring. A real hanging
+        // destination does not exist in this sandbox (loopback connects
+        // complete synchronously, everything else is proxy-instant or
+        // EPERM-fast), so the refused test covers the DialFailed → RST
+        // half and this covers the timeout → DialFailed half. The live
+        // post-deploy check (phone SYN to 10.8.0.1:853) proves the full
+        // timeout path against a real blackhole.
+        let err = SmoltcpForwarder::dial_with_timeout(
+            || std::future::pending::<std::io::Result<TcpStream>>(),
+            Duration::from_millis(10),
+        )
+        .await
+        .expect_err("a never-resolving dial must time out");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        // And a real dial error passes through untouched, not
+        // misclassified as a timeout.
+        let err = SmoltcpForwarder::dial_with_timeout(
+            || async {
+                Err::<TcpStream, _>(std::io::Error::new(std::io::ErrorKind::Other, "boom"))
+            },
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("a failing dial must stay an error");
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dial_first_retransmitted_syn_dials_once() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("test TCP listener should bind");
+        let server_port = listener
+            .local_addr()
+            .expect("listener should have local addr")
+            .port();
+        let (accept_tx, mut accept_rx) = mpsc::unbounded_channel::<()>();
+        let server_task = tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((socket, _)) => {
+                        let _ = accept_tx.send(());
+                        drop(socket);
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<SessionFrame>();
+        let forwarder = SmoltcpForwarder::new(47, outbound_tx, Arc::new(AtomicU64::new(0)));
+
+        let client_ip = Ipv4Addr::new(10, 8, 0, 2);
+        let client_port = 40012u16;
+        let server_ip = Ipv4Addr::LOCALHOST;
+        let client_isn = 7000u32;
+        let syn = build_ipv4_tcp_packet(
+            client_ip,
+            server_ip,
+            client_port,
+            server_port,
+            client_isn,
+            0,
+            TCP_SYN,
+            &[],
+        );
+        let frame = |seq: u64, payload: Vec<u8>| SessionFrame {
+            header: SessionHeader {
+                connection_id: 1,
+                sequence: seq,
+                flags: 0,
+            },
+            payload: payload.into(),
+        };
+        // Two back-to-back ingests with no await between: the dial task
+        // cannot run between them, so the second SYN must hit the held
+        // entry and be dropped, not start a second dial.
+        forwarder.ingest_packet(frame(1, syn.clone()));
+        forwarder.ingest_packet(frame(2, syn));
+        assert_eq!(
+            forwarder.dial_pending_len(),
+            1,
+            "a retransmitted SYN must not start a second dial"
+        );
+
+        // The surviving dial succeeds and the handshake completes.
+        let syn_ack = recv_matching_tcp_packet(
+            &mut outbound_rx,
+            client_ip,
+            client_port,
+            server_ip,
+            server_port,
+            Duration::from_secs(3),
+        )
+        .await;
+        assert_eq!(syn_ack.flags & (TCP_SYN | TCP_ACK), TCP_SYN | TCP_ACK);
+        let ack = build_ipv4_tcp_packet(
+            client_ip,
+            server_ip,
+            client_port,
+            server_port,
+            client_isn.wrapping_add(1),
+            syn_ack.seq.wrapping_add(1),
+            TCP_ACK,
+            &[],
+        );
+        forwarder.ingest_packet(frame(3, ack));
+        // Give a duplicate bridge (if one existed) time to accept.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let mut accepts = 0;
+        while accept_rx.try_recv().is_ok() {
+            accepts += 1;
+        }
+        assert_eq!(
+            accepts, 1,
+            "exactly one upstream connection should exist for one flow"
+        );
+        server_task.abort();
+    }
+
+    #[test]
+    fn build_ipv4_tcp_rst_fields_and_checksums() {
+        let src = Ipv4Addr::new(93, 184, 216, 34);
+        let dst = Ipv4Addr::new(10, 8, 0, 2);
+        let pkt = build_ipv4_tcp_rst(src, dst, 443, 40000, 7000, 0).unwrap();
+        assert_eq!(pkt.len(), 40);
+        assert_eq!(pkt[0], 0x45);
+        assert_eq!(pkt[9], 6);
+        assert_eq!(Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15]), src);
+        assert_eq!(Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]), dst);
+        assert_eq!(u16::from_be_bytes([pkt[20], pkt[21]]), 443);
+        assert_eq!(u16::from_be_bytes([pkt[22], pkt[23]]), 40000);
+        assert_eq!(u32::from_be_bytes([pkt[24], pkt[25], pkt[26], pkt[27]]), 0);
+        assert_eq!(
+            u32::from_be_bytes([pkt[28], pkt[29], pkt[30], pkt[31]]),
+            7001
+        );
+        assert_eq!(pkt[32], 0x50);
+        assert_eq!(pkt[33], TCP_RST | TCP_ACK);
+        assert_eq!(u16::from_be_bytes([pkt[34], pkt[35]]), 0);
+        // Checksums verify: zero the field, recompute, compare.
+        let mut header = pkt[..20].to_vec();
+        header[10..12].copy_from_slice(&[0, 0]);
+        assert_eq!(
+            u16::from_be_bytes([pkt[10], pkt[11]]),
+            ipv4_checksum(&header)
+        );
+        let mut segment = pkt[20..].to_vec();
+        segment[16..18].copy_from_slice(&[0, 0]);
+        assert_eq!(
+            u16::from_be_bytes([pkt[36], pkt[37]]),
+            tcp_udp_checksum_ipv4(src, dst, 6, &segment)
+        );
+        // A SYN with payload bytes: ack covers seq + 1 + payload.
+        let pkt2 = build_ipv4_tcp_rst(src, dst, 443, 40000, 9000, 13).unwrap();
+        assert_eq!(
+            u32::from_be_bytes([pkt2[28], pkt2[29], pkt2[30], pkt2[31]]),
+            9014
+        );
+    }
+
+    #[test]
+    fn parse_tcp_syn_seq_extracts_seq_and_payload() {
+        let syn = build_ipv4_tcp_packet(
+            Ipv4Addr::new(10, 8, 0, 2),
+            Ipv4Addr::LOCALHOST,
+            40000,
+            80,
+            12345,
+            0,
+            TCP_SYN,
+            &[],
+        );
+        assert_eq!(parse_tcp_syn_seq(&syn), Some((12345, 0)));
+        let syn_opts = build_ipv4_tcp_packet_with_options(
+            Ipv4Addr::new(10, 8, 0, 2),
+            Ipv4Addr::LOCALHOST,
+            40000,
+            80,
+            999,
+            0,
+            TCP_SYN,
+            &[],
+            &[2, 4, 0x05, 0xB4],
+        );
+        assert_eq!(parse_tcp_syn_seq(&syn_opts), Some((999, 0)));
+        let syn_data = build_ipv4_tcp_packet(
+            Ipv4Addr::new(10, 8, 0, 2),
+            Ipv4Addr::LOCALHOST,
+            40000,
+            80,
+            4242,
+            0,
+            TCP_SYN,
+            b"hello",
+        );
+        assert_eq!(parse_tcp_syn_seq(&syn_data), Some((4242, 5)));
+        assert_eq!(parse_tcp_syn_seq(&[0u8; 10]), None);
+        assert_eq!(parse_tcp_syn_seq(&syn[..20]), None);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn smoltcp_tcp_bridge_same_client_port_different_destinations() {
         let ip_a = Ipv4Addr::LOCALHOST;
@@ -4066,6 +4661,17 @@ mod tests {
     /// connection_id, not 0. The client drops frames with mismatched IDs.
     #[tokio::test]
     async fn tcp_outbound_frames_carry_session_connection_id() {
+        // Dial-first: a SYN-ACK is only emitted after the upstream dial
+        // succeeds, so the test destination must actually listen (before
+        // the dial-first change any SYN was SYN-ACKed unconditionally).
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("test TCP listener should bind");
+        let server_port = listener
+            .local_addr()
+            .expect("listener should have local addr")
+            .port();
+
         let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<SessionFrame>();
         // Session 1 (like the harness consumer; provider gets 0).
         let forwarder = SmoltcpForwarder::new(1, outbound_tx, Arc::new(AtomicU64::new(0)));
@@ -4073,7 +4679,6 @@ mod tests {
         let client_ip = Ipv4Addr::new(10, 8, 0, 2);
         let client_port = 40000u16;
         let server_ip = Ipv4Addr::LOCALHOST;
-        let server_port = 18080u16;
 
         let syn = build_ipv4_tcp_packet(
             client_ip,
