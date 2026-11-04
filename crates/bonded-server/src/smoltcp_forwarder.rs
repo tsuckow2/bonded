@@ -24,6 +24,14 @@
 //! sees is real. On dial failure or timeout the client gets a RST instead.
 //! Nothing is ever SYN-ACKed that is not actually open.
 //!
+//! IPv6 is dropped at ingest, fail-closed: the tunnel forwards IPv4 only,
+//! and the Android builder captures IPv6 into the TUN precisely so it
+//! cannot bypass the VPN on the physical network. A captured v6 packet
+//! dies here instead of being forwarded — and the gate must be on the
+//! version nibble, not the protocol byte, because byte 9 of an IPv6
+//! header is address bytes that could otherwise misdispatch a v6 packet
+//! to the IPv4 TCP/UDP/ICMP handlers.
+//!
 //! One exception skips the dial entirely: a SYN to the tunnel gateway's
 //! DoT port (10.8.0.1:853) is answered with an immediate RST. Nothing
 //! listens for DoT on the gateway, and dialing it would hang on the
@@ -727,7 +735,11 @@ impl SmoltcpForwarder {
     pub fn ingest_packet(&self, frame: SessionFrame) {
         self.ingested_packets.fetch_add(1, Ordering::Relaxed);
         let payload = frame.payload.as_ref();
-        if payload.len() < 20 {
+        // Fail-closed IPv6 gate: the tunnel forwards IPv4 only. A v6
+        // packet's byte 9 is address bytes, not a protocol field, so
+        // dispatching on it would misroute v6 packets to the IPv4
+        // handlers; the version nibble is the only sound check here.
+        if payload.len() < 20 || payload[0] >> 4 != 4 {
             return;
         }
 
@@ -3498,6 +3510,41 @@ mod tests {
         assert_eq!(rst.flags & (TCP_RST | TCP_ACK), TCP_RST | TCP_ACK);
         assert_eq!(rst.seq, 0);
         assert_eq!(rst.ack, client_isn.wrapping_add(1));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ingest_packet_drops_ipv6_without_dispatch() {
+        // Worst case for the old code: an IPv6 packet whose byte 9 reads
+        // 6 (TCP), which the old byte-9 dispatch would have handed to
+        // the IPv4 TCP handler. The version gate must drop it before
+        // dispatch: no outbound frame, no flow, no panic. (Byte 9 of a
+        // real IPv6 header is source-address bytes; here source[1] is
+        // set to 0x06 deliberately.)
+        let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<SessionFrame>();
+        let forwarder = SmoltcpForwarder::new(48, outbound_tx, Arc::new(AtomicU64::new(0)));
+
+        let mut pkt = vec![0u8; 40];
+        pkt[0] = 0x60; // version 6
+        pkt[6] = 6; // next header: TCP
+        pkt[8] = 0x20;
+        pkt[9] = 0x06;
+        forwarder.ingest_packet(SessionFrame {
+            header: SessionHeader {
+                connection_id: 1,
+                sequence: 1,
+                flags: 0,
+            },
+            payload: pkt.into(),
+        });
+        assert_eq!(forwarder.ingested_packet_count(), 1);
+
+        // Nothing may come back: the packet must not reach smoltcp or
+        // earn a RST/SYN-ACK.
+        let arrived = timeout(Duration::from_millis(300), outbound_rx.recv()).await;
+        assert!(
+            arrived.is_err(),
+            "an IPv6 packet must produce no outbound frame"
+        );
     }
 
     #[tokio::test]

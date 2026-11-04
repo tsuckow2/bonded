@@ -18,6 +18,7 @@ import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.net.DatagramSocket
 import java.net.Inet4Address
+import java.net.Inet6Address
 import java.net.InetAddress
 import java.util.ArrayDeque
 import kotlin.concurrent.thread
@@ -188,13 +189,26 @@ class BondedVpnService : VpnService() {
             try {
                 android.util.Log.d(
                         "BondedVPN",
-                        "Establishing VPN interface: address=10.8.0.2/32, mtu=1420, route=0.0.0.0/0"
+                        "Establishing VPN interface: address=10.8.0.2/32 + fd00:10:8::2/128, mtu=1420, route=0.0.0.0/0 + ::/0"
                 )
                 val builder =
                         Builder()
                                 .setSession("Bonded")
                                 .setMtu(1420)
                                 .addAddress("10.8.0.2", 32)
+                                // IPv6 capture, fail-closed: an IPv6
+                                // address on the TUN plus IPv6 routes, so
+                                // IPv6 traffic enters the tunnel instead
+                                // of bypassing the VPN on the physical
+                                // network. The server does not forward
+                                // IPv6 today — captured v6 packets are
+                                // dropped at the server ingest gate — so
+                                // captured v6 fails rather than leaks, and
+                                // dual-stack clients fall back to IPv4
+                                // through the tunnel. The ULA mirrors the
+                                // IPv4 numbering: gateway fd00:10:8::1,
+                                // this client fd00:10:8::2.
+                                .addAddress("fd00:10:8::2", 128)
                 if (AppSettingsStore.allowLocalTraffic(this)) {
                     // Local traffic mode: route everything EXCEPT the
                     // subnets this device is directly attached to. The
@@ -209,12 +223,21 @@ class BondedVpnService : VpnService() {
                     for (route in routes) {
                         builder.addRoute(route.toAddressString(), route.prefix)
                     }
+                    // Same complement for IPv6: attached v6 subnets stay
+                    // local, everything else is captured into the TUN
+                    // (and dropped at the server gate, fail-closed).
+                    val localV6Subnets = connectedIpv6Subnets()
+                    val v6Routes = excludeIpv6Subnets(localV6Subnets)
+                    for (route in v6Routes) {
+                        builder.addRoute(route.toAddressString(), route.prefix)
+                    }
                     android.util.Log.i(
                             "BondedVPN",
-                            "Local traffic mode: ${localSubnets.size} local subnets excluded, ${routes.size} routes added",
+                            "Local traffic mode: ${localSubnets.size} local subnets excluded, ${routes.size} routes added; IPv6: ${localV6Subnets.size} local subnets excluded, ${v6Routes.size} routes added",
                     )
                 } else {
                     builder.addRoute("0.0.0.0", 0)
+                    builder.addRoute("::", 0)
                 }
                 // DNS goes through the tunnel to the bonded server itself,
                 // which resolves with its own resolvers. No public fallback
@@ -389,6 +412,35 @@ class BondedVpnService : VpnService() {
                 val inet = linkAddress.address
                 if (inet is Inet4Address && !inet.isLoopbackAddress) {
                     subnets.add(Ipv4Cidr.fromBytes(inet.address, linkAddress.prefixLength))
+                }
+            }
+        }
+        return subnets
+    }
+
+    /**
+     * IPv6 mirror of [connectedIpv4Subnets]: every attached non-loopback
+     * IPv6 prefix, so local-traffic mode can exclude it from the IPv6
+     * capture. The TUN itself is not listed yet at establish time, so
+     * the tunnel's own fd00:10:8::/64 is never excluded.
+     */
+    private fun connectedIpv6Subnets(): List<Ipv6Cidr> {
+        val manager =
+                getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+                        ?: return emptyList()
+        val subnets = mutableListOf<Ipv6Cidr>()
+        for (network in manager.allNetworks) {
+            val props =
+                    try {
+                        manager.getLinkProperties(network)
+                    } catch (_: Exception) {
+                        null
+                    }
+                            ?: continue
+            for (linkAddress in props.linkAddresses) {
+                val inet = linkAddress.address
+                if (inet is Inet6Address && !inet.isLoopbackAddress) {
+                    subnets.add(Ipv6Cidr.fromBytes(inet.address, linkAddress.prefixLength))
                 }
             }
         }
