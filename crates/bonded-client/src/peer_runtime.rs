@@ -18,7 +18,7 @@ use tokio::time::sleep;
 use tracing::{info, warn};
 
 use crate::cert_proof;
-use crate::peer_discovery::{PeerShareAdvertiser, PeerShareBrowser};
+use crate::peer_discovery::{PeerShareAdvertiser, PeerShareBrowser, utc_minute};
 use crate::peer_listener::{
     accept_peer_relay, connect_peer_relay, register_peer_relay_upstream,
     relay_peer_frames_rate_limited, AcceptedPeerRelay, PeerListenerIdentity, PeerRelayDial,
@@ -707,8 +707,23 @@ async fn run_advertise_watcher(
     let mut current_ip = initial_ip;
     let mut current_advertisement = initial_advertisement;
     let mut advertiser: Option<PeerShareAdvertiser> = Some(initial_advertiser);
+    let mut last_window_minute = utc_minute(now_unix_secs());
     loop {
         sleep(PEER_ADVERTISE_POLL).await;
+        // Windowed discovery: re-announce at the start of each UTC
+        // minute so a consumer whose lock is only held for the 10s
+        // window still sees us. This runs every poll iteration,
+        // independent of the IP-change check below, which only acts
+        // when the advertise address actually changes.
+        let minute = utc_minute(now_unix_secs());
+        if minute != last_window_minute {
+            last_window_minute = minute;
+            if let Some(advertiser) = advertiser.as_ref() {
+                if let Err(err) = advertiser.reannounce() {
+                    warn!(error = %err, "peer-share window re-announce failed");
+                }
+            }
+        }
         let interfaces = enumerate_interfaces();
         let Some(desired) = desired_advertise_ip(&config, &path_source, &interfaces) else {
             continue;
@@ -770,6 +785,36 @@ async fn run_advertise_watcher(
                 match PeerShareAdvertiser::start(&current_advertisement) {
                     Ok(old_adv) => advertiser = Some(old_adv),
                     Err(err) => warn!(error = %err, "peer-share previous advertisement restore failed; next poll retries"),
+                }
+            }
+        }
+    }
+}
+
+/// Receives the next discovered advertisement, re-querying at the
+/// start of each UTC minute for windowed discovery. mdns-sd backs a
+/// long-running browse's retransmissions off to one query per hour,
+/// so without an explicit re-query a consumer could sit through the
+/// whole 10s lock window without sending any query. The 1s timeout
+/// notices a new minute within a second; the re-query itself runs
+/// between recv calls, never while one is in flight, because
+/// `requery` replaces the receiver the in-flight recv is awaiting.
+/// Cached advertisements, redials, and renewals bypass this entirely:
+/// they are unicast dials from the cached advertisement and need no
+/// multicast lock, so a previously seen peer can be re-dialed outside
+/// any window.
+async fn recv_discovery_in_window(
+    browser: &mut PeerShareBrowser,
+    last_window_minute: &mut u64,
+) -> anyhow::Result<PeerShareAdvertisement> {
+    loop {
+        match tokio::time::timeout(Duration::from_secs(1), browser.recv()).await {
+            Ok(result) => return result,
+            Err(_) => {
+                let minute = utc_minute(now_unix_secs());
+                if minute != *last_window_minute {
+                    *last_window_minute = minute;
+                    browser.requery()?;
                 }
             }
         }
@@ -915,7 +960,12 @@ pub async fn start_peer_share_runtime(
         let (closed_peer_tx, mut closed_peer_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let (renewal_tx, mut renewal_rx) =
             tokio::sync::mpsc::unbounded_channel::<(String, u64)>();
-        let browser = browser.expect("consumer mode requires browser");
+        let mut browser = browser.expect("consumer mode requires browser");
+        // UTC minute of the last discovery-window re-query. The 1s
+        // recv timeout below notices a new minute within a second, so
+        // the re-query lands inside the 10s window the Kotlin lock
+        // scheduler holds on the same clock.
+        let mut last_window_minute = utc_minute(now_unix_secs());
         Some(tokio::spawn(async move {
         let mut legs = PeerLegTracker::default();
         // Last advertisement seen per peer. mDNS resolves each service
@@ -971,7 +1021,10 @@ pub async fn start_peer_share_runtime(
                             None => continue,
                         }
                     }
-                    advertisement = browser.recv() => {
+                    advertisement = recv_discovery_in_window(
+                        &mut browser,
+                        &mut last_window_minute,
+                    ) => {
                         match advertisement {
                             Ok(advertisement) => (advertisement, false, false),
                             Err(err) => {

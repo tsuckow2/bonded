@@ -78,6 +78,7 @@ class BondedVpnService : VpnService() {
     private var sessionMonitorThread: Thread? = null
     private var networkPathManager: AndroidNetworkPathManager? = null
     private var multicastLock: WifiManager.MulticastLock? = null
+    private var peerDiscoveryWindow: PeerDiscoveryWindowScheduler? = null
     private var activeDeviceId: String? = null
 
     @Volatile private var packetIoRunning = false
@@ -189,9 +190,11 @@ class BondedVpnService : VpnService() {
         // only when peer sharing is actually enabled for this server —
         // peer discovery is the only thing that needs it, and the peer
         // runtime only starts when the flag is on. With peer sharing
-        // off, no lock is held for the whole session.
+        // off, no lock is held for the whole session. When on, the lock
+        // follows the windowed schedule (10s per UTC minute + bursts +
+        // sweeps) instead of being held continuously.
         if (pairedServer.peerShareEnabled) {
-            acquireMulticastLockIfNeeded()
+            startPeerDiscoveryWindow()
         }
 
         if (vpnInterface == null) {
@@ -355,6 +358,7 @@ class BondedVpnService : VpnService() {
         lastRecoveryAttemptMs = 0L
         synchronized(pendingOutboundLock) { pendingOutboundPackets.clear() }
         cachedServerAddress = null
+        stopPeerDiscoveryWindow()
         releaseMulticastLock()
         stopNativeSession()
         try {
@@ -471,6 +475,22 @@ class BondedVpnService : VpnService() {
         } catch (e: Exception) {
             android.util.Log.w("BondedVPN", "Failed to acquire multicast lock: ${e.message}")
         }
+    }
+
+    private fun startPeerDiscoveryWindow() {
+        val scheduler =
+            peerDiscoveryWindow
+                ?: PeerDiscoveryWindowScheduler(
+                        acquire = { acquireMulticastLockIfNeeded() },
+                        release = { releaseMulticastLock() },
+                    )
+                    .also { peerDiscoveryWindow = it }
+        scheduler.start()
+    }
+
+    private fun stopPeerDiscoveryWindow() {
+        peerDiscoveryWindow?.stop()
+        peerDiscoveryWindow = null
     }
 
     private fun releaseMulticastLock() {
@@ -1194,6 +1214,11 @@ class BondedVpnService : VpnService() {
 
         val deviceId = activeDeviceId ?: return
         val manager = networkPathManager ?: return
+        // A path change is a new LAN: give peer discovery a 30s
+        // continuous burst so a peer on the new network is found
+        // without waiting for the next window. No-op when the window
+        // scheduler is not running (peer sharing off).
+        peerDiscoveryWindow?.burst()
         // Re-read the current list inside the lock (never the
         // callback's snapshot): rapid callbacks serialize here, and
         // the last one to run always sends the freshest list, so the

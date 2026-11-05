@@ -7,8 +7,17 @@ use std::net::SocketAddr;
 
 pub const PEER_SHARE_SERVICE_TYPE: &str = "_bonded-peer._udp.local.";
 
+/// UTC minute index for windowed discovery. Windows are the first 10
+/// seconds of each UTC minute, derived from the same device clock the
+/// Kotlin lock scheduler uses, so both sides agree on window
+/// boundaries without any cross-language signalling.
+pub fn utc_minute(unix_secs: u64) -> u64 {
+    unix_secs / 60
+}
+
 pub struct PeerShareAdvertiser {
     daemon: ServiceDaemon,
+    service_info: ServiceInfo,
 }
 
 impl PeerShareAdvertiser {
@@ -16,9 +25,31 @@ impl PeerShareAdvertiser {
         let daemon = ServiceDaemon::new().context("failed to create mDNS daemon")?;
         let service_info = service_info_from_advertisement(advertisement)?;
         daemon
-            .register(service_info)
+            .register(service_info.clone())
             .context("failed to register peer-share mDNS service")?;
-        Ok(Self { daemon })
+        Ok(Self {
+            daemon,
+            service_info,
+        })
+    }
+
+    /// Re-announces the service for a discovery window. The daemon
+    /// processes commands in order, so the goodbye from unregister is
+    /// sent before the new announcement; the goodbye's single resend
+    /// fires 120ms later, while a probed re-register announces only
+    /// after ~750ms of probing, so no trailing goodbye can land after
+    /// the announcement. The daemon itself is never restarted.
+    pub fn reannounce(&self) -> anyhow::Result<()> {
+        let _ = self
+            .daemon
+            .unregister(self.service_info.get_fullname())
+            .map_err(|error| anyhow::anyhow!(error))
+            .context("failed to unregister peer-share mDNS service for re-announce")?;
+        self.daemon
+            .register(self.service_info.clone())
+            .map_err(|error| anyhow::anyhow!(error))
+            .context("failed to re-register peer-share mDNS service")?;
+        Ok(())
     }
 
     pub fn shutdown(self) -> anyhow::Result<()> {
@@ -42,6 +73,26 @@ impl PeerShareBrowser {
             .browse(PEER_SHARE_SERVICE_TYPE)
             .context("failed to browse peer-share mDNS service")?;
         Ok(Self { daemon, receiver })
+    }
+
+    /// Re-queries for the discovery window: stops the current browse
+    /// and starts a fresh one, resetting mdns-sd's retransmission
+    /// backoff (which doubles to an hour) so a query is actually sent
+    /// during the 10s lock window. The daemon itself is never
+    /// restarted. Callers must not hold a `recv()` future across this
+    /// call: the old receiver is replaced, so an in-flight recv on it
+    /// would never resolve.
+    pub fn requery(&mut self) -> anyhow::Result<()> {
+        self.daemon
+            .stop_browse(PEER_SHARE_SERVICE_TYPE)
+            .map_err(|error| anyhow::anyhow!(error))
+            .context("failed to stop peer-share browse for window re-query")?;
+        self.receiver = self
+            .daemon
+            .browse(PEER_SHARE_SERVICE_TYPE)
+            .map_err(|error| anyhow::anyhow!(error))
+            .context("failed to restart peer-share browse for window re-query")?;
+        Ok(())
     }
 
     pub async fn recv(&self) -> anyhow::Result<PeerShareAdvertisement> {
@@ -143,7 +194,9 @@ fn advertisement_from_resolved_service(
 
 #[cfg(test)]
 mod tests {
-    use super::{advertisement_from_resolved_service, service_info_from_advertisement};
+    use super::{
+        advertisement_from_resolved_service, service_info_from_advertisement, utc_minute,
+    };
     use bonded_core::peer_share::PeerShareAdvertisement;
 
     #[test]
@@ -165,5 +218,14 @@ mod tests {
             .expect("advertisement should parse from resolved service");
 
         assert_eq!(parsed, advertisement);
+    }
+
+    #[test]
+    fn utc_minute_changes_only_at_minute_boundaries() {
+        assert_eq!(utc_minute(0), 0);
+        assert_eq!(utc_minute(59), 0);
+        assert_eq!(utc_minute(60), 1);
+        assert_eq!(utc_minute(119), 1);
+        assert_eq!(utc_minute(120), 2);
     }
 }
