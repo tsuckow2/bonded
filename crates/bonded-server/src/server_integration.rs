@@ -1809,3 +1809,616 @@ async fn localhost_server_and_rust_client_can_relay_tcp_as_ipv4_packets() {
     let _ = fs::remove_file(private_key_path);
     let _ = fs::remove_file(public_key_path);
 }
+
+/// Read frames until the SYN-ACK for one handshake arrives, skipping
+/// stale frames from earlier connections on the same session (bare ACKs
+/// for finished data, FIN-ACKs from a connection that just closed).
+/// The fake client has no receive queue of its own, so leftovers from
+/// an earlier connection would otherwise be mistaken for the next
+/// handshake's SYN-ACK.
+async fn recv_syn_ack(transport: &mut NaiveTcpTransport, dst_port: u16) -> Ipv4TcpPacket {
+    const TCP_SYN_ACK: u8 = 0x02 | 0x10;
+    const GATEWAY_IP: Ipv4Addr = Ipv4Addr::new(10, 8, 0, 1);
+    for _ in 0..10 {
+        let frame = timeout(Duration::from_secs(5), transport.recv())
+            .await
+            .expect("SYN-ACK should arrive within timeout")
+            .expect("SYN-ACK frame should be readable");
+        let Some(pkt) = parse_ipv4_tcp_packet(&frame.payload) else {
+            continue;
+        };
+        if pkt.src_ip == GATEWAY_IP
+            && pkt.src_port == crate::tunnel_echo::TUN_ECHO_PORT
+            && pkt.dst_port == dst_port
+            && pkt.flags & TCP_SYN_ACK == TCP_SYN_ACK
+        {
+            return pkt;
+        }
+        // Stale frame from an earlier connection: skip it.
+    }
+    panic!("no SYN-ACK for client port {dst_port} arrived");
+}
+
+/// End-to-end test for the tunnel-gateway TCP echo endpoint
+/// (10.8.0.1:18099).
+///
+/// Same harness as
+/// `localhost_server_and_rust_client_can_relay_tcp_as_ipv4_packets`,
+/// but the far end is the server's own echo listener — no external
+/// echo server is started. The client drives raw IPv4/TCP packets
+/// through a real NaiveTCP session to the real server binary.
+///
+/// Proves, through the production dispatch path
+/// (`SmoltcpForwarder::dispatch_tcp` → dial-first → smoltcp bridge →
+/// loopback echo listener):
+///   * a SYN to 10.8.0.1:18099 is SYN-ACKed with the gateway as peer,
+///   * a 32 KiB patterned payload sent in 1400-byte segments is echoed
+///     back byte-for-byte (multi-segment, exercises the bridge's
+///     partial-write handling),
+///   * a second chunk on the same connection echoes (the connection
+///     stays usable after a large transfer),
+///   * an empty close on a second connection does not break the echo
+///     (a third connection echoes fine afterwards).
+///
+/// The client tracks the server's sequence numbers and ACKs echoed
+/// data as it arrives, so the server never sees the duplicate ACKs
+/// that would trigger retransmits and corrupt the byte comparison.
+#[tokio::test]
+async fn tunnel_gateway_echo_returns_fixed_payload() {
+    const TCP_SYN: u8 = 0x02;
+    const TCP_ACK: u8 = 0x10;
+    const TCP_PSH: u8 = 0x08;
+    const TCP_FIN: u8 = 0x01;
+    const TCP_PSH_ACK: u8 = TCP_PSH | TCP_ACK;
+    const TCP_FIN_ACK: u8 = TCP_FIN | TCP_ACK;
+    const CLIENT_VIRTUAL_IP: Ipv4Addr = Ipv4Addr::new(10, 8, 0, 2);
+    const GATEWAY_IP: Ipv4Addr = Ipv4Addr::new(10, 8, 0, 1);
+    const ECHO_PORT: u16 = crate::tunnel_echo::TUN_ECHO_PORT;
+    const WINDOW: u16 = 65535;
+    // One segment at a time, well under the tunnel MTU, so the fake
+    // client never overruns smoltcp's receive window.
+    const CHUNK: usize = 1400;
+
+    let keypair = DeviceKeypair::generate();
+    let authorized_path = temp_file_path("server-echo-keys");
+    let invites_path = temp_file_path("server-echo-invites");
+    let private_key_path = temp_file_path("server-echo-private");
+    let public_key_path = temp_file_path("server-echo-public");
+
+    fs::write(
+        &authorized_path,
+        format!(
+            "[[devices]]\ndevice_id = \"echo-test\"\npublic_key = \"{}\"\n",
+            keypair.public_key_b64
+        ),
+    )
+    .expect("authorized keys should write");
+    fs::write(
+        &invites_path,
+        "[[tokens]]\ntoken = \"unused\"\nexpires_at = \"unix:9999999999\"\nuses_remaining = 1\n",
+    )
+    .expect("invites file should write");
+    fs::write(&private_key_path, format!("{}\n", keypair.private_key_b64))
+        .expect("private key should write");
+    fs::write(&public_key_path, format!("{}\n", keypair.public_key_b64))
+        .expect("public key should write");
+
+    let bind = pick_ephemeral_bind();
+    let store = AuthorizedKeysStore::load(&authorized_path).expect("authorized keys should load");
+    let bind_for_server = bind.clone();
+    let invite_for_server = invites_path
+        .to_str()
+        .expect("path should be utf-8")
+        .to_owned();
+    let server_task = tokio::spawn(async move {
+        crate::run_server(
+            &bind_for_server,
+            &invite_for_server,
+            Arc::new(DeviceKeypair::generate()),
+            store,
+            crate::session_registry::SessionRegistry::default(),
+            Arc::new(RwLock::new(HashMap::new())),
+            None,
+            None,
+            std::net::SocketAddr::from(([192, 0, 2, 53], 53)),
+        )
+        .await
+    });
+
+    let mut connected = false;
+    let mut last_error = String::new();
+    for _ in 0..20 {
+        match try_establish_client_stream(&bind, &private_key_path, &public_key_path).await {
+            Ok(stream) => {
+                connected = true;
+                let mut transport = NaiveTcpTransport::from_stream(stream);
+
+                // ── Connection 1: handshake ────────────────────────
+                const CLIENT_PORT: u16 = 54321;
+                const CLIENT_ISN: u32 = 1000;
+                let syn_packet = build_ipv4_tcp_packet(
+                    CLIENT_VIRTUAL_IP,
+                    GATEWAY_IP,
+                    CLIENT_PORT,
+                    ECHO_PORT,
+                    CLIENT_ISN,
+                    0,
+                    TCP_SYN,
+                    WINDOW,
+                    &[],
+                );
+                transport
+                    .send(SessionFrame {
+                        header: SessionHeader {
+                            connection_id: 10,
+                            sequence: 0,
+                            flags: 0,
+                        },
+                        payload: Bytes::copy_from_slice(&syn_packet),
+                    })
+                    .await
+                    .expect("SYN frame should send");
+
+                let syn_ack = recv_syn_ack(&mut transport, CLIENT_PORT).await;
+                assert_eq!(
+                    syn_ack.ack_seq,
+                    CLIENT_ISN.wrapping_add(1),
+                    "SYN-ACK ack_seq should be client ISN + 1"
+                );
+                assert_eq!(syn_ack.src_ip, GATEWAY_IP, "SYN-ACK src_ip");
+                assert_eq!(syn_ack.dst_ip, CLIENT_VIRTUAL_IP, "SYN-ACK dst_ip");
+                assert_eq!(syn_ack.src_port, ECHO_PORT, "SYN-ACK src_port");
+                assert_eq!(syn_ack.dst_port, CLIENT_PORT, "SYN-ACK dst_port");
+                let server_isn = syn_ack.seq;
+
+                // Server sequence the client has ACKed so far; advanced
+                // as echoed data arrives so ACKs stay current.
+                let mut client_ack = server_isn.wrapping_add(1);
+                let mut client_seq = CLIENT_ISN.wrapping_add(1);
+                let mut seq_no = 1u64;
+
+                let ack_packet = build_ipv4_tcp_packet(
+                    CLIENT_VIRTUAL_IP,
+                    GATEWAY_IP,
+                    CLIENT_PORT,
+                    ECHO_PORT,
+                    client_seq,
+                    client_ack,
+                    TCP_ACK,
+                    WINDOW,
+                    &[],
+                );
+                transport
+                    .send(SessionFrame {
+                        header: SessionHeader {
+                            connection_id: 10,
+                            sequence: seq_no,
+                            flags: 0,
+                        },
+                        payload: Bytes::copy_from_slice(&ack_packet),
+                    })
+                    .await
+                    .expect("ACK frame should send");
+                seq_no += 1;
+
+                // ── 32 KiB patterned payload, one segment at a time ──
+                let payload: Vec<u8> = (0..32 * 1024).map(|i| (i % 251) as u8).collect();
+                let mut received: Vec<u8> = Vec::with_capacity(payload.len());
+                for chunk in payload.chunks(CHUNK) {
+                    let psh_ack_packet = build_ipv4_tcp_packet(
+                        CLIENT_VIRTUAL_IP,
+                        GATEWAY_IP,
+                        CLIENT_PORT,
+                        ECHO_PORT,
+                        client_seq,
+                        client_ack,
+                        TCP_PSH_ACK,
+                        WINDOW,
+                        chunk,
+                    );
+                    client_seq = client_seq.wrapping_add(chunk.len() as u32);
+                    transport
+                        .send(SessionFrame {
+                            header: SessionHeader {
+                                connection_id: 10,
+                                sequence: seq_no,
+                                flags: 0,
+                            },
+                            payload: Bytes::copy_from_slice(&psh_ack_packet),
+                        })
+                        .await
+                        .expect("PSH+ACK frame should send");
+                    seq_no += 1;
+
+                    // Drain echoed frames until this chunk is back.
+                    let want = received.len() + chunk.len();
+                    while received.len() < want {
+                        let frame = timeout(Duration::from_secs(5), transport.recv())
+                            .await
+                            .expect("echoed data should arrive within timeout")
+                            .expect("echoed frame should be readable");
+                        let pkt = parse_ipv4_tcp_packet(&frame.payload)
+                            .expect("echoed frame should be a valid IPv4/TCP packet");
+                        if pkt.payload.is_empty() {
+                            continue;
+                        }
+                        assert_eq!(pkt.src_ip, GATEWAY_IP, "echo src_ip");
+                        assert_eq!(pkt.src_port, ECHO_PORT, "echo src_port");
+                        client_ack =
+                            client_ack.max(pkt.seq.wrapping_add(pkt.payload.len() as u32));
+                        received.extend_from_slice(&pkt.payload);
+                        // ACK echoed data immediately, like a real TCP
+                        // stack: without prompt ACKs the server's RTO
+                        // fires mid-transfer and retransmits segments
+                        // the test would then count twice.
+                        let ack_back = build_ipv4_tcp_packet(
+                            CLIENT_VIRTUAL_IP,
+                            GATEWAY_IP,
+                            CLIENT_PORT,
+                            ECHO_PORT,
+                            client_seq,
+                            client_ack,
+                            TCP_ACK,
+                            WINDOW,
+                            &[],
+                        );
+                        transport
+                            .send(SessionFrame {
+                                header: SessionHeader {
+                                    connection_id: 10,
+                                    sequence: seq_no,
+                                    flags: 0,
+                                },
+                                payload: Bytes::copy_from_slice(&ack_back),
+                            })
+                            .await
+                            .expect("ACK frame should send");
+                        seq_no += 1;
+                    }
+                }
+                assert_eq!(
+                    received, payload,
+                    "32 KiB echoed payload must match sent bytes"
+                );
+
+                // ── Second chunk on the same connection ─────────────
+                let second: &[u8] = b"second-round";
+                let psh_ack_packet = build_ipv4_tcp_packet(
+                    CLIENT_VIRTUAL_IP,
+                    GATEWAY_IP,
+                    CLIENT_PORT,
+                    ECHO_PORT,
+                    client_seq,
+                    client_ack,
+                    TCP_PSH_ACK,
+                    WINDOW,
+                    second,
+                );
+                transport
+                    .send(SessionFrame {
+                        header: SessionHeader {
+                            connection_id: 10,
+                            sequence: seq_no,
+                            flags: 0,
+                        },
+                        payload: Bytes::copy_from_slice(&psh_ack_packet),
+                    })
+                    .await
+                    .expect("second PSH+ACK frame should send");
+                seq_no += 1;
+                let mut second_received: Vec<u8> = Vec::new();
+                while second_received.len() < second.len() {
+                    let frame = timeout(Duration::from_secs(5), transport.recv())
+                        .await
+                        .expect("second echo should arrive within timeout")
+                        .expect("second echo frame should be readable");
+                    let pkt = parse_ipv4_tcp_packet(&frame.payload)
+                        .expect("second echo frame should be a valid IPv4/TCP packet");
+                    second_received.extend_from_slice(&pkt.payload);
+                }
+                assert_eq!(
+                    second_received, second,
+                    "second chunk must echo on the same connection"
+                );
+
+                // ── Connection 2: empty close ───────────────────────
+                // Open, handshake, FIN immediately without sending any
+                // data. The server must not crash or wedge: a third
+                // connection must still echo afterwards. (No FIN is
+                // awaited from the server: the bridge holds a CloseWait
+                // socket until the client fully closes, exactly like
+                // any other proxied TCP flow.)
+                const CLIENT_PORT_2: u16 = 54322;
+                const CLIENT_ISN_2: u32 = 2000;
+                let syn2 = build_ipv4_tcp_packet(
+                    CLIENT_VIRTUAL_IP,
+                    GATEWAY_IP,
+                    CLIENT_PORT_2,
+                    ECHO_PORT,
+                    CLIENT_ISN_2,
+                    0,
+                    TCP_SYN,
+                    WINDOW,
+                    &[],
+                );
+                transport
+                    .send(SessionFrame {
+                        header: SessionHeader {
+                            connection_id: 10,
+                            sequence: seq_no,
+                            flags: 0,
+                        },
+                        payload: Bytes::copy_from_slice(&syn2),
+                    })
+                    .await
+                    .expect("second SYN frame should send");
+                seq_no += 1;
+                let syn_ack2 = recv_syn_ack(&mut transport, CLIENT_PORT_2).await;
+                let server_isn_2 = syn_ack2.seq;
+                let fin_packet = build_ipv4_tcp_packet(
+                    CLIENT_VIRTUAL_IP,
+                    GATEWAY_IP,
+                    CLIENT_PORT_2,
+                    ECHO_PORT,
+                    CLIENT_ISN_2.wrapping_add(1),
+                    server_isn_2.wrapping_add(1),
+                    TCP_FIN_ACK,
+                    WINDOW,
+                    &[],
+                );
+                transport
+                    .send(SessionFrame {
+                        header: SessionHeader {
+                            connection_id: 10,
+                            sequence: seq_no,
+                            flags: 0,
+                        },
+                        payload: Bytes::copy_from_slice(&fin_packet),
+                    })
+                    .await
+                    .expect("FIN frame should send");
+                seq_no += 1;
+                sleep(Duration::from_millis(200)).await;
+
+                // ── Connection 3: echo still works ─────────────────
+                const CLIENT_PORT_3: u16 = 54323;
+                const CLIENT_ISN_3: u32 = 3000;
+                let syn3 = build_ipv4_tcp_packet(
+                    CLIENT_VIRTUAL_IP,
+                    GATEWAY_IP,
+                    CLIENT_PORT_3,
+                    ECHO_PORT,
+                    CLIENT_ISN_3,
+                    0,
+                    TCP_SYN,
+                    WINDOW,
+                    &[],
+                );
+                transport
+                    .send(SessionFrame {
+                        header: SessionHeader {
+                            connection_id: 10,
+                            sequence: seq_no,
+                            flags: 0,
+                        },
+                        payload: Bytes::copy_from_slice(&syn3),
+                    })
+                    .await
+                    .expect("third SYN frame should send");
+                seq_no += 1;
+                let syn_ack3 = recv_syn_ack(&mut transport, CLIENT_PORT_3).await;
+                let server_isn_3 = syn_ack3.seq;
+                let ack3 = build_ipv4_tcp_packet(
+                    CLIENT_VIRTUAL_IP,
+                    GATEWAY_IP,
+                    CLIENT_PORT_3,
+                    ECHO_PORT,
+                    CLIENT_ISN_3.wrapping_add(1),
+                    server_isn_3.wrapping_add(1),
+                    TCP_ACK,
+                    WINDOW,
+                    &[],
+                );
+                transport
+                    .send(SessionFrame {
+                        header: SessionHeader {
+                            connection_id: 10,
+                            sequence: seq_no,
+                            flags: 0,
+                        },
+                        payload: Bytes::copy_from_slice(&ack3),
+                    })
+                    .await
+                    .expect("third ACK frame should send");
+                seq_no += 1;
+                let third: &[u8] = b"after-empty-close";
+                let psh3 = build_ipv4_tcp_packet(
+                    CLIENT_VIRTUAL_IP,
+                    GATEWAY_IP,
+                    CLIENT_PORT_3,
+                    ECHO_PORT,
+                    CLIENT_ISN_3.wrapping_add(1),
+                    server_isn_3.wrapping_add(1),
+                    TCP_PSH_ACK,
+                    WINDOW,
+                    third,
+                );
+                transport
+                    .send(SessionFrame {
+                        header: SessionHeader {
+                            connection_id: 10,
+                            sequence: seq_no,
+                            flags: 0,
+                        },
+                        payload: Bytes::copy_from_slice(&psh3),
+                    })
+                    .await
+                    .expect("third PSH+ACK frame should send");
+                let mut third_received: Vec<u8> = Vec::new();
+                while third_received.len() < third.len() {
+                    let frame = timeout(Duration::from_secs(5), transport.recv())
+                        .await
+                        .expect("third echo should arrive within timeout")
+                        .expect("third echo frame should be readable");
+                    let pkt = parse_ipv4_tcp_packet(&frame.payload)
+                        .expect("third echo frame should be a valid IPv4/TCP packet");
+                    third_received.extend_from_slice(&pkt.payload);
+                }
+                assert_eq!(
+                    third_received, third,
+                    "echo must still work after an empty close"
+                );
+
+                break;
+            }
+            Err(err) => {
+                last_error = err;
+                sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
+
+    assert!(
+        connected,
+        "rust client failed to connect to local server: {last_error}"
+    );
+    server_task.abort();
+    let _ = fs::remove_file(authorized_path);
+    let _ = fs::remove_file(&invites_path);
+    let _ = fs::remove_file(private_key_path);
+    let _ = fs::remove_file(public_key_path);
+}
+
+/// A SYN to a non-echo port on the tunnel gateway must NOT be echoed:
+/// it follows the existing dial-first path to 10.8.0.1, the dial
+/// fails (the gateway is not a real host), and the client gets a RST
+/// — never a SYN-ACK and never echoed data.
+#[tokio::test]
+async fn tunnel_gateway_non_echo_port_is_not_echoed() {
+    const TCP_SYN: u8 = 0x02;
+    const TCP_RST: u8 = 0x04;
+    const TCP_ACK: u8 = 0x10;
+    const CLIENT_VIRTUAL_IP: Ipv4Addr = Ipv4Addr::new(10, 8, 0, 2);
+    const GATEWAY_IP: Ipv4Addr = Ipv4Addr::new(10, 8, 0, 1);
+    const NON_ECHO_PORT: u16 = 18098;
+    const CLIENT_PORT: u16 = 54321;
+    const CLIENT_ISN: u32 = 1000;
+    const WINDOW: u16 = 65535;
+
+    let keypair = DeviceKeypair::generate();
+    let authorized_path = temp_file_path("server-noecho-keys");
+    let invites_path = temp_file_path("server-noecho-invites");
+    let private_key_path = temp_file_path("server-noecho-private");
+    let public_key_path = temp_file_path("server-noecho-public");
+
+    fs::write(
+        &authorized_path,
+        format!(
+            "[[devices]]\ndevice_id = \"noecho-test\"\npublic_key = \"{}\"\n",
+            keypair.public_key_b64
+        ),
+    )
+    .expect("authorized keys should write");
+    fs::write(
+        &invites_path,
+        "[[tokens]]\ntoken = \"unused\"\nexpires_at = \"unix:9999999999\"\nuses_remaining = 1\n",
+    )
+    .expect("invites file should write");
+    fs::write(&private_key_path, format!("{}\n", keypair.private_key_b64))
+        .expect("private key should write");
+    fs::write(&public_key_path, format!("{}\n", keypair.public_key_b64))
+        .expect("public key should write");
+
+    let bind = pick_ephemeral_bind();
+    let store = AuthorizedKeysStore::load(&authorized_path).expect("authorized keys should load");
+    let bind_for_server = bind.clone();
+    let invite_for_server = invites_path
+        .to_str()
+        .expect("path should be utf-8")
+        .to_owned();
+    let server_task = tokio::spawn(async move {
+        crate::run_server(
+            &bind_for_server,
+            &invite_for_server,
+            Arc::new(DeviceKeypair::generate()),
+            store,
+            crate::session_registry::SessionRegistry::default(),
+            Arc::new(RwLock::new(HashMap::new())),
+            None,
+            None,
+            std::net::SocketAddr::from(([192, 0, 2, 53], 53)),
+        )
+        .await
+    });
+
+    let mut connected = false;
+    let mut last_error = String::new();
+    for _ in 0..20 {
+        match try_establish_client_stream(&bind, &private_key_path, &public_key_path).await {
+            Ok(stream) => {
+                connected = true;
+                let mut transport = NaiveTcpTransport::from_stream(stream);
+
+                let syn_packet = build_ipv4_tcp_packet(
+                    CLIENT_VIRTUAL_IP,
+                    GATEWAY_IP,
+                    CLIENT_PORT,
+                    NON_ECHO_PORT,
+                    CLIENT_ISN,
+                    0,
+                    TCP_SYN,
+                    WINDOW,
+                    &[],
+                );
+                transport
+                    .send(SessionFrame {
+                        header: SessionHeader {
+                            connection_id: 10,
+                            sequence: 0,
+                            flags: 0,
+                        },
+                        payload: Bytes::copy_from_slice(&syn_packet),
+                    })
+                    .await
+                    .expect("SYN frame should send");
+
+                // The dial to 10.8.0.1:18098 fails (5 s dial budget at
+                // most), so the answer must be a RST, not a SYN-ACK.
+                let rst_frame = timeout(Duration::from_secs(15), transport.recv())
+                    .await
+                    .expect("RST should arrive within timeout")
+                    .expect("RST frame should be readable");
+                let rst = parse_ipv4_tcp_packet(&rst_frame.payload)
+                    .expect("RST should be a valid IPv4/TCP packet");
+                assert_eq!(rst.src_ip, GATEWAY_IP, "RST src_ip");
+                assert_eq!(rst.src_port, NON_ECHO_PORT, "RST src_port");
+                assert_eq!(rst.dst_port, CLIENT_PORT, "RST dst_port");
+                assert!(
+                    rst.flags & TCP_RST != 0,
+                    "non-echo gateway port must RST, got flags 0x{:02x}",
+                    rst.flags
+                );
+                assert!(
+                    rst.flags & TCP_SYN == 0,
+                    "non-echo gateway port must never SYN-ACK"
+                );
+
+                break;
+            }
+            Err(err) => {
+                last_error = err;
+                sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
+
+    assert!(
+        connected,
+        "rust client failed to connect to local server: {last_error}"
+    );
+    server_task.abort();
+    let _ = fs::remove_file(authorized_path);
+    let _ = fs::remove_file(&invites_path);
+    let _ = fs::remove_file(private_key_path);
+    let _ = fs::remove_file(public_key_path);
+}

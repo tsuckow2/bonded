@@ -362,6 +362,13 @@ pub struct SmoltcpForwarder {
     /// DNS proxy answering queries addressed to the tunnel gateway
     /// (the client's VPN DNS server) with the server's own resolvers.
     dns_proxy: crate::dns_proxy::DnsProxy,
+    /// Loopback TCP echo listener for the tunnel gateway's echo port
+    /// (10.8.0.1:18099; see `crate::tunnel_echo`). `None` when the
+    /// loopback bind failed at startup; echo SYNs then follow the
+    /// normal dial-first path to 10.8.0.1:18099 and RST, so the
+    /// diagnostic reports the endpoint as unavailable instead of
+    /// hanging.
+    echo_listener: Option<crate::tunnel_echo::TunnelEchoListener>,
     session_id: u64,
     /// Count of packets delivered to ingest_packet (for tests).
     ingested_packets: AtomicU64,
@@ -681,6 +688,9 @@ impl SmoltcpForwarder {
         let seq_thread = outbound_seq.clone();
         let tcp_flows_thread = tcp_flows.clone();
         let tokio_handle = tokio::runtime::Handle::current();
+        // The echo listener binds on the same runtime; keep a clone
+        // because the poll-thread spawn below moves the original.
+        let tokio_handle_echo = tokio_handle.clone();
 
         std::thread::Builder::new()
             .name(format!("smoltcp-{session_id}"))
@@ -708,6 +718,16 @@ impl SmoltcpForwarder {
             tcp_flows,
             outbound_tx: outbound_tx.clone(),
             dns_proxy: crate::dns_proxy::DnsProxy::new(session_id, outbound_tx, dns_server),
+            echo_listener: match crate::tunnel_echo::TunnelEchoListener::start(
+                &tokio_handle_echo,
+                crate::tunnel_echo::EchoConfig::default(),
+            ) {
+                Ok(listener) => Some(listener),
+                Err(err) => {
+                    warn!(error = %err, "tunnel echo listener failed to bind; echo endpoint unavailable");
+                    None
+                }
+            },
             session_id,
             ingested_packets: AtomicU64::new(0),
             dial_pending: Arc::new(Mutex::new(HashMap::new())),
@@ -854,6 +874,28 @@ impl SmoltcpForwarder {
             // so a port that is not actually open is never SYN-ACKed.
             // A retransmitted SYN for a held dial is dropped; a stale
             // held entry is replaced by a fresh dial.
+            //
+            // Exception: a SYN for the tunnel gateway's echo port
+            // (10.8.0.1:18099) is terminated locally — it dials the
+            // in-process loopback echo listener instead of the
+            // internet, so the overhead diagnostic can run a real
+            // fixed-payload TCP connection through the tunnel. The
+            // flow mapping still keys on the original tuple, so the
+            // client sees 10.8.0.1:18099 as the peer. When the echo
+            // listener failed to bind at startup, the SYN follows the
+            // normal path to 10.8.0.1:18099 and RSTs, exactly like
+            // any other unroutable gateway port.
+            let dial_target =
+                if dst_ip == crate::tunnel_echo::TUN_ECHO_ADDR
+                    && dst_port == crate::tunnel_echo::TUN_ECHO_PORT
+                {
+                    match &self.echo_listener {
+                        Some(listener) => listener.addr(),
+                        None => SocketAddrV4::new(dst_ip, dst_port),
+                    }
+                } else {
+                    SocketAddrV4::new(dst_ip, dst_port)
+                };
             let mut held = self
                 .dial_pending
                 .lock()
@@ -875,7 +917,7 @@ impl SmoltcpForwarder {
                 },
             );
             drop(held);
-            self.spawn_upstream_dial(key, SocketAddrV4::new(dst_ip, dst_port));
+            self.spawn_upstream_dial(key, dial_target);
             return;
         }
 

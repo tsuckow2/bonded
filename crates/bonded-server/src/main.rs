@@ -16,6 +16,7 @@ mod session_registry;
 mod smoltcp_forwarder;
 mod status;
 mod tun_bridge;
+mod tunnel_echo;
 mod tunnel_pcap;
 mod wireguard;
 
