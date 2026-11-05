@@ -569,17 +569,47 @@ class BondedVpnService : VpnService() {
         inboundDrainThread =
                 thread(name = "bonded-vpn-inbound", start = true) {
                     val output = FileOutputStream(pfd.fileDescriptor)
+                    // True when this thread exits because the native
+                    // fd handoff took over mid-session (as opposed to
+                    // shutdown). In that case the stream must NOT be
+                    // closed: it wraps the live TUN fd, which the
+                    // outbound thread still reads from — closing it
+                    // would break the session. The ParcelFileDescriptor
+                    // still owns the fd and closes it at shutdown.
+                    var handoffTakeover = false
                     try {
                         while (packetIoRunning) {
                             val inbound = pollInboundPacket()
                             if (inbound == null || inbound.isEmpty()) {
+                                // Queue empty. If the native fd handoff
+                                // has since succeeded, new packets go
+                                // straight to the TUN fd and this queue
+                                // will stay empty — exit instead of
+                                // spinning on the 1ms poll forever
+                                // after a successful re-handoff. A
+                                // later handoff failure restarts this
+                                // thread via
+                                // startInboundDrainThreadIfNeeded.
+                                if (nativeTunFdWriteAvailable) {
+                                    android.util.Log.i(
+                                        "BondedVPN",
+                                        "Inbound drain exiting: native TUN fd handoff active, queue drained"
+                                    )
+                                    handoffTakeover = true
+                                    break
+                                }
                                 // If nothing was available, sleep briefly to avoid busy-spinning.
                                 Thread.sleep(INBOUND_IDLE_SLEEP_MS)
                                 continue
                             }
 
+                            // No flush() here: FileOutputStream is
+                            // unbuffered, so every write already goes
+                            // straight to the fd and flush() is a
+                            // no-op. Writes also cannot be batched:
+                            // TUN writes are packet-atomic, so each
+                            // packet needs its own write syscall.
                             output.write(inbound)
-                            output.flush()
                         }
                     } catch (_: InterruptedException) {
                         // Normal shutdown signal.
@@ -593,9 +623,11 @@ class BondedVpnService : VpnService() {
                             emitEvent("error", "VPN inbound drain stopped: ${e.message}")
                         }
                     } finally {
-                        try {
-                            output.close()
-                        } catch (_: Exception) {}
+                        if (!handoffTakeover) {
+                            try {
+                                output.close()
+                            } catch (_: Exception) {}
+                        }
                     }
                 }
     }
@@ -854,8 +886,6 @@ class BondedVpnService : VpnService() {
     }
 
     private fun processOutboundPacket(buffer: ByteArray, length: Int) {
-        val packet = buffer.copyOf(length)
-
         if (!nativeProcessingAvailable) {
             if (!nativeAvailabilityReported) {
                 emitEvent("packet_io", "Native packet processing unavailable; packets are dropped")
@@ -866,8 +896,15 @@ class BondedVpnService : VpnService() {
 
         try {
             flushPendingOutboundPackets(MAX_PENDING_FLUSH_PER_CYCLE)
-            val queued = tryQueueOutboundPacket(packet)
+            // Fast path: hand the shared read buffer straight to
+            // native with its length — native copies synchronously
+            // during the call, so no JVM copy is needed. Only the
+            // pending queue needs its own copy, because it holds the
+            // packet past this call while the buffer is reused for
+            // the next read.
+            val queued = tryQueueOutboundPacket(buffer, length)
             if (!queued) {
+                val packet = buffer.copyOf(length)
                 enqueuePendingOutboundPacket(packet)
                 android.util.Log.w(
                         "BondedVPN",
@@ -942,7 +979,7 @@ class BondedVpnService : VpnService() {
         return "unknown(v=$version)"
     }
 
-    private external fun nativeHandleTunOutbound(packet: ByteArray): Boolean
+    private external fun nativeHandleTunOutbound(packet: ByteArray, length: Int): Boolean
 
     private external fun nativeSetTunFd(fd: Int): Boolean
 
@@ -1159,8 +1196,8 @@ class BondedVpnService : VpnService() {
         }
     }
 
-    private fun tryQueueOutboundPacket(packet: ByteArray): Boolean {
-        return nativeHandleTunOutbound(packet)
+    private fun tryQueueOutboundPacket(packet: ByteArray, length: Int): Boolean {
+        return nativeHandleTunOutbound(packet, length)
     }
 
     private fun enqueuePendingOutboundPacket(packet: ByteArray) {
@@ -1191,7 +1228,7 @@ class BondedVpnService : VpnService() {
                     }
                             ?: return
 
-            if (!tryQueueOutboundPacket(next)) {
+            if (!tryQueueOutboundPacket(next, next.size)) {
                 synchronized(pendingOutboundLock) { pendingOutboundPackets.addFirst(next) }
                 return
             }

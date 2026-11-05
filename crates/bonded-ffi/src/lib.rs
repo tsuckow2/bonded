@@ -3148,9 +3148,28 @@ pub extern "system" fn Java_com_bonded_bonded_1app_BondedVpnService_nativeHandle
     env: jni::JNIEnv,
     _obj: jni::objects::JObject,
     packet: jni::objects::JByteArray,
+    length: jni::sys::jint,
 ) -> jni::sys::jboolean {
-    if let Ok(packet) = env.convert_byte_array(&packet) {
-        return if queue_outbound_packet(packet) { 1 } else { 0 };
+    // The Kotlin side passes its shared 32 KB read buffer with the
+    // actual packet length. Copy exactly `length` bytes, not the whole
+    // buffer: converting the full array would copy 32 KB per packet
+    // even for a 100-byte packet. Lengths outside the array fail in
+    // GetByteArrayRegion and drop the packet instead of over-reading.
+    if length <= 0 {
+        return 0;
+    }
+    let mut bytes = vec![0u8; length as usize];
+    // SAFETY: u8 and i8 share size and alignment, and the slice covers
+    // exactly this Vec's allocation, so reinterpreting it for the
+    // region copy cannot alias anything else.
+    let buf: &mut [i8] = unsafe {
+        std::slice::from_raw_parts_mut(
+            bytes.as_mut_ptr() as *mut i8,
+            bytes.len(),
+        )
+    };
+    if env.get_byte_array_region(&packet, 0, buf).is_ok() {
+        return if queue_outbound_packet(bytes) { 1 } else { 0 };
     }
 
     0
