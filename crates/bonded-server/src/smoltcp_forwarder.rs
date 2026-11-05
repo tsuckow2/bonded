@@ -32,12 +32,6 @@
 //! header is address bytes that could otherwise misdispatch a v6 packet
 //! to the IPv4 TCP/UDP/ICMP handlers.
 //!
-//! One exception skips the dial entirely: a SYN to the tunnel gateway's
-//! DoT port (10.8.0.1:853) is answered with an immediate RST. Nothing
-//! listens for DoT on the gateway, and dialing it would hang on the
-//! blackholed gateway route until DIAL_TIMEOUT — the client (e.g. an
-//! Android Private DNS probe) should fail fast, not wait ~5 s.
-//!
 //! UDP (direct)
 //! ─────────────
 //! One OS `UdpSocket` per flow, driven by per-flow Tokio tasks. No smoltcp
@@ -833,29 +827,6 @@ impl SmoltcpForwarder {
             dst_port,
         };
 
-        // Explicit gateway-DoT rejection, before any live-flow or dial
-        // handling: nothing listens for DoT on the tunnel gateway, and
-        // dialing it would hang on the blackholed gateway route until
-        // DIAL_TIMEOUT. Answer the SYN with a RST immediately so the
-        // client fails fast (e.g. an Android Private DNS probe), with
-        // no dial entry created and no SYN-ACK ever sent.
-        if is_syn
-            && dst_ip == crate::dns_proxy::TUN_DNS_ADDR
-            && dst_port == crate::dns_proxy::TUN_DOT_PORT
-        {
-            let (syn_seq, syn_payload_len) = parse_tcp_syn_seq(payload).unwrap_or((0, 0));
-            let _ = self.cmd_tx.try_send(PollCommand::RejectSyn {
-                key,
-                syn_seq,
-                syn_payload_len,
-            });
-            let (lock, cvar) = &*self.work;
-            let mut flag = lock.lock().expect("work lock should not be poisoned");
-            *flag = true;
-            cvar.notify_one();
-            return;
-        }
-
         // A live flow owns this tuple: its mapped port is reused (a
         // retransmitted SYN for a live flow must NOT create a second
         // smoltcp socket). Anything else is a new flow (SYN) or a packet
@@ -1202,13 +1173,6 @@ enum PollCommand {
         syn_seq: u32,
         syn_payload_len: u32,
     },
-    /// Explicit rejection of a SYN that was never dialed (gateway DoT):
-    /// answer it with a RST immediately, same shape as DialFailed.
-    RejectSyn {
-        key: TcpFlowKey,
-        syn_seq: u32,
-        syn_payload_len: u32,
-    },
 }
 
 // ── Pending / established connection state ─────────────────────────────────────
@@ -1296,9 +1260,8 @@ fn smoltcp_poll_wait_duration(
 
 /// Answer a SYN with a RST through the poll thread's own outbound
 /// channel (own outbound sequence, exactly like smoltcp's egress
-/// packets). Shared by the dial-failure path and the explicit
-/// gateway-DoT rejection: in both cases the port is not open, and no
-/// SYN-ACK was ever sent for the SYN.
+/// packets). Used by the dial-failure path: the port is not open, and
+/// no SYN-ACK was ever sent for the SYN.
 fn emit_syn_rst(
     session_id: u64,
     outbound_tx: &mpsc::UnboundedSender<SessionFrame>,
@@ -1492,23 +1455,6 @@ fn smoltcp_poll_thread(
                 }) => {
                     // Answer the held SYN with a RST: the port is not
                     // open, and no SYN-ACK was ever sent for it.
-                    emit_syn_rst(
-                        session_id,
-                        &outbound_tx,
-                        &outbound_seq,
-                        &key,
-                        syn_seq,
-                        syn_payload_len,
-                    );
-                }
-                Ok(PollCommand::RejectSyn {
-                    key,
-                    syn_seq,
-                    syn_payload_len,
-                }) => {
-                    // Explicit rejection: no dial was ever attempted for
-                    // this tuple, so there is nothing to clean up — just
-                    // answer the SYN with a RST.
                     emit_syn_rst(
                         session_id,
                         &outbound_tx,
@@ -3448,21 +3394,24 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn gateway_dot_syn_gets_immediate_rst_without_dial() {
-        // A SYN to the tunnel gateway's DoT port must be answered with
-        // a RST immediately, not dialed: nothing listens for DoT on the
-        // gateway, and dialing it would hang on the blackholed gateway
-        // route until DIAL_TIMEOUT. The proof that no dial happened is
-        // synchronous: right after the ingest, with no await in between,
-        // the held-dial map must still be empty (the dial task could
-        // not have run, and the explicit path never inserts an entry).
-        let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<SessionFrame>();
+    async fn gateway_dot_syn_is_held_for_dial() {
+        // The explicit gateway-DoT RST was removed: a SYN to the tunnel
+        // gateway's DoT port (10.8.0.1:853) now goes through dial-first
+        // like any other destination. It must be held for a dial, never
+        // SYN-ACKed and never answered with an immediate RST; the RST
+        // arrives only when the dial fails or times out (DIAL_TIMEOUT,
+        // since the gateway route blackholes). The proof is
+        // synchronous: right after the ingest, with no await in
+        // between, the held-dial map must contain exactly this tuple
+        // (the entry is inserted synchronously, before the dial task
+        // can run and resolve it).
+        let (outbound_tx, _outbound_rx) = mpsc::unbounded_channel::<SessionFrame>();
         let forwarder = SmoltcpForwarder::new(46, outbound_tx, Arc::new(AtomicU64::new(0)), std::net::SocketAddr::from(([192, 0, 2, 53], 53)));
 
         let client_ip = Ipv4Addr::new(10, 8, 0, 2);
         let client_port = 40011u16;
         let gateway_ip = crate::dns_proxy::TUN_DNS_ADDR;
-        let gateway_dot_port = crate::dns_proxy::TUN_DOT_PORT;
+        let gateway_dot_port = 853u16;
         let client_isn = 6000u32;
         let syn = build_ipv4_tcp_packet(
             client_ip,
@@ -3484,35 +3433,9 @@ mod tests {
         });
         assert_eq!(
             forwarder.dial_pending_len(),
-            0,
-            "a gateway-DoT SYN must be rejected outright, never held for a dial"
+            1,
+            "a gateway-DoT SYN must be held for a dial-first dial, not rejected outright"
         );
-
-        let pkts = collect_tcp_packets_for_flow(
-            &mut outbound_rx,
-            client_ip,
-            client_port,
-            gateway_ip,
-            gateway_dot_port,
-            Duration::from_secs(2),
-        )
-        .await;
-        assert!(
-            pkts.iter().any(|p| p.flags & TCP_RST != 0),
-            "a gateway-DoT SYN must be answered with a RST, got flags: {:?}",
-            pkts.iter().map(|p| p.flags).collect::<Vec<_>>()
-        );
-        assert!(
-            !pkts.iter().any(|p| p.flags & TCP_SYN != 0),
-            "a gateway-DoT SYN must never be SYN-ACKed"
-        );
-        let rst = pkts
-            .iter()
-            .find(|p| p.flags & TCP_RST != 0)
-            .expect("RST should be present");
-        assert_eq!(rst.flags & (TCP_RST | TCP_ACK), TCP_RST | TCP_ACK);
-        assert_eq!(rst.seq, 0);
-        assert_eq!(rst.ack, client_isn.wrapping_add(1));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
