@@ -1642,7 +1642,11 @@ fn build_peer_server_config(cert_der: Vec<u8>, key_der: Vec<u8>) -> quinn::Serve
     // Peer relays are standby failover paths: they sit idle until the primary
     // path fails. Quinn's default 30s max idle timeout would silently kill an
     // idle relay, so send periodic PINGs to keep the QUIC connection alive.
-    transport.keep_alive_interval(Some(Duration::from_secs(10)));
+    // 25 s is the longest cadence that still stays under that 30 s
+    // timeout (and under typical NAT timeouts); it matches the
+    // session-level idle heartbeat, so a parked relay can be re-pinged
+    // on demand without a fresh handshake.
+    transport.keep_alive_interval(Some(Duration::from_secs(25)));
     server_config.transport_config(Arc::new(transport));
     server_config
 }

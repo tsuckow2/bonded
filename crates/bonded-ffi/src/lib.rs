@@ -5,6 +5,7 @@ use bonded_client::{
 };
 #[cfg(any(target_os = "android", test))]
 use bonded_core::config::ClientConfig;
+use bonded_core::heartbeat::{is_idle, IDLE_INTERVAL};
 #[cfg(target_os = "android")]
 use bonded_core::config::SocketNetworkBindFn;
 #[cfg(target_os = "android")]
@@ -37,7 +38,7 @@ use std::thread::{self, JoinHandle};
 #[cfg(any(target_os = "android", test))]
 use std::time::Duration;
 #[cfg(any(target_os = "android", test))]
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 #[cfg(any(target_os = "android", test))]
 use tokio_util::sync::CancellationToken;
 
@@ -1546,14 +1547,27 @@ fn start_android_session(
             let mut standby_ping_failures: std::collections::HashMap<usize, u8> =
                 std::collections::HashMap::new();
             let mut last_transport_count = transports.len();
-            // 10 s, not 25: the server reaps any transport it receives
-            // nothing on for 30 s, so a 25 s cadence leaves only 5 s of
-            // slack and a single doze/scheduler stall kills every idle
-            // standby path (measured 2026-10-18: median direct-transport
-            // lifetime 276 s in production logs).
-            let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
+            // Adaptive heartbeat (battery): 10 s while traffic flows,
+            // 25 s on the active path only while idle — see
+            // bonded_core::heartbeat for the policy. The 10 s active
+            // cadence is kept deliberately: the server reaps any
+            // transport it receives nothing on for 30 s, so a 25 s
+            // cadence leaves only 5 s of slack and a single
+            // doze/scheduler stall kills every idle standby path
+            // (measured 2026-10-18: median direct-transport lifetime
+            // 276 s in production logs). While idle that risk is
+            // accepted for the active path too, and standby paths are
+            // allowed to be reaped — they are re-pinged (and evicted
+            // if dead, then re-dialed by the supervisor) when traffic
+            // resumes. A fresh interval's first tick fires immediately,
+            // so it is consumed below and on every mode flip.
+            const HEARTBEAT_ACTIVE_INTERVAL: Duration = Duration::from_secs(10);
+            let mut heartbeat = tokio::time::interval(HEARTBEAT_ACTIVE_INTERVAL);
             heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            // Consume the immediate first tick so the first ping fires after 25s, not instantly.
+            let mut last_traffic = Instant::now();
+            let mut last_transport_change = Instant::now();
+            let mut heartbeat_idle = false;
+            // Consume the immediate first tick so the first ping fires after 10s, not instantly.
             heartbeat.tick().await;
 
             loop {
@@ -2051,6 +2065,7 @@ fn start_android_session(
                                             {
                                                 let _ = path_lost_tx.send(lost_path);
                                             }
+                                            last_transport_change = Instant::now();
                                             transports.remove(index);
                                             path_index_map.on_remove(index);
                                             if index < active_index {
@@ -2096,6 +2111,8 @@ fn start_android_session(
                                     break;
                                 }
                                 if sent {
+                                    // Outbound user traffic resets the idle clock.
+                                    last_traffic = Instant::now();
                                     update_snapshot(&worker_snapshot, |session_snapshot| {
                                         session_snapshot.outbound_packets = session_snapshot.outbound_packets.saturating_add(1);
                                         session_snapshot.outbound_bytes = session_snapshot.outbound_bytes.saturating_add(packet_len);
@@ -2202,6 +2219,8 @@ fn start_android_session(
                                     // TCP reordering; forcing in-order delivery here causes inbound
                                     // to stall whenever the server drops a response (e.g. UDP timeout).
                                     if !frame.payload.is_empty() {
+                                        // Inbound user traffic resets the idle clock.
+                                        last_traffic = Instant::now();
                                         let payload = frame.payload.to_vec();
                                         let payload_len = payload.len() as u64;
                                         let delivered_to_tun = {
@@ -2255,6 +2274,7 @@ fn start_android_session(
                                 let _ = path_lost_tx.send(lost_path);
                             }
                             let was_active = index == active_index;
+                            last_transport_change = Instant::now();
                             transports.remove(index);
                             path_index_map.on_remove(index);
                             if index < active_index {
@@ -2278,6 +2298,33 @@ fn start_android_session(
                         }
                     }
                     _ = heartbeat.tick() => {
+                        // Adaptive cadence: flip the interval when the
+                        // idle state changes, consuming the fresh
+                        // interval's immediate tick so a full period
+                        // passes before the next ping.
+                        let idle_now = is_idle(
+                            last_traffic,
+                            last_transport_change,
+                            Instant::now(),
+                        );
+                        if idle_now != heartbeat_idle {
+                            heartbeat_idle = idle_now;
+                            let period = if heartbeat_idle {
+                                IDLE_INTERVAL
+                            } else {
+                                HEARTBEAT_ACTIVE_INTERVAL
+                            };
+                            heartbeat = tokio::time::interval(period);
+                            heartbeat.set_missed_tick_behavior(
+                                tokio::time::MissedTickBehavior::Delay,
+                            );
+                            heartbeat.tick().await;
+                            alog_info!(
+                                "Worker: heartbeat cadence changed idle={} period_secs={}",
+                                heartbeat_idle,
+                                period.as_secs()
+                            );
+                        }
                         let now_ms = SystemTime::now()
                             .duration_since(UNIX_EPOCH)
                             .map(|d| d.as_millis() as u64)
@@ -2291,17 +2338,28 @@ fn start_android_session(
                             payload: Bytes::new(),
                         };
                         alog_info!("Sending heartbeat ping seq={}", ping_sequence);
-                        // Ping EVERY path, not just the active one: the
-                        // server closes any transport it receives nothing
-                        // on for 30s, so an active-path-only heartbeat lets
-                        // every idle path be torn down and re-dialed in a
-                        // loop, leaving the session single-path in practice.
+                        // While active, ping EVERY path, not just the
+                        // active one: the server closes any transport
+                        // it receives nothing on for 30s, so an
+                        // active-path-only heartbeat lets every idle
+                        // path be torn down and re-dialed in a loop,
+                        // leaving the session single-path in practice.
+                        // While idle, ping only the active path (see
+                        // bonded_core::heartbeat): standby paths go
+                        // silent and the server reaps them after 30s;
+                        // they are re-pinged — and evicted if dead,
+                        // then re-dialed by the supervisor — when
+                        // traffic resumes and the fast cadence restarts.
                         if transports.len() != last_transport_count {
                             standby_ping_failures.clear();
                             last_transport_count = transports.len();
+                            last_transport_change = Instant::now();
                         }
                         let mut any_sent = false;
                         for (path_index, transport) in transports.iter_mut().enumerate() {
+                            if heartbeat_idle && path_index != active_index {
+                                continue;
+                            }
                             match transport.send(ping.clone()).await {
                                 Ok(()) => {
                                     any_sent = true;
@@ -2379,6 +2437,7 @@ fn start_android_session(
                             if let Some(lost_path) = path_index_map.path_of(index) {
                                 let _ = path_lost_tx.send(lost_path);
                             }
+                            last_transport_change = Instant::now();
                             let mut expired_transport = transports.remove(index);
                             path_index_map.on_remove(index);
                             if index < active_index {

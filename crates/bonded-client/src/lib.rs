@@ -2,6 +2,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 use bonded_core::auth::{sign_auth_challenge, DeviceKeypair};
 use bonded_core::config::ClientConfig;
+use bonded_core::heartbeat::{is_idle, pong_silence_timeout, IDLE_INTERVAL};
 #[cfg(target_os = "linux")]
 use bonded_core::session::{
     SessionFrame, SessionHeader, SessionState, FLAG_MULTIPATH_RECV, FLAG_PING, FLAG_PONG,
@@ -2117,7 +2118,13 @@ fn build_quic_client_config(
             .map_err(|e| anyhow::anyhow!("QUIC crypto config error: {e}"))?,
     ));
     let mut transport = quinn::TransportConfig::default();
-    transport.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
+    // 25 s, not 10: quinn applies this at connection setup and offers
+    // no dynamic adjustment, so this is the idle cadence as well as
+    // the active one. 25 s is the WireGuard-recommended keepalive —
+    // just under the server's 30 s transport reap and the shortest
+    // common NAT timeout — and session-level heartbeats (5 s active,
+    // 25 s idle) provide the faster liveness detection while active.
+    transport.keep_alive_interval(Some(std::time::Duration::from_secs(25)));
     client_config.transport_config(Arc::new(transport));
     Ok(client_config)
 }
@@ -2733,11 +2740,20 @@ async fn run_linux_packet_loop(
     // and fail over. Per-index pong times are reseeded whenever the
     // transport count changes, since removals shift indices (the same
     // discipline the Android worker uses for its per-index counters).
-    let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
+    // Adaptive heartbeat (battery): fast while traffic flows, backed
+    // off while idle — see bonded_core::heartbeat for the policy and
+    // its detection-lag tradeoff. The interval is recreated whenever
+    // the mode flips; the immediate tick of a fresh interval is
+    // consumed below so the first ping fires after a full period.
+    const HEARTBEAT_ACTIVE_INTERVAL: Duration = Duration::from_secs(5);
+    let mut heartbeat = tokio::time::interval(HEARTBEAT_ACTIVE_INTERVAL);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_pong_by_index: std::collections::HashMap<usize, Instant> =
         (0..transports.len()).map(|i| (i, Instant::now())).collect();
     let mut last_transport_count = transports.len();
+    let mut last_traffic = Instant::now();
+    let mut last_transport_change = Instant::now();
+    let mut heartbeat_idle = false;
     // Skip the immediate first tick; we just completed binding.
     heartbeat.tick().await;
 
@@ -2749,6 +2765,9 @@ async fn run_linux_packet_loop(
                 if read == 0 {
                     continue;
                 }
+                // User traffic resets the idle clock: fast heartbeats
+                // resume on the next tick.
+                last_traffic = Instant::now();
 
                 let packet = Bytes::copy_from_slice(&tun_buf[..read]);
                 let frame = state.create_outbound_frame(packet.clone(), 0);
@@ -2784,6 +2803,7 @@ async fn run_linux_packet_loop(
                             if transports.len() == 1 {
                                 return Err(err);
                             }
+                            last_transport_change = Instant::now();
                             transports.remove(index);
                             if index < active_index {
                                 active_index -= 1;
@@ -2808,6 +2828,26 @@ async fn run_linux_packet_loop(
                 }
             }
             _ = heartbeat.tick() => {
+                // Adaptive cadence: flip the interval when the idle
+                // state changes. A fresh interval's first tick fires
+                // immediately, so consume it here to keep a full
+                // period between pings.
+                let idle_now =
+                    is_idle(last_traffic, last_transport_change, Instant::now());
+                if idle_now != heartbeat_idle {
+                    heartbeat_idle = idle_now;
+                    let period = if heartbeat_idle {
+                        IDLE_INTERVAL
+                    } else {
+                        HEARTBEAT_ACTIVE_INTERVAL
+                    };
+                    heartbeat = tokio::time::interval(period);
+                    heartbeat.set_missed_tick_behavior(
+                        tokio::time::MissedTickBehavior::Delay,
+                    );
+                    heartbeat.tick().await;
+                    info!(idle = heartbeat_idle, period_secs = period.as_secs(), "heartbeat cadence changed");
+                }
                 // Reseed per-index pong times whenever the transport set
                 // changed size since the last tick (indices shifted).
                 if transports.len() != last_transport_count {
@@ -2815,9 +2855,16 @@ async fn run_linux_packet_loop(
                         .map(|i| (i, Instant::now()))
                         .collect();
                     last_transport_count = transports.len();
+                    last_transport_change = Instant::now();
                 }
-                // PING every path, not just the active one: the server
-                // reaps transports it receives nothing on for 30s.
+                // While active, PING every path, not just the active
+                // one: the server reaps transports it receives nothing
+                // on for 30s. While idle, ping only the active path —
+                // standby paths go silent and the server reaps them
+                // after 30s; they are re-pinged (and evicted if dead,
+                // then re-dialed by the supervisor) when traffic
+                // resumes and the fast cadence restarts. See
+                // bonded_core::heartbeat for the full tradeoff.
                 let ping = SessionFrame {
                     header: SessionHeader {
                         connection_id: session_id,
@@ -2828,13 +2875,22 @@ async fn run_linux_packet_loop(
                 };
                 let mut failed: Vec<usize> = Vec::new();
                 for index in 0..transports.len() {
+                    if heartbeat_idle && index != active_index {
+                        continue;
+                    }
                     if let Err(err) = transports[index].send(ping.clone()).await {
                         warn!(path = index, error = %err, "heartbeat ping send failed, dropping path");
                         failed.push(index);
                     }
                 }
-                // A path whose PONG has been silent for 15s is
-                // blackholed even if its sends still succeed.
+                // A path whose PONG has been silent for three heartbeat
+                // intervals is blackholed even if its sends still
+                // succeed (15s at the 5s cadence, 75s while idle).
+                let pong_timeout = pong_silence_timeout(if heartbeat_idle {
+                    IDLE_INTERVAL
+                } else {
+                    HEARTBEAT_ACTIVE_INTERVAL
+                });
                 let now = Instant::now();
                 for index in 0..transports.len() {
                     if failed.contains(&index) {
@@ -2842,7 +2898,7 @@ async fn run_linux_packet_loop(
                     }
                     let silent = last_pong_by_index
                         .get(&index)
-                        .map(|pong| now.duration_since(*pong) > Duration::from_secs(15))
+                        .map(|pong| now.duration_since(*pong) > pong_timeout)
                         .unwrap_or(false);
                     if silent {
                         warn!(path = index, "heartbeat timeout: no PONG in 15s, dropping blackholed path");
@@ -2853,6 +2909,7 @@ async fn run_linux_packet_loop(
                 failed.sort_unstable_by(|a, b| b.cmp(a));
                 failed.dedup();
                 for index in failed {
+                    last_transport_change = Instant::now();
                     transports.remove(index);
                     if transports.is_empty() {
                         anyhow::bail!("all paths lost");
@@ -2867,6 +2924,7 @@ async fn run_linux_packet_loop(
             peer_transport = peer_transport_rx.recv() => {
                 if let Some(transport) = peer_transport {
                     let kind = transport.kind();
+                    last_transport_change = Instant::now();
                     transports.push(transport);
                     info!(kind = ?kind, total_paths = transports.len(), "added peer-share transport path");
                 }
@@ -2885,6 +2943,8 @@ async fn run_linux_packet_loop(
                                 last_pong_by_index.insert(index, Instant::now());
                                 continue;
                             }
+                            // Inbound user traffic resets the idle clock.
+                            last_traffic = Instant::now();
                             let ready = state.ingest_inbound(frame)?;
                             for packet in ready {
                                 let _ = device.send(&packet.payload).await?;
@@ -2900,6 +2960,7 @@ async fn run_linux_packet_loop(
                     if transports.len() == 1 {
                         return Err(err);
                     }
+                    last_transport_change = Instant::now();
                     transports.remove(index);
                     if index < active_index {
                         active_index -= 1;
