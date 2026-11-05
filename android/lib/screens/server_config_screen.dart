@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import '../models/pairing_model.dart';
+import '../widgets/remote_text_field.dart';
 import '../services/pairing_service.dart';
 
 class ServerConfigScreen extends StatefulWidget {
@@ -23,6 +24,16 @@ class _ServerConfigScreenState extends State<ServerConfigScreen> {
   late bool _diagnosticsUploadEnabled;
   late TextEditingController _diagnosticsUploadPeriodController;
   bool _isSaving = false;
+  // Remote navigation: Back exits editing instead of popping the page
+  // while any field below is editing. See RemoteTextField.
+  bool _isAnyFieldEditing = false;
+  final _serverAddressFieldKey = GlobalKey<RemoteTextFieldState>();
+  final _publicKeyFieldKey = GlobalKey<RemoteTextFieldState>();
+  final _peerShareBindFieldKey = GlobalKey<RemoteTextFieldState>();
+  final _peerShareAdvertiseFieldKey = GlobalKey<RemoteTextFieldState>();
+  final _peerShareMaxConsumersFieldKey = GlobalKey<RemoteTextFieldState>();
+  final _peerShareBandwidthFieldKey = GlobalKey<RemoteTextFieldState>();
+  final _diagnosticsPeriodFieldKey = GlobalKey<RemoteTextFieldState>();
 
   @override
   void initState() {
@@ -205,25 +216,50 @@ class _ServerConfigScreenState extends State<ServerConfigScreen> {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(title: const Text('Server Configuration')),
-      body: SingleChildScrollView(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
+    // Back on a remote: while a field is editing, Back exits editing
+    // (hides the keyboard, keeps focus on the field) instead of popping
+    // this page. A second Back, with nothing editing, pops as usual.
+    return PopScope(
+      canPop: !_isAnyFieldEditing,
+      onPopInvokedWithResult: (didPop, _) {
+        if (didPop || !_isAnyFieldEditing) return;
+        for (final key in [
+          _serverAddressFieldKey,
+          _publicKeyFieldKey,
+          _peerShareBindFieldKey,
+          _peerShareAdvertiseFieldKey,
+          _peerShareMaxConsumersFieldKey,
+          _peerShareBandwidthFieldKey,
+          _diagnosticsPeriodFieldKey,
+        ]) {
+          key.currentState?.cancelEditing();
+        }
+      },
+      child: Scaffold(
+        appBar: AppBar(title: const Text('Server Configuration')),
+        body: SingleChildScrollView(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'On a remote: move to a field and press OK to edit it. '
+                'Back exits editing without leaving this page.',
+                style: TextStyle(fontSize: 13, color: Colors.grey),
+              ),
+              const SizedBox(height: 16),
             const Text(
               'Server Address',
               style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold),
             ),
             const SizedBox(height: 8),
-            TextField(
+            RemoteTextField(
+              key: _serverAddressFieldKey,
               controller: _serverAddressController,
+              onEditingChanged:
+                  (editing) => setState(() => _isAnyFieldEditing = editing),
               decoration: InputDecoration(
                 hintText: 'Server address',
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(8),
-                ),
                 filled: true,
                 fillColor: Colors.grey[100],
               ),
@@ -234,14 +270,14 @@ class _ServerConfigScreenState extends State<ServerConfigScreen> {
               style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold),
             ),
             const SizedBox(height: 8),
-            TextField(
+            RemoteTextField(
+              key: _publicKeyFieldKey,
               controller: _publicKeyController,
               maxLines: 3,
+              onEditingChanged:
+                  (editing) => setState(() => _isAnyFieldEditing = editing),
               decoration: InputDecoration(
                 hintText: 'Trusted ed25519 identity key (base64)',
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(8),
-                ),
                 filled: true,
                 fillColor: Colors.grey[100],
               ),
@@ -252,9 +288,14 @@ class _ServerConfigScreenState extends State<ServerConfigScreen> {
               style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold),
             ),
             const SizedBox(height: 12),
-            Wrap(
-              spacing: 8,
-              children:
+            // Remote navigation: chip delete buttons are still tappable,
+            // but they are excluded from D-pad traversal, so moving down
+            // from the key field lands on the peer-sharing switch instead
+            // of stepping through every protocol chip's delete button.
+            ExcludeFocus(
+              child: Wrap(
+                spacing: 8,
+                children:
                   _selectedProtocols
                       .map(
                         (protocol) => Chip(
@@ -267,7 +308,8 @@ class _ServerConfigScreenState extends State<ServerConfigScreen> {
                         ),
                       )
                       .toList(),
-            ),
+                ),
+              ),
             const SizedBox(height: 24),
             SwitchListTile(
               contentPadding: EdgeInsets.zero,
@@ -291,13 +333,13 @@ class _ServerConfigScreenState extends State<ServerConfigScreen> {
               style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold),
             ),
             const SizedBox(height: 8),
-            TextField(
+            RemoteTextField(
+              key: _peerShareBindFieldKey,
               controller: _peerShareBindAddressController,
+              onEditingChanged:
+                  (editing) => setState(() => _isAnyFieldEditing = editing),
               decoration: InputDecoration(
                 hintText: '0.0.0.0:54443',
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(8),
-                ),
                 filled: true,
                 fillColor: Colors.grey[100],
               ),
@@ -308,13 +350,13 @@ class _ServerConfigScreenState extends State<ServerConfigScreen> {
               style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold),
             ),
             const SizedBox(height: 8),
-            TextField(
+            RemoteTextField(
+              key: _peerShareAdvertiseFieldKey,
               controller: _peerShareAdvertiseIpController,
+              onEditingChanged:
+                  (editing) => setState(() => _isAnyFieldEditing = editing),
               decoration: InputDecoration(
                 hintText: 'Optional LAN IP override',
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(8),
-                ),
                 filled: true,
                 fillColor: Colors.grey[100],
               ),
@@ -325,15 +367,15 @@ class _ServerConfigScreenState extends State<ServerConfigScreen> {
               style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold),
             ),
             const SizedBox(height: 8),
-            TextField(
+            RemoteTextField(
+              key: _peerShareMaxConsumersFieldKey,
               controller: _peerShareMaxConsumersController,
               keyboardType: TextInputType.number,
+              onEditingChanged:
+                  (editing) => setState(() => _isAnyFieldEditing = editing),
               decoration: InputDecoration(
                 hintText: '4',
                 helperText: 'Max peers that can relay through this device',
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(8),
-                ),
                 filled: true,
                 fillColor: Colors.grey[100],
               ),
@@ -344,15 +386,15 @@ class _ServerConfigScreenState extends State<ServerConfigScreen> {
               style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold),
             ),
             const SizedBox(height: 8),
-            TextField(
+            RemoteTextField(
+              key: _peerShareBandwidthFieldKey,
               controller: _peerShareRelayBandwidthController,
               keyboardType: TextInputType.number,
+              onEditingChanged:
+                  (editing) => setState(() => _isAnyFieldEditing = editing),
               decoration: InputDecoration(
                 hintText: '0 = unlimited',
                 helperText: 'Per-relay bandwidth limit, kilobits per second',
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(8),
-                ),
                 filled: true,
                 fillColor: Colors.grey[100],
               ),
@@ -384,15 +426,15 @@ class _ServerConfigScreenState extends State<ServerConfigScreen> {
               style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold),
             ),
             const SizedBox(height: 8),
-            TextField(
+            RemoteTextField(
+              key: _diagnosticsPeriodFieldKey,
               controller: _diagnosticsUploadPeriodController,
               keyboardType: TextInputType.number,
+              onEditingChanged:
+                  (editing) => setState(() => _isAnyFieldEditing = editing),
               decoration: InputDecoration(
                 hintText: '900',
                 helperText: 'How often the log uploads (60–3600 seconds)',
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(8),
-                ),
                 filled: true,
                 fillColor: Colors.grey[100],
               ),
@@ -453,6 +495,7 @@ class _ServerConfigScreenState extends State<ServerConfigScreen> {
             ),
           ],
         ),
+      ),
       ),
     );
   }

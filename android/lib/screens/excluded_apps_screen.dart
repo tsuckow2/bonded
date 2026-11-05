@@ -29,11 +29,25 @@ class _ExcludedAppsScreenState extends State<ExcludedAppsScreen> {
   bool _loading = true;
   String? _error;
   String _filter = '';
+  final _searchFocusNode = FocusNode();
+  bool _searchFocused = false;
 
   @override
   void initState() {
     super.initState();
+    _searchFocusNode.addListener(() {
+      final focused = _searchFocusNode.hasFocus;
+      if (focused != _searchFocused) {
+        setState(() => _searchFocused = focused);
+      }
+    });
     _load();
+  }
+
+  @override
+  void dispose() {
+    _searchFocusNode.dispose();
+    super.dispose();
   }
 
   Future<void> _load() async {
@@ -90,8 +104,18 @@ class _ExcludedAppsScreenState extends State<ExcludedAppsScreen> {
             return app.label.toLowerCase().contains(needle) ||
                 app.packageName.toLowerCase().contains(needle);
           }).toList();
-    return Scaffold(
-      appBar: AppBar(title: const Text('Excluded apps')),
+    // Remote navigation: Back while the search field is focused
+    // dismisses the keyboard (unfocuses) instead of leaving this page.
+    // A second Back, with nothing focused, pops as usual.
+    return PopScope(
+      canPop: !_searchFocused,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop && _searchFocused) {
+          _searchFocusNode.unfocus();
+        }
+      },
+      child: Scaffold(
+        appBar: AppBar(title: const Text('Excluded apps')),
       body: Column(
         children: [
           const Padding(
@@ -105,6 +129,7 @@ class _ExcludedAppsScreenState extends State<ExcludedAppsScreen> {
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 16),
             child: TextField(
+              focusNode: _searchFocusNode,
               decoration: const InputDecoration(
                 hintText: 'Search apps',
                 prefixIcon: Icon(Icons.search),
@@ -145,6 +170,7 @@ class _ExcludedAppsScreenState extends State<ExcludedAppsScreen> {
           ),
         ],
       ),
+    ),
     );
   }
 }
