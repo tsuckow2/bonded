@@ -184,7 +184,15 @@ class BondedVpnService : VpnService() {
         val networkPathCount = pathManager.start()
         val bindAddresses = pathManager.activeBindAddresses()
         setActiveNetworkBindings(bindAddresses, pathManager.activePathSummaries())
-        acquireMulticastLockIfNeeded()
+        // Battery: the multicast lock keeps the Wi-Fi driver awake for
+        // every multicast frame on the LAN, not just Bonded's. Hold it
+        // only when peer sharing is actually enabled for this server —
+        // peer discovery is the only thing that needs it, and the peer
+        // runtime only starts when the flag is on. With peer sharing
+        // off, no lock is held for the whole session.
+        if (pairedServer.peerShareEnabled) {
+            acquireMulticastLockIfNeeded()
+        }
 
         if (vpnInterface == null) {
             try {
