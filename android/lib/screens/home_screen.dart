@@ -8,6 +8,7 @@ import '../services/app_settings_service.dart';
 import '../services/background_service.dart';
 import '../services/pairing_service.dart';
 import '../widgets/app_update_checker.dart';
+import '../widgets/focusable_row.dart';
 import '../widgets/session_charts.dart';
 
 /// The connect-first main screen (redesign, build 183): a server dropdown
@@ -964,46 +965,53 @@ class _PeerRow extends StatelessWidget {
   Widget build(BuildContext context) {
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 6),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.center,
-        children: [
-          Icon(
-            Icons.people,
-            size: 20,
-            color: path.active ? Colors.teal : Colors.grey,
-          ),
-          const SizedBox(width: 10),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  'Peer ${_shortId(path.peerId)} · leg $leg',
-                  style: const TextStyle(fontWeight: FontWeight.w600),
-                ),
-                Text(
-                  [
-                    path.kind,
-                    if (path.lastRttMs > 0) '${path.lastRttMs} ms',
-                    '↓ ${_PathRow._bytes(path.inboundBytes)} · ↑ ${_PathRow._bytes(path.outboundBytes)}',
-                  ].join(' · '),
-                  style: TextStyle(fontSize: 12, color: Colors.grey[700]),
-                ),
-                if (path.publicIp != null)
+      // Peer rows were plain Rows with no focusable widget inside, and
+      // the graphs card below has none either, so on a TV D-pad focus
+      // stopped at the last path row and the scroll view never scrolled
+      // to the peers below the fold. Each peer row is now its own focus
+      // stop with a ring that scrolls into view on focus.
+      child: FocusableRow(
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.center,
+          children: [
+            Icon(
+              Icons.people,
+              size: 20,
+              color: path.active ? Colors.teal : Colors.grey,
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
                   Text(
-                    'Public IP ${path.publicIp}',
+                    'Peer ${_shortId(path.peerId)} · leg $leg',
+                    style: const TextStyle(fontWeight: FontWeight.w600),
+                  ),
+                  Text(
+                    [
+                      path.kind,
+                      if (path.lastRttMs > 0) '${path.lastRttMs} ms',
+                      '↓ ${_PathRow._bytes(path.inboundBytes)} · ↑ ${_PathRow._bytes(path.outboundBytes)}',
+                    ].join(' · '),
                     style: TextStyle(fontSize: 12, color: Colors.grey[700]),
                   ),
-              ],
+                  if (path.publicIp != null)
+                    Text(
+                      'Public IP ${path.publicIp}',
+                      style: TextStyle(fontSize: 12, color: Colors.grey[700]),
+                    ),
+                ],
+              ),
             ),
-          ),
-          if (path.active)
-            const Chip(
-              label: Text('Active', style: TextStyle(fontSize: 11)),
-              visualDensity: VisualDensity.compact,
-              padding: EdgeInsets.zero,
-            ),
-        ],
+            if (path.active)
+              const Chip(
+                label: Text('Active', style: TextStyle(fontSize: 11)),
+                visualDensity: VisualDensity.compact,
+                padding: EdgeInsets.zero,
+              ),
+          ],
+        ),
       ),
     );
   }
