@@ -455,6 +455,14 @@ struct AndroidPathStat {
     paused: bool,
     outbound_bytes: u64,
     inbound_bytes: u64,
+    /// Socket bytes for the overhead diagnostic (see
+    /// [`bonded_core::transport::WireStats`]). `None` when the
+    /// transport cannot observe them (WebSocketTls). Read live from
+    /// the transport at publish time and refreshed on every worker
+    /// tick; never carried across a transport replacement, so a
+    /// re-dialed path restarts from zero.
+    wire_tx_bytes: Option<u64>,
+    wire_rx_bytes: Option<u64>,
     /// Most recent heartbeat RTT in ms (0 = none measured yet). All
     /// paths are pinged on the same tick, so a pong's arrival transport
     /// identifies the path its RTT belongs to.
@@ -637,14 +645,24 @@ fn snapshot_json(snapshot: &AndroidSessionSnapshot) -> String {
                 .as_ref()
                 .map(|id| format!("\"{}\"", escape_json(id)))
                 .unwrap_or_else(|| "null".to_owned());
+            let wire_tx = stat
+                .wire_tx_bytes
+                .map(|bytes| bytes.to_string())
+                .unwrap_or_else(|| "null".to_owned());
+            let wire_rx = stat
+                .wire_rx_bytes
+                .map(|bytes| bytes.to_string())
+                .unwrap_or_else(|| "null".to_owned());
             format!(
-                "{{\"pathIndex\":{},\"kind\":\"{}\",\"active\":{},\"paused\":{},\"outboundBytes\":{},\"inboundBytes\":{},\"lastRttMs\":{},\"serverSeenAddress\":{},\"peerId\":{}}}",
+                "{{\"pathIndex\":{},\"kind\":\"{}\",\"active\":{},\"paused\":{},\"outboundBytes\":{},\"inboundBytes\":{},\"wireTxBytes\":{},\"wireRxBytes\":{},\"lastRttMs\":{},\"serverSeenAddress\":{},\"peerId\":{}}}",
                 path_index,
                 escape_json(&stat.kind),
                 stat.active,
                 stat.paused,
                 stat.outbound_bytes,
                 stat.inbound_bytes,
+                wire_tx,
+                wire_rx,
                 stat.last_rtt_ms,
                 server_seen,
                 peer_id,
@@ -1035,6 +1053,12 @@ fn publish_path_stats(
                     paused: prior.map(|stat| stat.paused).unwrap_or(false),
                     outbound_bytes: prior.map(|stat| stat.outbound_bytes).unwrap_or(0),
                     inbound_bytes: prior.map(|stat| stat.inbound_bytes).unwrap_or(0),
+                    wire_tx_bytes: transport
+                        .wire_stats()
+                        .map(|stats| stats.tx_bytes),
+                    wire_rx_bytes: transport
+                        .wire_stats()
+                        .map(|stats| stats.rx_bytes),
                     last_rtt_ms: prior.map(|stat| stat.last_rtt_ms).unwrap_or(0),
                     server_seen_address: prior
                         .and_then(|stat| stat.server_seen_address.clone()),
@@ -2515,6 +2539,28 @@ fn start_android_session(
                                 &auto_paused_paths,
                             );
                         }
+                        // Overhead diagnostic: refresh per-path socket
+                        // byte counters from the live transports.
+                        // Publish only runs on structural changes, so
+                        // without this the snapshot's wire bytes would
+                        // go stale between republishes. Rows are in
+                        // transport-vec order, matching `transports`.
+                        update_snapshot(&worker_snapshot, |session_snapshot| {
+                            for (index, transport) in transports.iter().enumerate() {
+                                if let Some(stat) =
+                                    session_snapshot.path_stats.get_mut(index)
+                                {
+                                    let (tx, rx) = match transport.wire_stats() {
+                                        Some(stats) => {
+                                            (Some(stats.tx_bytes), Some(stats.rx_bytes))
+                                        }
+                                        None => (None, None),
+                                    };
+                                    stat.wire_tx_bytes = tx;
+                                    stat.wire_rx_bytes = rx;
+                                }
+                            }
+                        });
                         let now_ms = SystemTime::now()
                             .duration_since(UNIX_EPOCH)
                             .map(|d| d.as_millis() as u64)

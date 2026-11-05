@@ -9,6 +9,15 @@ class PathStat {
   final bool paused;
   final int outboundBytes;
   final int inboundBytes;
+
+  /// Socket bytes for the transport overhead diagnostic (see
+  /// `TransportOverheadResult`): bytes actually written to / read from
+  /// the transport socket, including framing/encryption, excluding
+  /// IP/UDP headers below the socket. Null when the transport cannot
+  /// observe them (WebSocketTls today). Null is also possible when the
+  /// native snapshot predates the wire counters (old app build).
+  final int? wireTxBytes;
+  final int? wireRxBytes;
   final int lastRttMs;
 
   /// "IP:port" source address the server sees for this path's
@@ -28,6 +37,8 @@ class PathStat {
     this.paused = false,
     required this.outboundBytes,
     required this.inboundBytes,
+    this.wireTxBytes,
+    this.wireRxBytes,
     required this.lastRttMs,
     required this.serverSeenAddress,
     this.peerId,
@@ -41,6 +52,8 @@ class PathStat {
       paused: map['paused'] == true,
       outboundBytes: (map['outboundBytes'] as num?)?.toInt() ?? 0,
       inboundBytes: (map['inboundBytes'] as num?)?.toInt() ?? 0,
+      wireTxBytes: (map['wireTxBytes'] as num?)?.toInt(),
+      wireRxBytes: (map['wireRxBytes'] as num?)?.toInt(),
       lastRttMs: (map['lastRttMs'] as num?)?.toInt() ?? 0,
       serverSeenAddress:
           (map['serverSeenAddress'] as String?)?.trim().isNotEmpty == true

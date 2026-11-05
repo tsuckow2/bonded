@@ -4,7 +4,10 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import '../models/session_status.dart';
+import '../models/transport_overhead.dart';
 import '../services/pairing_service.dart';
+import '../widgets/transport_overhead_card.dart';
 
 class NetworkTestsScreen extends StatefulWidget {
   const NetworkTestsScreen({super.key});
@@ -40,6 +43,12 @@ class _NetworkTestsScreenState extends State<NetworkTestsScreen> {
   List<String> _logs = const [];
   Map<String, dynamic>? _firstPairedServer;
   Timer? _logRefreshTimer;
+
+  // Transport overhead diagnostic (slice 5).
+  int _payloadSizeBytes = 1024 * 1024;
+  bool _measuringOverhead = false;
+  String? _overheadNote;
+  List<TransportOverheadResult> _overheadResults = const [];
 
   @override
   void initState() {
@@ -198,6 +207,82 @@ class _NetworkTestsScreenState extends State<NetworkTestsScreen> {
       if (mounted) {
         setState(() {
           _running = false;
+        });
+      }
+    }
+  }
+
+  Future<SessionStatus> _fetchSessionStatus() async {
+    final raw = await _channel.invokeMethod<Map<dynamic, dynamic>>(
+      'getVpnSessionStatus',
+    );
+    return SessionStatus.fromMap(raw);
+  }
+
+  /// Live-window overhead measurement: snapshots the session counters,
+  /// waits 10 s of real traffic, snapshots again, and reports per-path
+  /// inside (TUN) vs wire (socket) bytes. This is real traffic, not a
+  /// fixed payload — the payload is unknown, so inside bytes stand in
+  /// for it (the result cards say so). Paths are matched by position
+  /// in the transport list; a path whose kind changed mid-window is
+  /// skipped rather than misattributed.
+  Future<void> _measureLiveOverhead() async {
+    setState(() {
+      _measuringOverhead = true;
+      _overheadNote = 'Measuring live traffic for 10 s…';
+      _overheadResults = const [];
+    });
+    try {
+      final before = await _fetchSessionStatus();
+      if (!before.isConnected) {
+        if (!mounted) return;
+        setState(() {
+          _overheadNote = 'VPN is not connected; start the VPN first.';
+        });
+        return;
+      }
+      await Future<void>.delayed(const Duration(seconds: 10));
+      if (!mounted) return;
+      final after = await _fetchSessionStatus();
+      final results = <TransportOverheadResult>[];
+      final skipped = <String>[];
+      for (var i = 0; i < before.paths.length; i++) {
+        final beforePath = before.paths[i];
+        if (i >= after.paths.length ||
+            after.paths[i].kind != beforePath.kind) {
+          skipped.add(beforePath.kind);
+          continue;
+        }
+        final result = TransportOverheadResult.fromSnapshots(
+          transportLabel: beforePath.kind,
+          before: beforePath,
+          after: after.paths[i],
+          elapsed: const Duration(seconds: 10),
+          isLiveWindow: true,
+        );
+        if (result != null) results.add(result);
+      }
+      if (!mounted) return;
+      setState(() {
+        _overheadResults = results;
+        _overheadNote = results.isEmpty
+            ? 'No paths survived the window.'
+            : skipped.isEmpty
+                ? 'Live traffic over 10 s. Payload is unknown for live '
+                      'traffic, so inside bytes stand in for it.'
+                : 'Skipped ${skipped.join(', ')} (transport changed '
+                      'during the window).';
+      });
+    } on PlatformException catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _overheadNote =
+            'Failed to read session status: ${e.code} ${e.message ?? ''}';
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _measuringOverhead = false;
         });
       }
     }
@@ -417,6 +502,118 @@ class _NetworkTestsScreenState extends State<NetworkTestsScreen> {
                           label: const Text('Reload Paired Server'),
                         ),
                       ],
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 12),
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(12),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'Transport Overhead',
+                    style: Theme.of(context).textTheme.titleMedium,
+                  ),
+                  const SizedBox(height: 8),
+                  const Text(
+                    'Inside bytes are TUN IP packet bytes; wire bytes are '
+                    'bytes actually written to / read from the transport '
+                    'socket, including framing/encryption (IP/UDP/TCP '
+                    'headers below the socket are excluded). Overhead is '
+                    'wire minus inside.',
+                  ),
+                  const SizedBox(height: 12),
+                  Row(
+                    children: [
+                      const Text('Fixed payload size: '),
+                      DropdownButton<int>(
+                        value: _payloadSizeBytes,
+                        items: const [
+                          DropdownMenuItem(
+                            value: 256 * 1024,
+                            child: Text('256 KiB'),
+                          ),
+                          DropdownMenuItem(
+                            value: 1024 * 1024,
+                            child: Text('1 MiB'),
+                          ),
+                          DropdownMenuItem(
+                            value: 10 * 1024 * 1024,
+                            child: Text('10 MiB'),
+                          ),
+                        ],
+                        onChanged: _measuringOverhead
+                            ? null
+                            : (value) {
+                                if (value != null) {
+                                  setState(() {
+                                    _payloadSizeBytes = value;
+                                  });
+                                }
+                              },
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  const Text(
+                    'Wire measurement status per transport:',
+                    style: TextStyle(fontWeight: FontWeight.w600),
+                  ),
+                  const SizedBox(height: 4),
+                  ...[
+                    'NaiveTCP',
+                    'QUIC',
+                    'WireGuard',
+                    'WebSocketTls',
+                  ].map(
+                    (kind) => Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 2),
+                      child: Text('$kind: ${wireMeasurementStatus(kind)}'),
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: [
+                      ElevatedButton.icon(
+                        onPressed: _measuringOverhead || _running
+                            ? null
+                            : _measureLiveOverhead,
+                        icon: const Icon(Icons.speed),
+                        label: const Text('Measure live overhead (10 s)'),
+                      ),
+                      ElevatedButton.icon(
+                        onPressed: null,
+                        icon: const Icon(Icons.play_arrow),
+                        label: const Text('Run fixed-payload TCP test'),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  const Text(
+                    'The fixed-payload test is not yet available: it needs '
+                    'a TCP echo endpoint on the tunnel gateway (10.8.0.1), '
+                    'which is not deployed. The measurement itself is '
+                    'proven in Rust tests against a loopback server; use '
+                    'the live 10 s window above for real traffic.',
+                  ),
+                  if (_overheadNote != null) ...[
+                    const SizedBox(height: 8),
+                    Text(_overheadNote!),
+                  ],
+                  if (_overheadResults.isNotEmpty) ...[
+                    const SizedBox(height: 8),
+                    ..._overheadResults.map(
+                      (result) => Padding(
+                        padding: const EdgeInsets.only(bottom: 8),
+                        child: TransportOverheadCard(result: result),
+                      ),
                     ),
                   ],
                 ],

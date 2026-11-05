@@ -166,6 +166,21 @@ impl ClientTransport {
             ClientTransport::WireGuard(inner) => inner.close().await,
         }
     }
+
+    /// Socket byte counters for the overhead diagnostic, or None when
+    /// the transport cannot observe them (WebSocketTls today; see
+    /// [`bonded_core::transport::WireStats`]). Peer relays delegate to
+    /// their inner QUIC transport's connection stats.
+    pub fn wire_stats(&self) -> Option<bonded_core::transport::WireStats> {
+        use bonded_core::transport::Transport as _;
+        match self {
+            ClientTransport::NaiveTcp(inner) => inner.wire_stats(),
+            ClientTransport::WebSocket(inner) => inner.wire_stats(),
+            ClientTransport::Quic(inner) => inner.wire_stats(),
+            ClientTransport::PeerRelay { transport, .. } => transport.wire_stats(),
+            ClientTransport::WireGuard(inner) => inner.wire_stats(),
+        }
+    }
 }
 
 fn notify_peer_relay_closed(

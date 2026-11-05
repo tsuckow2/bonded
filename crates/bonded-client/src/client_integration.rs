@@ -281,6 +281,124 @@ async fn single_path_authenticated_frame_exchange() {
     let _ = fs::remove_file(&cfg.client.public_key_path);
 }
 
+/// Frame-level transport overhead diagnostic, proven against the
+/// loopback test server: a fixed 256 KiB payload is sent through a
+/// single naive_tcp transport and echoed back, and the wire counters
+/// + overhead calculation are asserted. This is the measurement
+/// plumbing the app's diagnostic reports; the live TCP-through-tunnel
+/// run additionally needs the server echo endpoint (see the plan),
+/// which is not deployed, so the app does not yet run it live.
+///
+/// "Inside" bytes here are session frame payload bytes (the
+/// frame-level analogue of TUN IP packet bytes: the bytes carried,
+/// excluding the session frame header and length prefix, which are
+/// wire overhead).
+#[tokio::test]
+async fn transport_overhead_diagnostic_measures_fixed_payload() {
+    use bonded_core::overhead::{compute_overhead, OverheadInput};
+    use std::time::Instant;
+
+    const PAYLOAD_BYTES: usize = 256 * 1024;
+    const FRAME_PAYLOAD: usize = 1024;
+    const FRAMES: usize = PAYLOAD_BYTES / FRAME_PAYLOAD;
+
+    let keypair = DeviceKeypair::generate();
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let addr = listener.local_addr().expect("addr should resolve");
+
+    let expected_public_key = keypair.public_key_b64.clone();
+    let server_task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept should succeed");
+        let stream = server_handshake(stream, &expected_public_key).await;
+        let mut transport = NaiveTcpTransport::from_stream(stream);
+        let mut echoed: usize = 0;
+        while echoed < PAYLOAD_BYTES {
+            let frame = transport.recv().await.expect("frame should arrive");
+            echoed += frame.payload.len();
+            transport.send(frame).await.expect("echo should send");
+        }
+    });
+
+    let cfg = test_client_config(addr.to_string(), &keypair);
+    let stream = establish_naive_tcp_session(&cfg)
+        .await
+        .expect("session should authenticate");
+    let mut transport = NaiveTcpTransport::from_stream(stream);
+    let before = transport
+        .wire_stats()
+        .expect("naive tcp should measure wire bytes");
+    assert_eq!(before.tx_bytes, 0, "counters start at transport creation");
+    assert_eq!(before.rx_bytes, 0);
+
+    let header_len = SessionFrame {
+        header: SessionHeader {
+            connection_id: 5,
+            sequence: 0,
+            flags: 0,
+        },
+        payload: Bytes::new(),
+    }
+    .encode()
+    .len();
+
+    let started = Instant::now();
+    let mut sent_payload: usize = 0;
+    for sequence in 0..FRAMES {
+        transport
+            .send(SessionFrame {
+                header: SessionHeader {
+                    connection_id: 5,
+                    sequence: sequence as u64,
+                    flags: 0,
+                },
+                payload: Bytes::from(vec![0xABu8; FRAME_PAYLOAD]),
+            })
+            .await
+            .expect("send should succeed");
+        sent_payload += FRAME_PAYLOAD;
+    }
+    let mut received_payload: usize = 0;
+    while received_payload < PAYLOAD_BYTES {
+        let echoed = transport.recv().await.expect("echo should arrive");
+        received_payload += echoed.payload.len();
+    }
+    let elapsed = started.elapsed();
+
+    let after = transport
+        .wire_stats()
+        .expect("naive tcp should measure wire bytes");
+    let wire_tx = after.tx_bytes - before.tx_bytes;
+    let wire_rx = after.rx_bytes - before.rx_bytes;
+
+    // Exact framing: each frame costs its 4-byte length prefix plus
+    // the session header on the wire; nothing else.
+    assert_eq!(wire_tx, (sent_payload + FRAMES * (4 + header_len)) as u64);
+    assert_eq!(wire_rx, (received_payload + FRAMES * (4 + header_len)) as u64);
+
+    let report = compute_overhead(OverheadInput {
+        payload_bytes: PAYLOAD_BYTES as u64,
+        inside_tx_bytes: sent_payload as u64,
+        inside_rx_bytes: received_payload as u64,
+        wire_tx_bytes: Some(wire_tx),
+        wire_rx_bytes: Some(wire_rx),
+        elapsed,
+    });
+    assert_eq!(report.payload_bytes, PAYLOAD_BYTES as u64);
+    assert_eq!(
+        report.overhead_tx_bytes,
+        Some((FRAMES * (4 + header_len)) as u64)
+    );
+    let ratio = report.overhead_tx_ratio.expect("ratio should exist");
+    assert!(ratio < 0.05, "naive tcp overhead should be under 5%: {ratio}");
+    assert!(report.payload_bandwidth_bps > 0.0);
+
+    server_task.await.expect("server task should join");
+    let _ = fs::remove_file(&cfg.client.private_key_path);
+    let _ = fs::remove_file(&cfg.client.public_key_path);
+}
+
 #[tokio::test]
 async fn h3_bootstrap_request_fetches_capabilities_after_cert_proof() {
     let _ = rustls::crypto::ring::default_provider().install_default();

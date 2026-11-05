@@ -88,17 +88,51 @@ pub enum TransportKind {
     WireGuard,
 }
 
+/// Bytes actually written to / read from the transport's socket, as
+/// observed by the transport implementation. This is the "outside the
+/// tunnel" (wire) side of the overhead diagnostic: it includes session
+/// framing, transport framing, and encryption overhead, but excludes
+/// IP/UDP/TCP headers below the transport's socket.
+///
+/// Per transport:
+/// - NaiveTcp: TCP stream bytes (4-byte frame length prefix + encoded
+///   frame on send; socket bytes read on recv, including bytes still
+///   buffered for the next frame).
+/// - Quic: QUIC UDP datagram bytes from quinn connection stats (QUIC
+///   packets incl. headers, encryption, ACKs and PINGs; excludes
+///   IP/UDP headers). Cumulative per connection; take deltas.
+/// - WireGuard: UDP datagram bytes sent/received on the socket
+///   (WireGuard packets incl. handshake and keepalives; excludes
+///   IP/UDP headers).
+/// - WebSocketTls: NOT measured (None). tokio-tungstenite owns the
+///   TCP+TLS stack behind a closed connector enum, so there is no hook
+///   at which socket bytes can be counted without reimplementing the
+///   client handshake; reporting message bytes as wire bytes would
+///   understate overhead (WS framing + TLS records excluded).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WireStats {
+    pub tx_bytes: u64,
+    pub rx_bytes: u64,
+}
+
 #[async_trait]
 pub trait Transport: Send {
     async fn send(&mut self, frame: SessionFrame) -> anyhow::Result<()>;
     async fn recv(&mut self) -> anyhow::Result<SessionFrame>;
     fn kind(&self) -> TransportKind;
+    /// Socket byte counters for the overhead diagnostic, or None when
+    /// this transport cannot observe them (see [`WireStats`]).
+    fn wire_stats(&self) -> Option<WireStats> {
+        None
+    }
 }
 
 pub struct NaiveTcpTransport {
     stream: TcpStream,
     /// Accumulates bytes across `select!` cancellations so that `recv()` is cancel-safe.
     read_buf: BytesMut,
+    wire_tx_bytes: u64,
+    wire_rx_bytes: u64,
 }
 
 enum WebSocketStreamInner {
@@ -122,6 +156,8 @@ impl NaiveTcpTransport {
         Ok(Self {
             stream,
             read_buf: BytesMut::new(),
+            wire_tx_bytes: 0,
+            wire_rx_bytes: 0,
         })
     }
 
@@ -130,6 +166,8 @@ impl NaiveTcpTransport {
         Self {
             stream,
             read_buf: BytesMut::new(),
+            wire_tx_bytes: 0,
+            wire_rx_bytes: 0,
         }
     }
 
@@ -262,6 +300,7 @@ impl Transport for NaiveTcpTransport {
         self.stream.write_all(&len.to_be_bytes()).await?;
         self.stream.write_all(&encoded).await?;
         self.stream.flush().await?;
+        self.wire_tx_bytes += 4 + encoded.len() as u64;
         Ok(())
     }
 
@@ -275,6 +314,7 @@ impl Transport for NaiveTcpTransport {
             if n == 0 {
                 anyhow::bail!("connection closed while reading frame length prefix");
             }
+            self.wire_rx_bytes += n as u64;
             self.read_buf.extend_from_slice(&tmp[..n]);
         }
 
@@ -298,6 +338,7 @@ impl Transport for NaiveTcpTransport {
             if n == 0 {
                 anyhow::bail!("connection closed while reading frame payload");
             }
+            self.wire_rx_bytes += n as u64;
             self.read_buf.extend_from_slice(&tmp[..n]);
         }
 
@@ -309,6 +350,13 @@ impl Transport for NaiveTcpTransport {
 
     fn kind(&self) -> TransportKind {
         TransportKind::NaiveTcp
+    }
+
+    fn wire_stats(&self) -> Option<WireStats> {
+        Some(WireStats {
+            tx_bytes: self.wire_tx_bytes,
+            rx_bytes: self.wire_rx_bytes,
+        })
     }
 }
 
@@ -519,6 +567,18 @@ impl Transport for QuicTransport {
     fn kind(&self) -> TransportKind {
         TransportKind::Quic
     }
+
+    fn wire_stats(&self) -> Option<WireStats> {
+        // Quinn connection stats are cumulative for the whole
+        // connection (all streams, incl. ACKs, PINGs, retransmits);
+        // the diagnostic takes deltas around the transfer, so the
+        // handshake and any background streams are excluded.
+        let stats = self._connection.stats();
+        Some(WireStats {
+            tx_bytes: stats.udp_tx.bytes,
+            rx_bytes: stats.udp_rx.bytes,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -584,6 +644,126 @@ mod tests {
         assert_eq!(response.header.sequence, 1);
         assert_eq!(&response.payload[..], b"pong");
 
+        server_task.await.expect("server task should join");
+    }
+
+    #[tokio::test]
+    async fn naive_tcp_wire_stats_count_socket_bytes() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let address = listener.local_addr().expect("local addr should resolve");
+
+        let server_task = tokio::spawn(async move {
+            let (server_stream, _) = listener.accept().await.expect("accept should succeed");
+            let mut server_transport = NaiveTcpTransport::from_stream(server_stream);
+            let frame = server_transport
+                .recv()
+                .await
+                .expect("server should recv frame");
+            let response = SessionFrame {
+                header: SessionHeader {
+                    connection_id: 7,
+                    sequence: 1,
+                    flags: 0,
+                },
+                payload: Bytes::from_static(b"pong"),
+            };
+            server_transport
+                .send(response)
+                .await
+                .expect("server should send response");
+            // Server read exactly one frame (4-byte prefix + encoded
+            // frame) and wrote exactly one response frame.
+            let stats = server_transport
+                .wire_stats()
+                .expect("naive tcp should measure wire bytes");
+            assert_eq!(stats.rx_bytes, 4 + frame.encode().len() as u64);
+            assert_eq!(
+                stats.tx_bytes,
+                4 + SessionFrame {
+                    header: SessionHeader {
+                        connection_id: 7,
+                        sequence: 1,
+                        flags: 0,
+                    },
+                    payload: Bytes::from_static(b"pong"),
+                }
+                .encode()
+                .len() as u64
+            );
+        });
+
+        let mut client_transport = NaiveTcpTransport::connect(&address.to_string())
+            .await
+            .expect("client should connect");
+        let request = SessionFrame {
+            header: SessionHeader {
+                connection_id: 7,
+                sequence: 0,
+                flags: 0,
+            },
+            payload: Bytes::from_static(b"ping"),
+        };
+        let request_len = request.encode().len() as u64;
+        client_transport
+            .send(request)
+            .await
+            .expect("client should send request");
+        let response = client_transport
+            .recv()
+            .await
+            .expect("client should receive response");
+        let response_len = response.encode().len() as u64;
+        let stats = client_transport
+            .wire_stats()
+            .expect("naive tcp should measure wire bytes");
+        assert_eq!(stats.tx_bytes, 4 + request_len);
+        assert_eq!(stats.rx_bytes, 4 + response_len);
+
+        server_task.await.expect("server task should join");
+    }
+
+    #[tokio::test]
+    async fn websocket_wire_stats_are_unmeasured() {
+        // Documents the WebSocketTls limitation: tungstenite owns the
+        // TCP+TLS stack, so no socket byte hook exists.
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let address = listener.local_addr().expect("local addr should resolve");
+        let server_task = tokio::spawn(async move {
+            let (server_stream, _) = listener.accept().await.expect("accept should succeed");
+            let mut server_transport = WebSocketTlsTransport::accept(server_stream)
+                .await
+                .expect("server websocket should accept");
+            let frame = server_transport
+                .recv()
+                .await
+                .expect("server should recv websocket frame");
+            assert_eq!(&frame.payload[..], b"hello-ws");
+        });
+        let mut client_transport = WebSocketTlsTransport::connect(&format!("ws://{address}"))
+            .await
+            .expect("client websocket should connect");
+        assert_eq!(client_transport.wire_stats(), None);
+        let request = SessionFrame {
+            header: SessionHeader {
+                connection_id: 6,
+                sequence: 0,
+                flags: 0,
+            },
+            payload: Bytes::from_static(b"hello-ws"),
+        };
+        client_transport
+            .send(request)
+            .await
+            .expect("client should send websocket request");
+        assert_eq!(
+            client_transport.wire_stats(),
+            None,
+            "websocket wire bytes stay unmeasured even after traffic"
+        );
         server_task.await.expect("server task should join");
     }
 
@@ -742,6 +922,8 @@ pub struct WireGuardTransport {
     udp_buf: Vec<u8>,
     /// Scratch buffer for boringtun encapsulate / decapsulate output.
     wg_buf: Vec<u8>,
+    wire_tx_bytes: u64,
+    wire_rx_bytes: u64,
 }
 
 /// A Curve25519 keypair used with the WireGuard transport.
@@ -816,6 +998,8 @@ impl WireGuardTransport {
             pending_recv: std::collections::VecDeque::new(),
             udp_buf: vec![0u8; WG_MAX_DATAGRAM],
             wg_buf: vec![0u8; WG_MAX_DATAGRAM + WG_ENCAP_OVERHEAD],
+            wire_tx_bytes: 0,
+            wire_rx_bytes: 0,
         })
     }
 
@@ -845,7 +1029,7 @@ impl WireGuardTransport {
             }
         };
         if let Some(init_pkt) = init_pkt {
-            self.socket.send(&init_pkt).await?;
+            self.send_datagram(&init_pkt).await?;
         }
 
         // Wait up to 5 s for handshake to complete.
@@ -922,7 +1106,7 @@ impl WireGuardTransport {
         }
 
         for pkt in outbound {
-            self.socket.send(&pkt).await?;
+            self.send_datagram(&pkt).await?;
         }
         for frame in decoded_frames {
             self.pending_recv.push_back(frame);
@@ -941,7 +1125,7 @@ impl Transport for WireGuardTransport {
             let result = self.tunn.update_timers(&mut self.wg_buf);
             if let TunnResult::WriteToNetwork(pkt) = result {
                 let pkt = pkt.to_vec();
-                self.socket.send(&pkt).await?;
+                self.send_datagram(&pkt).await?;
             }
         }
 
@@ -968,7 +1152,7 @@ impl Transport for WireGuardTransport {
         match result {
             TunnResult::WriteToNetwork(pkt) => {
                 let pkt = pkt.to_vec();
-                self.socket.send(&pkt).await?;
+                self.send_datagram(&pkt).await?;
             }
             TunnResult::Err(_) | TunnResult::Done => {
                 // boringtun may report either `Err(_)` or `Done` before the first
@@ -979,7 +1163,7 @@ impl Transport for WireGuardTransport {
                 match result {
                     TunnResult::WriteToNetwork(pkt) => {
                         let pkt = pkt.to_vec();
-                        self.socket.send(&pkt).await?;
+                        self.send_datagram(&pkt).await?;
                     }
                     other => {
                         anyhow::bail!("WireGuard: encapsulate failed after handshake: {other:?}");
@@ -1005,11 +1189,12 @@ impl Transport for WireGuardTransport {
                 let result = self.tunn.update_timers(&mut self.wg_buf);
                 if let boringtun::noise::TunnResult::WriteToNetwork(pkt) = result {
                     let pkt = pkt.to_vec();
-                    self.socket.send(&pkt).await?;
+                    self.send_datagram(&pkt).await?;
                 }
             }
 
             let n = self.socket.recv(&mut self.udp_buf).await?;
+            self.wire_rx_bytes += n as u64;
             let datagram = self.udp_buf[..n].to_vec();
             self.process_datagram(&datagram).await?;
 
@@ -1022,9 +1207,25 @@ impl Transport for WireGuardTransport {
     fn kind(&self) -> TransportKind {
         TransportKind::WireGuard
     }
+
+    fn wire_stats(&self) -> Option<WireStats> {
+        Some(WireStats {
+            tx_bytes: self.wire_tx_bytes,
+            rx_bytes: self.wire_rx_bytes,
+        })
+    }
 }
 
 impl WireGuardTransport {
+    /// Send one UDP datagram, counting it for the overhead diagnostic.
+    /// Every socket send in this transport goes through here (data,
+    /// handshake, and keepalive alike — all of it is wire bytes).
+    async fn send_datagram(&mut self, pkt: &[u8]) -> anyhow::Result<()> {
+        let n = self.socket.send(pkt).await?;
+        self.wire_tx_bytes += n as u64;
+        Ok(())
+    }
+
     /// Gracefully shut down: the QUIC-style close is not needed for UDP, but
     /// callers may want a no-op method to match `NaiveTcpTransport::close`.
     pub async fn close(&mut self) -> anyhow::Result<()> {
