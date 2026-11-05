@@ -697,44 +697,52 @@ class _HomeScreenState extends State<HomeScreen> {
         : 0.0;
     final currentUp = _rateSamples.isNotEmpty ? _rateSamples.last.upBps : 0.0;
     final activeRtt = _status.activePath?.lastRttMs ?? 0;
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
+    // The graphs card is read-only (no buttons), so like the peer rows
+    // it had no D-pad focus stop and could never be scrolled into view
+    // on a TV. One focus stop for the whole card: it is short enough
+    // (~250px: 96px throughput + 64px latency + headers) to fit on
+    // screen once scrolled into view, so per-chart stops would only
+    // add extra D-pad presses for no benefit.
+    return FocusableRow(
+      child: Card(
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                const Text(
-                  'Throughput',
-                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
-                ),
-                const Spacer(),
-                Text(
-                  '↓ ${_fmtRate(currentDown)}  ↑ ${_fmtRate(currentUp)}',
-                  style: TextStyle(color: Colors.grey[700], fontSize: 13),
-                ),
-              ],
-            ),
-            const SizedBox(height: 8),
-            ThroughputChart(samples: _rateSamples),
-            const SizedBox(height: 16),
-            Row(
-              children: [
-                const Text(
-                  'Latency (active path)',
-                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
-                ),
-                const Spacer(),
-                Text(
-                  activeRtt > 0 ? '$activeRtt ms' : '—',
-                  style: TextStyle(color: Colors.grey[700], fontSize: 13),
-                ),
-              ],
-            ),
-            const SizedBox(height: 8),
-            RttChart(samplesMs: _rttSamples),
-          ],
+                Row(
+                  children: [
+                    const Text(
+                      'Throughput',
+                    style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
+                  ),
+                  const Spacer(),
+                  Text(
+                    '↓ ${_fmtRate(currentDown)}  ↑ ${_fmtRate(currentUp)}',
+                    style: TextStyle(color: Colors.grey[700], fontSize: 13),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              ThroughputChart(samples: _rateSamples),
+              const SizedBox(height: 16),
+              Row(
+                children: [
+                  const Text(
+                    'Latency (active path)',
+                    style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
+                  ),
+                  const Spacer(),
+                  Text(
+                    activeRtt > 0 ? '$activeRtt ms' : '—',
+                    style: TextStyle(color: Colors.grey[700], fontSize: 13),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              RttChart(samplesMs: _rttSamples),
+            ],
+          ),
         ),
       ),
     );
