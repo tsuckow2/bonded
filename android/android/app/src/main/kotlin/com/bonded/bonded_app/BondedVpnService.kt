@@ -12,6 +12,7 @@ import android.net.VpnService
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.ParcelFileDescriptor
+import android.os.SystemClock
 import androidx.annotation.Keep
 import androidx.core.app.NotificationCompat
 import java.io.FileInputStream
@@ -604,6 +605,10 @@ class BondedVpnService : VpnService() {
         }
 
         sessionMonitorRunning = true
+        // Fast cadence for the first minute after start even with no
+        // UI poll yet (auto-connect on boot, tile/widget refresh),
+        // then follow actual UI demand (see below).
+        val monitorStartedAtMs = SystemClock.elapsedRealtime()
         sessionMonitorThread =
                 thread(name = "bonded-session-monitor", start = true) {
                     var monitorTick = 0L
@@ -620,8 +625,22 @@ class BondedVpnService : VpnService() {
                             }
                         }
 
+                        // Adaptive poll (battery): the snapshot is only
+                        // serialized when the UI is actually asking for
+                        // it. The UI polls getVpnSessionStatus every
+                        // second while visible, which refreshes
+                        // lastUiStatusRequestMs; with no UI demand for
+                        // 5 s, back off to 30 s between serializations.
+                        // State-change events (tile/widget refresh,
+                        // error recovery) still fire on the next poll —
+                        // up to 30 s late in the background, which is
+                        // acceptable when nobody is watching. The
+                        // data plane is independent of this thread.
+                        val nowMs = SystemClock.elapsedRealtime()
+                        val uiActive = nowMs - lastUiStatusRequestMs < 5_000 ||
+                                nowMs - monitorStartedAtMs < 60_000
                         try {
-                            Thread.sleep(1000)
+                            Thread.sleep(if (uiActive) 1_000 else 30_000)
                         } catch (_: InterruptedException) {
                             return@thread
                         }
@@ -1322,6 +1341,13 @@ class BondedVpnService : VpnService() {
 
         @Volatile private var lastSessionSnapshot: SessionSnapshot? = null
 
+        // Monotonic timestamp (ms) of the last time the Flutter UI asked
+        // for the session snapshot via getSessionSnapshot(). The session
+        // monitor thread reads this as its foreground signal: it polls
+        // the native snapshot every second while the UI is asking, and
+        // backs off to 30 s when the UI has been quiet for 5 s.
+        @Volatile private var lastUiStatusRequestMs: Long = 0
+
         @Volatile private var activeNetworkPathCount: Int = 1
 
         @Volatile private var activeNetworkBindAddresses: List<String> = emptyList()
@@ -1401,6 +1427,9 @@ class BondedVpnService : VpnService() {
         }
 
         fun getSessionSnapshot(): Map<String, Any?>? {
+            // Record the demand even when no snapshot exists yet: the
+            // UI is asking, so the monitor must stay on fast cadence.
+            lastUiStatusRequestMs = SystemClock.elapsedRealtime()
             val snapshot = lastSessionSnapshot ?: return null
             return mapOf(
                     "state" to snapshot.state,

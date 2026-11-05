@@ -62,8 +62,23 @@ class _HomeScreenState extends State<HomeScreen> {
     }, onError: (_) {});
     _pollTimer = Timer.periodic(
       const Duration(seconds: 1),
-      (_) => _refreshStatus(),
+      (_) => _onPollTick(),
     );
+  }
+
+  void _onPollTick() {
+    // Throttle the 1s poll when the UI is not actually visible:
+    // backgrounded app, or navigated to another screen. The native
+    // session monitor uses our getVpnSessionStatus calls as its
+    // foreground signal and backs off to 30s when we stop asking, so
+    // skipping here is what lets the whole chain sleep. Foreground
+    // behaviour is unchanged: 1s polls while this screen is visible.
+    if (!mounted) return;
+    if (WidgetsBinding.instance.lifecycleState != AppLifecycleState.resumed) {
+      return;
+    }
+    if (ModalRoute.of(context)?.isCurrent != true) return;
+    _refreshStatus();
   }
 
   @override
