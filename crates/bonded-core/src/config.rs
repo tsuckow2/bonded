@@ -344,6 +344,20 @@ pub struct ClientSection {
     /// use). Defaults to 900.
     #[serde(default = "default_diagnostics_upload_period_secs")]
     pub diagnostics_upload_period_secs: u64,
+    /// Battery saver (Android): when true, the worker parks the
+    /// cellular path while a non-cellular path is healthy and the
+    /// session is idle, and prefers the WireGuard transport first.
+    /// Default OFF: behavior is unchanged when false. Applies at
+    /// session start; toggling it mid-session takes effect on the
+    /// next connect.
+    #[serde(default)]
+    pub battery_saver: bool,
+    /// Bind addresses that belong to a cellular network (Android
+    /// only; supplied by the platform layer, which alone knows the
+    /// transport per network). Paths bound to one of these addresses
+    /// are the ones battery saver parks. Empty = no path is cellular.
+    #[serde(default)]
+    pub cellular_bind_addresses: Vec<String>,
 }
 
 fn default_diagnostics_upload_period_secs() -> u64 {
@@ -379,6 +393,8 @@ impl Default for ClientSection {
             peer_share_relay_bandwidth_kbps: 0,
             diagnostics_upload_enabled: false,
             diagnostics_upload_period_secs: default_diagnostics_upload_period_secs(),
+            battery_saver: false,
+            cellular_bind_addresses: Vec::new(),
         }
     }
 }

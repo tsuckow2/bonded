@@ -17,6 +17,7 @@ object AppSettingsStore {
     private const val KEY_SELECTED_SERVER_ID = "selected_server_id"
     private const val KEY_ALLOW_LOCAL_TRAFFIC = "allow_local_traffic"
     private const val KEY_EXCLUDED_APP_PACKAGES = "excluded_app_packages"
+    private const val KEY_BATTERY_SAVER = "battery_saver"
 
     private fun prefs(context: Context) =
             context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -46,6 +47,18 @@ object AppSettingsStore {
             editor.putString(KEY_SELECTED_SERVER_ID, value)
         }
         editor.apply()
+    }
+
+    /**
+     * Battery saver: park the cellular path while a non-cellular path
+     * is healthy and the session is idle, and prefer WireGuard first.
+     * Default OFF. Applies on next connect.
+     */
+    fun batterySaver(context: Context): Boolean =
+            prefs(context).getBoolean(KEY_BATTERY_SAVER, false)
+
+    fun setBatterySaver(context: Context, value: Boolean) {
+        prefs(context).edit().putBoolean(KEY_BATTERY_SAVER, value).apply()
     }
 
     /** Local traffic mode: LAN subnets bypass the VPN (applies on next connect). */

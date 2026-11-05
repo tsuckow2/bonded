@@ -110,6 +110,22 @@ class AndroidNetworkPathManager(
                 .take(limit)
     }
 
+    /**
+     * Bind addresses belonging to cellular networks, in the same
+     * priority order as [activeBindAddresses]. The native worker uses
+     * these to identify which paths battery saver may park; the
+     * platform layer alone knows the transport per network.
+     */
+    fun cellularBindAddresses(): List<String> =
+            trackedNetworks
+                    .values
+                    .filter { binding ->
+                        binding.transport == NetworkCapabilities.TRANSPORT_CELLULAR
+                    }
+                    .sortedBy { binding -> transportPriority(binding.transport) }
+                    .mapNotNull { binding -> binding.bindAddress }
+                    .distinct()
+
     fun activePathSummaries(limit: Int = 4): List<String> {
         return trackedNetworks
                 .values

@@ -966,6 +966,8 @@ class BondedVpnService : VpnService() {
             diagnosticsUploadEnabled: Boolean,
             diagnosticsUploadPeriodSecs: Long,
             appVersionCode: Long,
+            batterySaver: Boolean,
+            cellularBindAddressesJson: String,
     ): Boolean
 
     private external fun nativeStopSession()
@@ -974,7 +976,10 @@ class BondedVpnService : VpnService() {
 
     private external fun nativeResetPath(pathIndex: Int): Boolean
 
-    private external fun nativeUpdatePaths(bindAddressesJson: String): Boolean
+    private external fun nativeUpdatePaths(
+            bindAddressesJson: String,
+            cellularBindAddressesJson: String,
+    ): Boolean
 
     // Resolve a "host:port" address to "ip:port" using system DNS, before the VPN is
     // active. Returns the original string unchanged on any error or if already an IP.
@@ -1137,6 +1142,11 @@ class BondedVpnService : VpnService() {
                             server.diagnosticsUploadEnabled,
                             server.diagnosticsUploadPeriodSecs,
                             appVersionCode(),
+                            AppSettingsStore.batterySaver(this),
+                            JSONArray(
+                                    networkPathManager?.cellularBindAddresses()
+                                            .orEmpty()
+                            ).toString(),
                     )
             android.util.Log.i("BondedVPN", "nativeStartSession returned: $started")
             if (started) {
@@ -1439,7 +1449,13 @@ class BondedVpnService : VpnService() {
         fun updatePaths(bindAddresses: List<String>): Boolean {
             val service = activeInstance ?: return false
             return try {
-                service.nativeUpdatePaths(JSONArray(bindAddresses).toString())
+                service.nativeUpdatePaths(
+                        JSONArray(bindAddresses).toString(),
+                        JSONArray(
+                                service.networkPathManager?.cellularBindAddresses()
+                                        .orEmpty()
+                        ).toString(),
+                )
             } catch (_: Exception) {
                 false
             }

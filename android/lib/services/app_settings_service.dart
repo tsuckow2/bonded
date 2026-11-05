@@ -10,6 +10,7 @@ class AppSettings {
   final String? selectedServerId;
   final bool allowLocalTraffic;
   final List<String> excludedAppPackages;
+  final bool batterySaver;
 
   const AppSettings({
     this.autoConnectOnOpen = false,
@@ -17,6 +18,7 @@ class AppSettings {
     this.selectedServerId,
     this.allowLocalTraffic = false,
     this.excludedAppPackages = const [],
+    this.batterySaver = false,
   });
 
   AppSettings copyWith({
@@ -26,6 +28,7 @@ class AppSettings {
     bool clearSelectedServerId = false,
     bool? allowLocalTraffic,
     List<String>? excludedAppPackages,
+    bool? batterySaver,
   }) {
     return AppSettings(
       autoConnectOnOpen: autoConnectOnOpen ?? this.autoConnectOnOpen,
@@ -35,6 +38,7 @@ class AppSettings {
           : (selectedServerId ?? this.selectedServerId),
       allowLocalTraffic: allowLocalTraffic ?? this.allowLocalTraffic,
       excludedAppPackages: excludedAppPackages ?? this.excludedAppPackages,
+      batterySaver: batterySaver ?? this.batterySaver,
     );
   }
 }
@@ -59,6 +63,7 @@ class AppSettingsService {
                 ?.map((e) => e.toString())
                 .toList() ??
             const [],
+        batterySaver: map?['batterySaver'] == true,
       );
     } catch (_) {
       return const AppSettings();
@@ -73,6 +78,7 @@ class AppSettingsService {
         'selectedServerId': settings.selectedServerId,
         'allowLocalTraffic': settings.allowLocalTraffic,
         'excludedAppPackages': settings.excludedAppPackages,
+        'batterySaver': settings.batterySaver,
       });
     } catch (_) {
       // Settings are best-effort; the native surfaces fall back to the

@@ -769,7 +769,10 @@ enum PathControl {
     /// path's paused flag is kept across its removal (pause is a
     /// per-index debugging intent, and the index is reused when
     /// the interface returns).
-    PathsChanged { bind_addresses: Vec<String> },
+    PathsChanged {
+        bind_addresses: Vec<String>,
+        cellular_bind_addresses: Vec<String>,
+    },
 }
 
 /// Order direct-transport candidates for one outbound packet's
@@ -798,6 +801,65 @@ fn order_candidates_for_send(
         healthy.extend(paused);
         healthy
     }
+}
+
+/// Move WireGuard to the front of the transport preference list for
+/// battery saver (it is the cheapest transport per byte: kernel
+/// crypto, no TLS/QUIC framing). No-op when WireGuard is absent or
+/// already first; the remaining order is unchanged.
+#[cfg(any(target_os = "android", test))]
+fn prefer_wireguard_first(protocols: &mut Vec<String>) {
+    if let Some(position) = protocols
+        .iter()
+        .position(|protocol| protocol.eq_ignore_ascii_case("wireguard"))
+    {
+        let wireguard = protocols.remove(position);
+        protocols.insert(0, wireguard);
+    }
+}
+
+/// Desired battery-saver auto-pause set for one evaluation tick.
+/// Auto-pause parks cellular paths only while ALL of these hold:
+/// battery saver is on, the session is idle (the same 60 s definition
+/// as the adaptive heartbeat), and a non-cellular path is live. Any
+/// other state clears the set, so a traffic burst or Wi-Fi loss
+/// resumes cellular immediately. Auto-pause is separate from the debug
+/// pause set: the send predicate treats a path as paused if either set
+/// contains it, and toggling one never touches the other.
+///
+/// What auto-pause does NOT do: it stops data spreading and (with the
+/// idle heartbeat policy) session heartbeats on the parked path, but
+/// the cellular QUIC connection's 25 s keepalive PINGs continue —
+/// quinn fixes keepalive at connect time and offers no runtime toggle
+/// per connection. Full radio sleep would need tearing the cellular
+/// transport down and re-dialing on demand, which is a larger
+/// supervisor change with failover risk; that step is deliberately
+/// not taken here.
+#[cfg(any(target_os = "android", test))]
+fn compute_auto_paused(
+    battery_saver: bool,
+    idle: bool,
+    non_cellular_up: bool,
+    cellular_live: &std::collections::HashSet<usize>,
+) -> std::collections::HashSet<usize> {
+    if battery_saver && idle && non_cellular_up {
+        cellular_live.clone()
+    } else {
+        std::collections::HashSet::new()
+    }
+}
+
+/// Path indexes whose desired bind address is a cellular address.
+#[cfg(any(target_os = "android", test))]
+fn cellular_path_indexes(
+    desired: &std::collections::HashMap<usize, String>,
+    cellular_bind_addresses: &std::collections::HashSet<String>,
+) -> std::collections::HashSet<usize> {
+    desired
+        .iter()
+        .filter(|(_, address)| cellular_bind_addresses.contains(*address))
+        .map(|(index, _)| *index)
+        .collect()
 }
 
 /// Poll every transport's `recv()` concurrently and return the frames
@@ -918,6 +980,27 @@ fn path_index_slots(map: &PathIndexMap, len: usize) -> Vec<Option<usize>> {
     (0..len).map(|index| map.path_of(index)).collect()
 }
 
+/// Refresh the snapshot's paused flags from the debug-pause set and
+/// the battery-saver auto-pause set. Display truth is the OR: a path
+/// shows paused if either mechanism parked it. (Long-press toggles
+/// only the debug set; an auto-paused row keeps showing paused until
+/// the next tick evaluation clears it.)
+#[cfg(any(target_os = "android", test))]
+fn sync_paused_snapshot_flags(
+    snapshot: &Arc<Mutex<AndroidSessionSnapshot>>,
+    paused_paths: &std::collections::HashSet<usize>,
+    auto_paused_paths: &std::collections::HashSet<usize>,
+) {
+    update_snapshot(snapshot, |session_snapshot| {
+        for stat in session_snapshot.path_stats.iter_mut() {
+            if let Some(path_index) = stat.path_index {
+                stat.paused = paused_paths.contains(&path_index)
+                    || auto_paused_paths.contains(&path_index);
+            }
+        }
+    });
+}
+
 /// Refresh the snapshot's per-path structure (which transports exist,
 /// their path indexes and kinds, which is active) after a transport-set
 /// change. Counters survive the refresh: direct paths are matched by
@@ -1027,6 +1110,8 @@ fn start_android_session(
     diagnostics_upload_period_secs: u64,
     app_version_code: u64,
     storage_dir: &str,
+    battery_saver: bool,
+    cellular_bind_addresses_json: &str,
 ) -> anyhow::Result<()> {
     #[cfg(target_os = "android")]
     if diagnostics_upload_enabled {
@@ -1080,6 +1165,15 @@ fn start_android_session(
             .iter()
             .any(|protocol| protocol.eq_ignore_ascii_case("naive_tcp"));
         config.client.preferred_protocols = protocols;
+    }
+    // Battery saver: WireGuard first (cheapest transport per byte),
+    // applied to the effective list whether it came from the server
+    // record or the default. When off, the order is untouched.
+    config.client.battery_saver = battery_saver;
+    config.client.cellular_bind_addresses =
+        parse_bind_address_list(cellular_bind_addresses_json);
+    if battery_saver {
+        prefer_wireguard_first(&mut config.client.preferred_protocols);
     }
     if !bind_addresses.is_empty() {
         config.client.path_bind_addresses = bind_addresses;
@@ -1500,6 +1594,14 @@ fn start_android_session(
             // them (see order_candidates_for_send).
             let mut paused_paths: std::collections::HashSet<usize> =
                 std::collections::HashSet::new();
+            // Battery-saver auto-pause (see compute_auto_paused): a
+            // separate set from the debug pause above, so toggling one
+            // never touches the other. The send predicate treats a path
+            // as paused if either set contains it.
+            let mut auto_paused_paths: std::collections::HashSet<usize> =
+                std::collections::HashSet::new();
+            let mut cellular_bind_addresses: std::collections::HashSet<String> =
+                config.client.cellular_bind_addresses.iter().cloned().collect();
             let (path_lost_tx, path_lost_rx) =
                 tokio::sync::mpsc::unbounded_channel::<usize>();
             let (redial_outcome_tx, mut redial_outcome_rx) =
@@ -1664,7 +1766,16 @@ fn start_android_session(
                                     );
                                 }
                             }
-                            Some(PathControl::PathsChanged { bind_addresses }) => {
+                            Some(PathControl::PathsChanged {
+                                bind_addresses,
+                                cellular_bind_addresses: new_cellular,
+                            }) => {
+                                // The cellular set rides with the path
+                                // set: a roam can move the cellular
+                                // address, and battery saver must keep
+                                // parking the right path.
+                                cellular_bind_addresses =
+                                    new_cellular.into_iter().collect();
                                 // Surgical path-set update: surviving
                                 // transports are never touched (no
                                 // session restart, no re-dial of
@@ -2002,6 +2113,23 @@ fn start_android_session(
                                     break;
                                 }
 
+                                // Battery saver: a traffic burst resumes
+                                // parked cellular paths immediately so
+                                // the burst can spread; re-parking
+                                // happens on a later tick once the
+                                // session is idle again.
+                                if !auto_paused_paths.is_empty() {
+                                    auto_paused_paths.clear();
+                                    sync_paused_snapshot_flags(
+                                        &worker_snapshot,
+                                        &paused_paths,
+                                        &auto_paused_paths,
+                                    );
+                                    alog_info!(
+                                        "Worker: battery saver resumed cellular paths on traffic burst"
+                                    );
+                                }
+
                                 let packet_len = packet.len() as u64;
                                 // Multipath spreading: pin this packet's
                                 // flow to a transport by hash, so every
@@ -2023,13 +2151,18 @@ fn start_android_session(
                                 // they stay connected, but a healthy path
                                 // is always tried first. (Relays never
                                 // report paused: pause is per path index
-                                // and relays have none.)
+                                // and relays have none.) Battery-saver
+                                // auto-pause counts exactly like a debug
+                                // pause here.
                                 let mut candidates = order_candidates_for_send(
                                     (0..transports.len()).collect(),
                                     |vec_index| {
                                         path_index_map
                                             .path_of(vec_index)
-                                            .map(|path| paused_paths.contains(&path))
+                                            .map(|path| {
+                                                paused_paths.contains(&path)
+                                                    || auto_paused_paths.contains(&path)
+                                            })
                                             .unwrap_or(false)
                                     },
                                     flow,
@@ -2323,6 +2456,63 @@ fn start_android_session(
                                 "Worker: heartbeat cadence changed idle={} period_secs={}",
                                 heartbeat_idle,
                                 period.as_secs()
+                            );
+                        }
+                        // Battery saver: re-evaluate cellular parking
+                        // on every tick. Path liveness changes between
+                        // ticks, so this also clears parking when
+                        // Wi-Fi is lost, without needing loss-path
+                        // wiring. Live path indexes come from the map
+                        // (direct paths only; relays have no index).
+                        if config.client.battery_saver {
+                            let live_indexes = path_index_map.path_indexes();
+                            let desired = path_addresses
+                                .read()
+                                .expect("path address map lock poisoned");
+                            let cellular_live: std::collections::HashSet<usize> =
+                                live_indexes
+                                    .iter()
+                                    .copied()
+                                    .filter(|index| {
+                                        desired
+                                            .get(index)
+                                            .map(|address| {
+                                                cellular_bind_addresses
+                                                    .contains(address)
+                                            })
+                                            .unwrap_or(false)
+                                    })
+                                    .collect();
+                            let non_cellular_up = live_indexes
+                                .iter()
+                                .any(|index| !cellular_live.contains(index));
+                            let desired_auto = compute_auto_paused(
+                                true,
+                                idle_now,
+                                non_cellular_up,
+                                &cellular_live,
+                            );
+                            if desired_auto != auto_paused_paths {
+                                if desired_auto.is_empty() {
+                                    alog_info!(
+                                        "Worker: battery saver resumed cellular paths"
+                                    );
+                                } else {
+                                    alog_info!(
+                                        "Worker: battery saver parked cellular paths {:?} (idle, non-cellular path up)",
+                                        desired_auto
+                                    );
+                                }
+                                auto_paused_paths = desired_auto;
+                            }
+                            // Sync flags every tick: a structural
+                            // republish between ticks can restore a
+                            // stale flag, and this is one cheap pass
+                            // over a handful of rows.
+                            sync_paused_snapshot_flags(
+                                &worker_snapshot,
+                                &paused_paths,
+                                &auto_paused_paths,
                             );
                         }
                         let now_ms = SystemTime::now()
@@ -2864,6 +3054,8 @@ pub extern "system" fn Java_com_bonded_bonded_1app_BondedVpnService_nativeStartS
     diagnostics_upload_enabled: jni::sys::jboolean,
     diagnostics_upload_period_secs: jni::sys::jlong,
     app_version_code: jni::sys::jlong,
+    battery_saver: jni::sys::jboolean,
+    cellular_bind_addresses_json: jni::objects::JString,
 ) -> jni::sys::jboolean {
     // Store global ref to the service so protect_fd can call back into Java.
     if let Ok(global_ref) = env.new_global_ref(&obj) {
@@ -2904,6 +3096,11 @@ pub extern "system" fn Java_com_bonded_bonded_1app_BondedVpnService_nativeStartS
         Ok(value) => value.into(),
         Err(_) => return 0,
     };
+    let cellular_bind_addresses_json: String =
+        match env.get_string(&cellular_bind_addresses_json) {
+            Ok(value) => value.into(),
+            Err(_) => return 0,
+        };
 
     if start_android_session(
         &server_address,
@@ -2921,6 +3118,8 @@ pub extern "system" fn Java_com_bonded_bonded_1app_BondedVpnService_nativeStartS
         diagnostics_upload_period_secs.max(0) as u64,
         app_version_code.max(0) as u64,
         &storage_dir,
+        battery_saver != 0,
+        &cellular_bind_addresses_json,
     )
     .is_ok()
     {
@@ -3060,12 +3259,20 @@ pub extern "system" fn Java_com_bonded_bonded_1app_BondedVpnService_nativeUpdate
     mut env: jni::JNIEnv,
     _obj: jni::objects::JObject,
     bind_addresses_json: jni::objects::JString,
+    cellular_bind_addresses_json: jni::objects::JString,
 ) -> jni::sys::jboolean {
     let bind_addresses_json: String = match env.get_string(&bind_addresses_json) {
         Ok(value) => value.into(),
         Err(_) => return false as jni::sys::jboolean,
     };
+    let cellular_bind_addresses_json: String =
+        match env.get_string(&cellular_bind_addresses_json) {
+            Ok(value) => value.into(),
+            Err(_) => return false as jni::sys::jboolean,
+        };
     let bind_addresses = parse_bind_address_list(&bind_addresses_json);
+    let cellular_bind_addresses =
+        parse_bind_address_list(&cellular_bind_addresses_json);
     android_session_slot()
         .lock()
         .expect("android session slot lock poisoned")
@@ -3073,7 +3280,10 @@ pub extern "system" fn Java_com_bonded_bonded_1app_BondedVpnService_nativeUpdate
         .map(|handle| {
             handle
                 .path_control_tx
-                .send(PathControl::PathsChanged { bind_addresses })
+                .send(PathControl::PathsChanged {
+                    bind_addresses,
+                    cellular_bind_addresses,
+                })
                 .is_ok()
         })
         .unwrap_or(false) as jni::sys::jboolean
@@ -3185,8 +3395,11 @@ pub unsafe extern "C" fn bonded_ffi_decode_frame_metadata(
 
 #[cfg(test)]
 mod tests {
+    use super::cellular_path_indexes;
+    use super::compute_auto_paused;
     use super::diff_path_addresses;
     use super::order_candidates_for_send;
+    use super::prefer_wireguard_first;
 
     #[test]
     fn path_diff_removes_vanished_and_reuses_freed_indexes() {
@@ -3528,6 +3741,8 @@ mod tests {
             900,
             0,
             storage_dir.to_string_lossy().as_ref(),
+            false,
+            "[]",
         )
         .expect("android session should start");
 
@@ -3746,6 +3961,8 @@ mod tests {
             900,
             0,
             storage_dir.to_string_lossy().as_ref(),
+            false,
+            "[]",
         )
         .expect("android session should start");
 
@@ -4099,6 +4316,8 @@ mod tests {
             900,
             0,
             storage_dir.to_string_lossy().as_ref(),
+            false,
+            "[]",
         )
         .expect("android session should start");
 
@@ -4215,5 +4434,70 @@ mod tests {
             .block_on(server_task)
             .expect("server task should join");
         let _ = fs::remove_dir_all(storage_dir);
+    }
+
+    #[test]
+    fn prefer_wireguard_first_moves_wireguard_to_front() {
+        let mut protocols = vec![
+            "h3".to_owned(),
+            "wireguard".to_owned(),
+            "wss".to_owned(),
+        ];
+        prefer_wireguard_first(&mut protocols);
+        assert_eq!(protocols, vec!["wireguard", "h3", "wss"]);
+    }
+
+    #[test]
+    fn prefer_wireguard_first_is_noop_without_wireguard_or_when_first() {
+        let mut no_wireguard = vec!["h3".to_owned(), "wss".to_owned()];
+        prefer_wireguard_first(&mut no_wireguard);
+        assert_eq!(no_wireguard, vec!["h3", "wss"]);
+        let mut already_first =
+            vec!["wireguard".to_owned(), "h3".to_owned()];
+        prefer_wireguard_first(&mut already_first);
+        assert_eq!(already_first, vec!["wireguard", "h3"]);
+    }
+
+    #[test]
+    fn auto_pause_parks_cellular_only_when_idle_with_non_cellular_up() {
+        use std::collections::HashSet;
+        let cellular: HashSet<usize> = [1].into_iter().collect();
+        assert_eq!(
+            compute_auto_paused(true, true, true, &cellular),
+            cellular,
+            "idle + wifi up parks cellular"
+        );
+        assert!(
+            compute_auto_paused(true, false, true, &cellular).is_empty(),
+            "traffic burst resumes cellular"
+        );
+        assert!(
+            compute_auto_paused(true, true, false, &cellular).is_empty(),
+            "wifi loss resumes cellular"
+        );
+        assert!(
+            compute_auto_paused(false, true, true, &cellular).is_empty(),
+            "battery saver off never parks"
+        );
+    }
+
+    #[test]
+    fn cellular_path_indexes_match_on_bind_address() {
+        use std::collections::{HashMap, HashSet};
+        let desired: HashMap<usize, String> = [
+            (0, "192.168.1.250".to_owned()),
+            (1, "192.0.0.4".to_owned()),
+        ]
+        .into_iter()
+        .collect();
+        let cellular: HashSet<String> = ["192.0.0.4".to_owned()].into_iter().collect();
+        assert_eq!(
+            cellular_path_indexes(&desired, &cellular),
+            [1].into_iter().collect::<HashSet<usize>>()
+        );
+        assert!(
+            cellular_path_indexes(&desired, &HashSet::new()).is_empty(),
+            "no cellular addresses means no cellular path"
+        );
     }
 }

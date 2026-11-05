@@ -706,6 +706,10 @@ class MainActivity : FlutterActivity() {
                                                     AppSettingsStore.allowLocalTraffic(
                                                             this@MainActivity
                                                     ),
+                                            "batterySaver" to
+                                                    AppSettingsStore.batterySaver(
+                                                            this@MainActivity
+                                                    ),
                                             "excludedAppPackages" to
                                                     AppSettingsStore.excludedAppPackages(
                                                             this@MainActivity
@@ -730,6 +734,9 @@ class MainActivity : FlutterActivity() {
                             }
                             (args?.get("allowLocalTraffic") as? Boolean)?.let {
                                 AppSettingsStore.setAllowLocalTraffic(this@MainActivity, it)
+                            }
+                            (args?.get("batterySaver") as? Boolean)?.let {
+                                AppSettingsStore.setBatterySaver(this@MainActivity, it)
                             }
                             (args?.get("excludedAppPackages") as? List<*>)?.let { raw ->
                                 AppSettingsStore.setExcludedAppPackages(

@@ -107,6 +107,21 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       _save(_settings.copyWith(allowLocalTraffic: value))
                 : null,
           ),
+          SwitchListTile(
+            title: const Text('Battery saver'),
+            subtitle: const Text(
+              'While idle on Wi-Fi, park the cellular path (it carries no '
+              'data until traffic resumes or Wi-Fi drops) and prefer the '
+              'WireGuard transport. Failover still works, but resuming '
+              'cellular takes a moment instead of being instant. '
+              'Applies when you next connect.',
+            ),
+            value: _settings.batterySaver,
+            onChanged: _settingsLoaded
+                ? (value) =>
+                      _save(_settings.copyWith(batterySaver: value))
+                : null,
+          ),
           ListTile(
             title: const Text('Excluded apps'),
             subtitle: Text(
