@@ -7,10 +7,15 @@ import 'package:flutter/services.dart';
 import '../models/session_status.dart';
 import '../models/transport_overhead.dart';
 import '../services/pairing_service.dart';
+import '../services/tcp_echo_client.dart';
 import '../widgets/transport_overhead_card.dart';
 
 class NetworkTestsScreen extends StatefulWidget {
-  const NetworkTestsScreen({super.key});
+  /// Injectable echo client for tests (defaults to the tunnel
+  /// gateway endpoint, 10.8.0.1:18099).
+  final TcpEchoClient? echoClient;
+
+  const NetworkTestsScreen({super.key, this.echoClient});
 
   @override
   State<NetworkTestsScreen> createState() => _NetworkTestsScreenState();
@@ -49,10 +54,12 @@ class _NetworkTestsScreenState extends State<NetworkTestsScreen> {
   bool _measuringOverhead = false;
   String? _overheadNote;
   List<TransportOverheadResult> _overheadResults = const [];
+  late final TcpEchoClient _echoClient;
 
   @override
   void initState() {
     super.initState();
+    _echoClient = widget.echoClient ?? TcpEchoClient();
     _loadFirstPairedServer();
     _refreshLogs();
     _setAutoRefresh(true);
@@ -296,6 +303,170 @@ class _NetworkTestsScreenState extends State<NetworkTestsScreen> {
     _logRefreshTimer = Timer.periodic(const Duration(seconds: 2), (_) {
       _refreshLogs();
     });
+  }
+
+  Future<void> _setPathPaused(int pathIndex, bool paused) async {
+    await _channel.invokeMethod<bool>('pausePath', {
+      'pathIndex': pathIndex,
+      'paused': paused,
+    });
+  }
+
+  PathStat? _pathByIndex(SessionStatus status, int pathIndex) {
+    for (final path in status.paths) {
+      if (path.pathIndex == pathIndex) return path;
+    }
+    return null;
+  }
+
+  /// Fixed-payload overhead measurement: for each direct transport,
+  /// pauses every other direct path so the echo flow pins to the one
+  /// under test, sends the selected fixed payload to the tunnel
+  /// gateway echo endpoint and reads it back, then reports inside
+  /// (TUN) vs wire (socket) bytes from the session-counter deltas.
+  /// Other paths are resumed in a finally block, so a failure never
+  /// leaves the VPN degraded. Peer-relay paths cannot be paused by
+  /// index, so a run whose flow pins to a relay instead of the
+  /// target is skipped and named in the note.
+  Future<void> _runFixedPayloadTcpTest() async {
+    setState(() {
+      _measuringOverhead = true;
+      _overheadNote = 'Running fixed-payload TCP test…';
+      _overheadResults = const [];
+    });
+    try {
+      final before = await _fetchSessionStatus();
+      if (!before.isConnected) {
+        if (!mounted) return;
+        setState(() {
+          _overheadNote = 'VPN is not connected; start the VPN first.';
+        });
+        return;
+      }
+      final directPaths =
+          before.paths.where((p) => p.pathIndex != null).toList();
+      if (directPaths.isEmpty) {
+        if (!mounted) return;
+        setState(() {
+          _overheadNote = 'No direct transports to test.';
+        });
+        return;
+      }
+      final hasRelays = before.paths.any((p) => p.pathIndex == null);
+      final results = <TransportOverheadResult>[];
+      final skipped = <String>[];
+      for (final target in directPaths) {
+        final targetIndex = target.pathIndex!;
+        for (final p in directPaths) {
+          if (p.pathIndex != targetIndex) {
+            await _setPathPaused(p.pathIndex!, true);
+          }
+        }
+        try {
+          final runBefore = await _fetchSessionStatus();
+          final targetBefore = _pathByIndex(runBefore, targetIndex);
+          if (targetBefore == null) {
+            skipped.add('${target.kind} (vanished)');
+            continue;
+          }
+          final stats = await _echoClient.run(
+            payloadBytes: _payloadSizeBytes,
+          );
+          final runAfter = await _fetchSessionStatus();
+          final targetAfter = _pathByIndex(runAfter, targetIndex);
+          if (targetAfter == null) {
+            skipped.add('${target.kind} (vanished)');
+            continue;
+          }
+          // The flow should have pinned to the target: inside bytes
+          // count TUN packet lengths, so they must cover the payload
+          // plus TCP/IP headers. If they do not, the flow went
+          // elsewhere (e.g. a peer relay) or the counters did not
+          // move, and the result would misattribute the bytes.
+          final targetDelta =
+              targetAfter.outboundBytes - targetBefore.outboundBytes;
+          var otherCarried = false;
+          for (var i = 0; i < runAfter.paths.length; i++) {
+            final afterPath = runAfter.paths[i];
+            if (afterPath.pathIndex == targetIndex) continue;
+            final beforePath =
+                i < runBefore.paths.length ? runBefore.paths[i] : null;
+            if (beforePath == null ||
+                beforePath.pathIndex != afterPath.pathIndex) {
+              continue;
+            }
+            if (afterPath.outboundBytes - beforePath.outboundBytes >=
+                _payloadSizeBytes) {
+              otherCarried = true;
+              break;
+            }
+          }
+          if (targetDelta < _payloadSizeBytes) {
+            skipped.add(
+              otherCarried
+                  ? '${target.kind} (flow pinned elsewhere)'
+                  : '${target.kind} (counters did not move)',
+            );
+            continue;
+          }
+          final result = TransportOverheadResult.fromSnapshots(
+            transportLabel: target.kind,
+            before: targetBefore,
+            after: targetAfter,
+            elapsed: stats.elapsed,
+            payloadBytes: _payloadSizeBytes,
+          );
+          if (result != null) results.add(result);
+        } on EchoUnavailableException catch (e) {
+          if (!mounted) return;
+          setState(() {
+            _overheadNote = e.message;
+          });
+          return;
+        } finally {
+          for (final p in directPaths) {
+            if (p.pathIndex != targetIndex) {
+              try {
+                await _setPathPaused(p.pathIndex!, false);
+              } on PlatformException {
+                // Best effort: a resume failure is reported below
+                // rather than masking the run result.
+              }
+            }
+          }
+        }
+      }
+      if (!mounted) return;
+      setState(() {
+        _overheadResults = results;
+        _overheadNote = results.isEmpty
+            ? 'No paths produced a result.'
+            : [
+                'Fixed-payload TCP test: '
+                    '${formatBytes(_payloadSizeBytes)} through each transport.',
+                if (skipped.isNotEmpty) 'Skipped: ${skipped.join(', ')}.',
+                if (hasRelays)
+                  'Peer relays cannot be paused, so a flow may pin to a relay instead of the target.',
+              ].join(' ');
+      });
+    } on PlatformException catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _overheadNote =
+            'Fixed-payload test failed: ${e.code} ${e.message ?? ''}';
+      });
+    } on Exception catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _overheadNote = 'Fixed-payload test failed: $e';
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _measuringOverhead = false;
+        });
+      }
+    }
   }
 
   Future<void> _refreshLogs() async {
@@ -589,7 +760,9 @@ class _NetworkTestsScreenState extends State<NetworkTestsScreen> {
                         label: const Text('Measure live overhead (10 s)'),
                       ),
                       ElevatedButton.icon(
-                        onPressed: null,
+                        onPressed: _measuringOverhead || _running
+                            ? null
+                            : _runFixedPayloadTcpTest,
                         icon: const Icon(Icons.play_arrow),
                         label: const Text('Run fixed-payload TCP test'),
                       ),
@@ -597,11 +770,12 @@ class _NetworkTestsScreenState extends State<NetworkTestsScreen> {
                   ),
                   const SizedBox(height: 8),
                   const Text(
-                    'The fixed-payload test is not yet available: it needs '
-                    'a TCP echo endpoint on the tunnel gateway (10.8.0.1), '
-                    'which is not deployed. The measurement itself is '
-                    'proven in Rust tests against a loopback server; use '
-                    'the live 10 s window above for real traffic.',
+                    'Sends the selected fixed payload through the tunnel '
+                    'to the server echo endpoint (10.8.0.1:18099) and '
+                    'reads it back, one transport at a time — other '
+                    'paths are paused during each run and resumed after. '
+                    'If the server predates the echo endpoint, the run '
+                    'reports it as unavailable instead of hanging.',
                   ),
                   if (_overheadNote != null) ...[
                     const SizedBox(height: 8),
