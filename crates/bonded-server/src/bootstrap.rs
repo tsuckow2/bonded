@@ -65,6 +65,11 @@ pub(crate) struct AdvertisedBootstrapEndpoints {
 
 /// Shared context injected into every connection handler.
 pub struct BootstrapContext {
+    /// Single upstream DNS server for tunnel clients, from
+    /// `server.dns_server` (required). The tunnel DNS proxy blind-forwards
+    /// to exactly this address; there is no /etc/resolv.conf fallback.
+    pub dns_server: std::net::SocketAddr,
+
     /// Stable server identity key.  Signs the TLS cert fingerprint for the
     /// cert-proof endpoint so clients can trust a self-signed TLS cert using
     /// the already-trusted QR-provisioned ed25519 key.
@@ -1059,6 +1064,7 @@ async fn handle_transport_session<T: Transport>(
                     handle.session_id,
                     fwd_tx,
                     Arc::new(AtomicU64::new(0)),
+                    ctx.dns_server,
                 ));
                 let ctx = Arc::new(SessionContext { forwarder, router });
                 // Acquire write lock and insert (double-check for race)
@@ -1296,6 +1302,7 @@ mod tests {
             wireguard_peers: None,
             wireguard_public_addr: None,
             wireguard_peer_lease_secs: 3600,
+            dns_server: std::net::SocketAddr::from(([192, 0, 2, 53], 53)),
             authorized_keys: AuthorizedKeysStore::default(),
             diagnostics_dir: std::env::temp_dir().join("bonded-diagnostics-test"),
             invite_tokens_file: std::env::temp_dir().join("bonded-invites-test.toml"),
@@ -1436,6 +1443,7 @@ mod tests {
             wireguard_peers: None,
             wireguard_public_addr: None,
             wireguard_peer_lease_secs: 3600,
+            dns_server: std::net::SocketAddr::from(([192, 0, 2, 53], 53)),
             authorized_keys: AuthorizedKeysStore::default(),
             diagnostics_dir: std::env::temp_dir().join("bonded-diagnostics-test"),
             invite_tokens_file: std::env::temp_dir().join("bonded-invites-test.toml"),
@@ -1546,6 +1554,7 @@ mod tests {
             wireguard_peers: None,
             wireguard_public_addr: None,
             wireguard_peer_lease_secs: 3600,
+            dns_server: std::net::SocketAddr::from(([192, 0, 2, 53], 53)),
             authorized_keys,
             diagnostics_dir: diagnostics_dir.clone(),
             invite_tokens_file: std::env::temp_dir().join(format!("bonded-invites-{name}-{stamp}.toml")),
@@ -1789,6 +1798,7 @@ mod tests {
             wireguard_peers: None,
             wireguard_public_addr: None,
             wireguard_peer_lease_secs: 3600,
+            dns_server: std::net::SocketAddr::from(([192, 0, 2, 53], 53)),
             authorized_keys,
             diagnostics_dir: std::env::temp_dir().join("bonded-diagnostics-test"),
             invite_tokens_file: std::env::temp_dir().join("bonded-invites-test.toml"),

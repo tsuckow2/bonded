@@ -125,6 +125,22 @@ pub struct ServerSection {
     #[serde(default)]
     pub tcp_public: Option<u16>,
 
+    // ── Tunnel DNS ───────────────────────────────────────────────────────────
+    /// Single upstream DNS server for tunnel clients (queries to the
+    /// tunnel gateway 10.8.0.1:53). REQUIRED: the server fails to start
+    /// when this is missing or unparseable, rather than silently falling
+    /// back to /etc/resolv.conf.
+    ///
+    /// The proxy blind-forwards queries verbatim to exactly this address
+    /// (port 53 when no port is given, e.g. `"192.168.1.1"` or
+    /// `"192.168.1.1:5353"`). Point it at your LAN router or at a local
+    /// resolver you run yourself (dnsmasq, unbound, Pi-hole, …) — that
+    /// resolver, not the proxy, owns redundancy, caching, and LAN zones.
+    /// Do NOT point it at 127.0.0.53: that is the systemd-resolved stub,
+    /// which will not forward single-label names to unicast DNS.
+    #[serde(default)]
+    pub dns_server: Option<String>,
+
     // ── Infrastructure ───────────────────────────────────────────────────────
     pub status_bind: String,
     pub health_bind: String,
@@ -170,6 +186,45 @@ impl ServerSection {
         let port = self.wireguard_public?;
         Some(format!("{}:{}", self.hostname, port))
     }
+
+    /// Parses the required `dns_server` setting into the single upstream
+    /// socket address the tunnel DNS proxy blind-forwards to. A bare IP
+    /// gets port 53. The proxy is IPv4-only, so an IPv6 address is an
+    /// error, not a silent fallback.
+    pub fn dns_server_addr(&self) -> Result<std::net::SocketAddr, String> {
+        let raw = self
+            .dns_server
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                "server.dns_server is required: set it to your LAN router or \
+                 local resolver (e.g. dns_server = \"192.168.1.1\"); the server \
+                 will not fall back to /etc/resolv.conf"
+                    .to_owned()
+            })?;
+        if let Ok(addr) = raw.parse::<std::net::SocketAddr>() {
+            return match addr.ip() {
+                std::net::IpAddr::V4(_) => Ok(addr),
+                std::net::IpAddr::V6(_) => Err(format!(
+                    "server.dns_server must be an IPv4 address (tunnel DNS is \
+                     IPv4-only); got {raw}"
+                )),
+            };
+        }
+        match raw.parse::<std::net::IpAddr>() {
+            Ok(std::net::IpAddr::V4(ip)) => {
+                Ok(std::net::SocketAddr::new(std::net::IpAddr::V4(ip), 53))
+            }
+            Ok(std::net::IpAddr::V6(_)) => Err(format!(
+                "server.dns_server must be an IPv4 address (tunnel DNS is \
+                 IPv4-only); got {raw}"
+            )),
+            Err(_) => Err(format!(
+                "server.dns_server is not a valid IP or IP:port address: {raw}"
+            )),
+        }
+    }
 }
 
 impl Default for ServerSection {
@@ -187,6 +242,7 @@ impl Default for ServerSection {
             wireguard_peer_lease_secs: DEFAULT_WIREGUARD_PEER_LEASE_SECS,
             tcp_bind: None,
             tcp_public: None,
+            dns_server: None,
             status_bind: "0.0.0.0:8082".to_owned(),
             health_bind: "0.0.0.0:8081".to_owned(),
             log_level: "info".to_owned(),
@@ -396,6 +452,40 @@ https_bind = "127.0.0.1:9000"
         cfg.server.hostname = "vpn.example.com".to_owned();
         cfg.server.https_public = 8443;
         assert_eq!(cfg.server.https_public_addr(), "vpn.example.com:8443");
+    }
+
+    #[test]
+    fn dns_server_addr_requires_a_value_and_defaults_to_port_53() {
+        let mut cfg = ServerConfig::default();
+        assert!(cfg.server.dns_server_addr().is_err());
+
+        cfg.server.dns_server = Some("192.168.1.1".to_owned());
+        assert_eq!(
+            cfg.server.dns_server_addr().unwrap(),
+            "192.168.1.1:53".parse().unwrap()
+        );
+
+        cfg.server.dns_server = Some("192.168.1.1:5353".to_owned());
+        assert_eq!(
+            cfg.server.dns_server_addr().unwrap(),
+            "192.168.1.1:5353".parse().unwrap()
+        );
+    }
+
+    #[test]
+    fn dns_server_addr_rejects_invalid_and_ipv6_values() {
+        let mut cfg = ServerConfig::default();
+        cfg.server.dns_server = Some("not-an-address".to_owned());
+        assert!(cfg.server.dns_server_addr().is_err());
+
+        cfg.server.dns_server = Some("2001:db8::1".to_owned());
+        assert!(cfg.server.dns_server_addr().is_err());
+
+        cfg.server.dns_server = Some("[2001:db8::1]:53".to_owned());
+        assert!(cfg.server.dns_server_addr().is_err());
+
+        cfg.server.dns_server = Some(String::new());
+        assert!(cfg.server.dns_server_addr().is_err());
     }
 
     #[test]

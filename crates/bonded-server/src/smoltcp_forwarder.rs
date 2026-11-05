@@ -665,10 +665,13 @@ impl SessionOutboundRouter {
 
 impl SmoltcpForwarder {
     /// Create the forwarder and start the smoltcp poll thread.
+    /// `dns_server` is the single upstream DNS server (from
+    /// `server.dns_server`) that tunnel DNS queries blind-forward to.
     pub fn new(
         session_id: u64,
         outbound_tx: mpsc::UnboundedSender<SessionFrame>,
         outbound_seq: Arc<AtomicU64>,
+        dns_server: std::net::SocketAddr,
     ) -> Self {
         let work = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
         let tcp_stats = Arc::new(std::sync::RwLock::new(TcpStats::default()));
@@ -710,7 +713,7 @@ impl SmoltcpForwarder {
             udp_flow_map: Arc::new(TokioMutex::new(HashMap::new())),
             tcp_flows,
             outbound_tx: outbound_tx.clone(),
-            dns_proxy: crate::dns_proxy::DnsProxy::new(session_id, outbound_tx),
+            dns_proxy: crate::dns_proxy::DnsProxy::new(session_id, outbound_tx, dns_server),
             session_id,
             ingested_packets: AtomicU64::new(0),
             dial_pending: Arc::new(Mutex::new(HashMap::new())),
@@ -3190,7 +3193,7 @@ mod tests {
         });
 
         let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<SessionFrame>();
-        let forwarder = SmoltcpForwarder::new(42, outbound_tx, Arc::new(AtomicU64::new(0)));
+        let forwarder = SmoltcpForwarder::new(42, outbound_tx, Arc::new(AtomicU64::new(0)), std::net::SocketAddr::from(([192, 0, 2, 53], 53)));
 
         let client_ip = Ipv4Addr::new(10, 8, 0, 2);
         let client_port = 40000u16;
@@ -3392,7 +3395,7 @@ mod tests {
         drop(listener);
 
         let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<SessionFrame>();
-        let forwarder = SmoltcpForwarder::new(45, outbound_tx, Arc::new(AtomicU64::new(0)));
+        let forwarder = SmoltcpForwarder::new(45, outbound_tx, Arc::new(AtomicU64::new(0)), std::net::SocketAddr::from(([192, 0, 2, 53], 53)));
 
         let client_ip = Ipv4Addr::new(10, 8, 0, 2);
         let client_port = 40010u16;
@@ -3454,7 +3457,7 @@ mod tests {
         // the held-dial map must still be empty (the dial task could
         // not have run, and the explicit path never inserts an entry).
         let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<SessionFrame>();
-        let forwarder = SmoltcpForwarder::new(46, outbound_tx, Arc::new(AtomicU64::new(0)));
+        let forwarder = SmoltcpForwarder::new(46, outbound_tx, Arc::new(AtomicU64::new(0)), std::net::SocketAddr::from(([192, 0, 2, 53], 53)));
 
         let client_ip = Ipv4Addr::new(10, 8, 0, 2);
         let client_port = 40011u16;
@@ -3521,7 +3524,7 @@ mod tests {
         // real IPv6 header is source-address bytes; here source[1] is
         // set to 0x06 deliberately.)
         let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<SessionFrame>();
-        let forwarder = SmoltcpForwarder::new(48, outbound_tx, Arc::new(AtomicU64::new(0)));
+        let forwarder = SmoltcpForwarder::new(48, outbound_tx, Arc::new(AtomicU64::new(0)), std::net::SocketAddr::from(([192, 0, 2, 53], 53)));
 
         let mut pkt = vec![0u8; 40];
         pkt[0] = 0x60; // version 6
@@ -3600,7 +3603,7 @@ mod tests {
         });
 
         let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<SessionFrame>();
-        let forwarder = SmoltcpForwarder::new(47, outbound_tx, Arc::new(AtomicU64::new(0)));
+        let forwarder = SmoltcpForwarder::new(47, outbound_tx, Arc::new(AtomicU64::new(0)), std::net::SocketAddr::from(([192, 0, 2, 53], 53)));
 
         let client_ip = Ipv4Addr::new(10, 8, 0, 2);
         let client_port = 40012u16;
@@ -3809,7 +3812,7 @@ mod tests {
         });
 
         let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<SessionFrame>();
-        let forwarder = SmoltcpForwarder::new(43, outbound_tx, Arc::new(AtomicU64::new(0)));
+        let forwarder = SmoltcpForwarder::new(43, outbound_tx, Arc::new(AtomicU64::new(0)), std::net::SocketAddr::from(([192, 0, 2, 53], 53)));
 
         let client_ip = Ipv4Addr::new(10, 8, 0, 2);
         // SAME client source port for both flows — the collision condition.
@@ -4122,7 +4125,7 @@ mod tests {
         spawn_churn_server(listener3, 3, violations.clone());
 
         let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<SessionFrame>();
-        let forwarder = SmoltcpForwarder::new(44, outbound_tx, Arc::new(AtomicU64::new(0)));
+        let forwarder = SmoltcpForwarder::new(44, outbound_tx, Arc::new(AtomicU64::new(0)), std::net::SocketAddr::from(([192, 0, 2, 53], 53)));
         let client_ip = Ipv4Addr::new(10, 8, 0, 2);
         let mut client = ChurnClient::new();
         let mut frame_seq = 0u64;
@@ -4781,7 +4784,12 @@ mod tests {
     async fn forwarder_uses_shared_outbound_sequence_counter() {
         let (router, fwd_tx) = SessionOutboundRouter::new();
         let shared_seq = Arc::new(AtomicU64::new(1000));
-        let forwarder = SmoltcpForwarder::new(999, fwd_tx, shared_seq.clone());
+        let forwarder = SmoltcpForwarder::new(
+            999,
+            fwd_tx,
+            shared_seq.clone(),
+            std::net::SocketAddr::from(([192, 0, 2, 53], 53)),
+        );
         let (tx1, rx1) = mpsc::unbounded_channel::<SessionFrame>();
         router.add_transport(7, tx1);
         router.mark_active(7);
@@ -4863,7 +4871,7 @@ mod tests {
 
         let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<SessionFrame>();
         // Session 1 (like the harness consumer; provider gets 0).
-        let forwarder = SmoltcpForwarder::new(1, outbound_tx, Arc::new(AtomicU64::new(0)));
+        let forwarder = SmoltcpForwarder::new(1, outbound_tx, Arc::new(AtomicU64::new(0)), std::net::SocketAddr::from(([192, 0, 2, 53], 53)));
 
         let client_ip = Ipv4Addr::new(10, 8, 0, 2);
         let client_port = 40000u16;

@@ -110,6 +110,18 @@ async fn main() -> anyhow::Result<()> {
     };
 
     apply_env_overrides(&mut cfg, |key| std::env::var(key).ok());
+    // Tunnel DNS has exactly one upstream, configured by the operator.
+    // Fail here, before any listener starts, rather than starting with
+    // a silently broken DNS proxy (the old /etc/resolv.conf fallback
+    // pointed at the systemd stub on most hosts, which will not forward
+    // single-label names to unicast DNS).
+    let dns_server = match cfg.server.dns_server_addr() {
+        Ok(addr) => addr,
+        Err(err) => {
+            eprintln!("failed to start bonded-server: {err}");
+            return Err(anyhow::anyhow!("{err}"));
+        }
+    };
     init_tracing_from_level(&cfg.server.log_level);
     let tunnel_pcap = TunnelPcapLogger::from_env(TUNNEL_PCAP_MAX_MB_ENV)?;
     ensure_server_state_files(&cfg)?;
@@ -271,6 +283,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let bootstrap_ctx = Arc::new(bootstrap::BootstrapContext {
+        dns_server,
         server_identity: server_identity.clone(),
         tls_cert_der: tls_cert_der.map(Arc::new),
         server_public_address: cfg.server.https_public_addr(),
@@ -303,6 +316,7 @@ async fn main() -> anyhow::Result<()> {
                 wireguard_forwarders,
                 wireguard_tun_bridge,
                 wireguard_tunnel_pcap,
+                dns_server,
             )
             .await
             {
@@ -372,6 +386,7 @@ async fn main() -> anyhow::Result<()> {
                 forwarders,
                 tun_bridge,
                 tunnel_pcap,
+                dns_server,
             ) => result,
             signal_result = signal::ctrl_c() => {
                 match signal_result {
@@ -562,6 +577,7 @@ async fn run_server(
     forwarders: ForwarderRegistry,
     tun_bridge: Option<TunBridge>,
     tunnel_pcap: Option<Arc<TunnelPcapLogger>>,
+    dns_server: std::net::SocketAddr,
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind(bind).await?;
     info!(bind = %bind, "naive tcp listener bound");
@@ -643,6 +659,7 @@ async fn run_server(
                                     handle.session_id,
                                     fwd_tx,
                                     Arc::new(AtomicU64::new(0)),
+                                    dns_server,
                                 ));
                                 let ctx = Arc::new(SessionContext { forwarder, router });
                                 guard.insert(handle.session_id, ctx.clone());
@@ -1035,6 +1052,9 @@ where
         if let Ok(value) = v.parse::<u64>() {
             cfg.server.wireguard_peer_lease_secs = value;
         }
+    }
+    if let Some(v) = read_env("BONDED_DNS_SERVER") {
+        cfg.server.dns_server = Some(v);
     }
     if let Some(v) = read_env("BONDED_TCP_BIND") {
         cfg.server.tcp_bind = Some(v);

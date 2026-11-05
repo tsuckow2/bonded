@@ -501,6 +501,7 @@ pub async fn run_wireguard_server(
     forwarders: ForwarderRegistry,
     tun_bridge: Option<TunBridge>,
     tunnel_pcap: Option<Arc<TunnelPcapLogger>>,
+    dns_server: std::net::SocketAddr,
 ) -> anyhow::Result<()> {
     let socket = Arc::new(UdpSocket::bind(bind).await?);
     info!(bind = %bind, "wireguard udp listener bound");
@@ -550,6 +551,7 @@ pub async fn run_wireguard_server(
                     forwarders.clone(),
                     tun_bridge.clone(),
                     tunnel_pcap.clone(),
+                    dns_server,
                 )
                 .await?;
                 if let Some(frames) = runtime
@@ -584,6 +586,7 @@ async fn ensure_peer_runtime(
     forwarders: ForwarderRegistry,
     tun_bridge: Option<TunBridge>,
     tunnel_pcap: Option<Arc<TunnelPcapLogger>>,
+    dns_server: std::net::SocketAddr,
 ) -> anyhow::Result<Arc<WireGuardServerPeer>> {
     if let Some(existing) = runtimes.get(&peer.device_public_key) {
         if sessions.contains_client(&peer.device_public_key) {
@@ -630,6 +633,7 @@ async fn ensure_peer_runtime(
                     handle.session_id,
                     fwd_tx,
                     Arc::new(AtomicU64::new(0)),
+                    dns_server,
                 ));
                 let ctx = Arc::new(SessionContext { forwarder, router });
                 guard.insert(handle.session_id, ctx.clone());
@@ -1386,6 +1390,7 @@ mod tests {
             forwarders.clone(),
             None,
             None,
+            std::net::SocketAddr::from(([192, 0, 2, 53], 53)),
         )
         .await
         .expect("first runtime should be created");
@@ -1403,6 +1408,7 @@ mod tests {
             forwarders,
             None,
             None,
+            std::net::SocketAddr::from(([192, 0, 2, 53], 53)),
         )
         .await
         .expect("stale runtime should be recreated");
@@ -1439,6 +1445,7 @@ mod tests {
             forwarders,
             None,
             None,
+            std::net::SocketAddr::from(([192, 0, 2, 53], 53)),
         )
         .await
         .expect("runtime should be created without tun bridge");

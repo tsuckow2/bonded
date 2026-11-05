@@ -1,15 +1,20 @@
 //! DNS proxy for the tunnel: queries addressed to the tunnel gateway
-//! (10.8.0.1:53) are resolved by the server itself, using the server
-//! host's own resolvers from /etc/resolv.conf, instead of being
-//! forwarded to the internet like any other UDP packet.
+//! (10.8.0.1:53) are blind-forwarded verbatim to the server's single
+//! configured upstream DNS server (`server.dns_server`), instead of
+//! being forwarded to the internet like any other UDP packet.
 //!
 //! The Android client sets the VPN DNS server to the tunnel gateway, so
 //! when the tunnel is up, all device DNS goes through the tunnel to this
 //! proxy. Nothing reaches here by accident: 10.8.0.1 is not a real
 //! client address, and the server answers nothing else on it.
+//!
+//! There is deliberately no resolver list, no /etc/resolv.conf fallback,
+//! and no gateway guessing here: the proxy is a dumb forwarder to one
+//! address. An operator who wants redundancy runs their own local
+//! resolver and points `dns_server` at it.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -31,7 +36,7 @@ pub const TUN_DNS_PORT: u16 = 53;
 /// which would hang on the blackholed gateway route until DIAL_TIMEOUT.
 pub const TUN_DOT_PORT: u16 = 853;
 
-/// How long to wait for one upstream resolver before trying the next.
+/// How long to wait for the single upstream resolver before SERVFAIL.
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Per-client-tuple reply state, mirroring the UDP flow pump: responses
@@ -48,39 +53,44 @@ struct DnsFlowState {
 pub struct DnsProxy {
     session_id: u64,
     outbound_tx: mpsc::UnboundedSender<SessionFrame>,
+    /// The one upstream DNS server, from `server.dns_server` (required).
+    upstream: SocketAddr,
     flows: Arc<Mutex<HashMap<(Ipv4Addr, u16), DnsFlowState>>>,
 }
 
 impl DnsProxy {
-    pub fn new(session_id: u64, outbound_tx: mpsc::UnboundedSender<SessionFrame>) -> Self {
+    pub fn new(
+        session_id: u64,
+        outbound_tx: mpsc::UnboundedSender<SessionFrame>,
+        upstream: SocketAddr,
+    ) -> Self {
         Self {
             session_id,
             outbound_tx,
+            upstream,
             flows: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    /// Answer one DNS query addressed to the tunnel gateway, using the
-    /// server host's own resolvers.
+    /// Answer one DNS query addressed to the tunnel gateway, by
+    /// blind-forwarding it verbatim to the configured upstream.
     pub async fn handle_query(&self, header: SessionHeader, pkt: Ipv4UdpPacket) {
-        let resolvers = system_resolvers();
-        self.answer(header, pkt, &resolvers).await;
+        self.answer(header, pkt).await;
     }
 
-    /// Answer one DNS query using an explicit resolver list (the
-    /// production path passes the system resolvers; tests pass a stub).
-    async fn answer(&self, header: SessionHeader, pkt: Ipv4UdpPacket, resolvers: &[SocketAddr]) {
+    /// Answer one DNS query using the configured upstream.
+    async fn answer(&self, header: SessionHeader, pkt: Ipv4UdpPacket) {
         let query = pkt.payload;
         if query.len() < 12 {
             debug!(session_id = self.session_id, "dropping short DNS query to tunnel gateway");
             return;
         }
-        let response = match forward_query(&query, resolvers).await {
+        let response = match forward_query(&query, self.upstream).await {
             Some(response) => response,
             None => {
                 warn!(
                     session_id = self.session_id,
-                    resolvers = resolvers.len(),
+                    upstream = %self.upstream,
                     "no upstream DNS resolver answered; returning SERVFAIL"
                 );
                 build_servfail(&query)
@@ -127,52 +137,19 @@ impl DnsProxy {
     }
 }
 
-/// Forward a raw DNS query to the given resolvers in order, returning
-/// the first response. Each resolver gets a fresh ephemeral socket, so
-/// concurrent queries never mix up replies.
-async fn forward_query(query: &[u8], resolvers: &[SocketAddr]) -> Option<Vec<u8>> {
-    for resolver in resolvers {
-        let socket = match UdpSocket::bind("0.0.0.0:0").await {
-            Ok(socket) => socket,
-            Err(_) => continue,
-        };
-        if socket.send_to(query, resolver).await.is_err() {
-            continue;
-        }
-        let mut buf = vec![0u8; 65535];
-        match timeout(UPSTREAM_TIMEOUT, socket.recv(&mut buf)).await {
-            Ok(Ok(n)) => return Some(buf[..n].to_vec()),
-            _ => continue,
-        }
+/// Forward a raw DNS query verbatim to the single upstream resolver,
+/// returning its response. The query gets a fresh ephemeral socket, so
+/// concurrent queries never mix up replies. No parsing, no fallback,
+/// no second resolver: whatever the upstream returns is the answer,
+/// and a timeout yields None (the caller synthesizes SERVFAIL).
+async fn forward_query(query: &[u8], upstream: SocketAddr) -> Option<Vec<u8>> {
+    let socket = UdpSocket::bind("0.0.0.0:0").await.ok()?;
+    socket.send_to(query, upstream).await.ok()?;
+    let mut buf = vec![0u8; 65535];
+    match timeout(UPSTREAM_TIMEOUT, socket.recv(&mut buf)).await {
+        Ok(Ok(n)) => Some(buf[..n].to_vec()),
+        _ => None,
     }
-    None
-}
-
-/// The server host's resolvers from /etc/resolv.conf, in order.
-fn system_resolvers() -> Vec<SocketAddr> {
-    let Ok(contents) = std::fs::read_to_string("/etc/resolv.conf") else {
-        return Vec::new();
-    };
-    parse_resolv_conf(&contents)
-}
-
-/// Parse `nameserver` lines out of resolv.conf content. IPv6
-/// nameservers are skipped: the proxy queries over IPv4.
-fn parse_resolv_conf(contents: &str) -> Vec<SocketAddr> {
-    let mut resolvers = Vec::new();
-    for line in contents.lines() {
-        let line = line.split('#').next().unwrap_or("").trim();
-        let mut parts = line.split_whitespace();
-        if parts.next() != Some("nameserver") {
-            continue;
-        }
-        let Some(addr) = parts.next() else { continue };
-        let Ok(IpAddr::V4(ip)) = addr.parse::<IpAddr>() else {
-            continue;
-        };
-        resolvers.push(SocketAddr::new(IpAddr::V4(ip), 53));
-    }
-    resolvers
 }
 
 /// A SERVFAIL response echoing the query's ID and question count, so
@@ -198,16 +175,6 @@ mod tests {
         vec![
             0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         ]
-    }
-
-    #[test]
-    fn resolv_conf_parsing_skips_comments_and_ipv6() {
-        let contents = "# a comment\nnameserver 192.168.1.1\nnameserver 2001:db8::1 # trailing\nsearch example.com\noptions ndots:5\nnameserver 8.8.8.8\n";
-        let resolvers = parse_resolv_conf(contents);
-        assert_eq!(resolvers.len(), 2);
-        assert_eq!(resolvers[0].ip(), IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)));
-        assert_eq!(resolvers[0].port(), 53);
-        assert_eq!(resolvers[1].ip(), IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
     }
 
     #[test]
@@ -262,7 +229,7 @@ mod tests {
             assert_eq!(&buf[..n], &example_query()[..]);
             stub.send_to(&canned_clone, peer).await.expect("stub send");
         });
-        let response = forward_query(&example_query(), &[stub_addr])
+        let response = forward_query(&example_query(), stub_addr)
             .await
             .expect("stub should answer");
         assert_eq!(response, canned);
@@ -273,7 +240,11 @@ mod tests {
     async fn answer_returns_servfail_when_no_resolver_answers() {
         // A closed port: sends succeed, nothing ever replies.
         let (tx, mut rx) = mpsc::unbounded_channel::<SessionFrame>();
-        let proxy = DnsProxy::new(7, tx);
+        let proxy = DnsProxy::new(
+            7,
+            tx,
+            SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST), 1),
+        );
         let pkt = Ipv4UdpPacket {
             src_ip: Ipv4Addr::new(10, 8, 0, 2),
             dst_ip: TUN_DNS_ADDR,
@@ -287,9 +258,7 @@ mod tests {
             sequence: 100,
             flags: 0,
         };
-        proxy
-            .answer(header, pkt, &[SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1)])
-            .await;
+        proxy.answer(header, pkt).await;
         let frame = rx.recv().await.expect("a response frame");
         assert_eq!(frame.header.connection_id, 9);
         assert_eq!(frame.header.sequence, 100);

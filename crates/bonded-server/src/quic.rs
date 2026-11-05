@@ -296,6 +296,7 @@ async fn handle_quic_connection(
                 handle.session_id,
                 fwd_tx,
                 Arc::new(AtomicU64::new(0)),
+                bootstrap_ctx.dns_server,
             ));
             let ctx = Arc::new(SessionContext { forwarder, router });
             guard.insert(handle.session_id, ctx.clone());

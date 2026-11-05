@@ -17,6 +17,13 @@ wireguard_peers_file = "/tmp/wg-peers.toml"
 tcp_bind = "0.0.0.0:8000"
 tcp_public = 8000
 
+# Required: single upstream DNS server for tunnel clients (queries to
+# 10.8.0.1:53 are blind-forwarded verbatim to exactly this address).
+# Replace with your LAN router or your own local resolver (dnsmasq,
+# unbound, Pi-hole, ...). Do NOT use 127.0.0.53: that is the
+# systemd-resolved stub, which will not forward single-label names.
+dns_server = "192.168.1.1"
+
 status_bind = "0.0.0.0:8082"
 health_bind = "0.0.0.0:8081"
 log_level = "info"
