@@ -75,6 +75,12 @@ data class SessionPathStat(
         val paused: Boolean = false,
         val outboundBytes: Long,
         val inboundBytes: Long,
+        /** Socket-level bytes for this path (wire counters from the
+         * transport, incl. QUIC/TLS framing overhead). Null when the
+         * transport cannot observe them. Read by the 4.41 overhead
+         * diagnostic's wire rows. */
+        val wireTxBytes: Long? = null,
+        val wireRxBytes: Long? = null,
         val lastRttMs: Long,
         /** "IP:port" source address the server sees for this path, or null. */
         val serverSeenAddress: String?,
@@ -86,6 +92,68 @@ data class SessionPathStat(
          * from zero. Wakeup accounting for the profiler. */
         val quicPingFrames: Long? = null,
 )
+
+/** Parse the native snapshot's per-path stats (transport-vec order).
+ * Top-level (not a [BondedVpnService] member) so the parse is
+ * unit-testable (plan 4.48): the service class cannot be instantiated
+ * in a local unit test, and this function only touches org.json.
+ * Null JSON values become null fields; missing keys default the
+ * same way (see [SessionPathStat]). */
+internal fun parseSessionPaths(array: JSONArray?): List<SessionPathStat> {
+    if (array == null) return emptyList()
+    val paths = ArrayList<SessionPathStat>(array.length())
+    for (i in 0 until array.length()) {
+        val item = array.optJSONObject(i) ?: continue
+        paths.add(
+                SessionPathStat(
+                        pathIndex =
+                                if (item.isNull("pathIndex")) null
+                                else item.optInt("pathIndex", -1).takeIf { it >= 0 },
+                        kind = item.optString("kind", "Unknown"),
+                        active = item.optBoolean("active", false),
+                        paused = item.optBoolean("paused", false),
+                        outboundBytes = item.optLong("outboundBytes", 0),
+                        inboundBytes = item.optLong("inboundBytes", 0),
+                        wireTxBytes =
+                                if (item.isNull("wireTxBytes")) null
+                                else item.optLong("wireTxBytes", 0),
+                        wireRxBytes =
+                                if (item.isNull("wireRxBytes")) null
+                                else item.optLong("wireRxBytes", 0),
+                        lastRttMs = item.optLong("lastRttMs", 0),
+                        serverSeenAddress =
+                                if (item.isNull("serverSeenAddress")) null
+                                else item.optString("serverSeenAddress").takeIf { it.isNotEmpty() },
+                        peerId =
+                                if (item.isNull("peerId")) null
+                                else item.optString("peerId").takeIf { it.isNotEmpty() },
+                        quicPingFrames =
+                                if (item.isNull("quicPingFrames")) null
+                                else item.optLong("quicPingFrames", 0),
+                )
+        )
+    }
+    return paths
+}
+
+/** Serialize one per-path stat for the Dart side
+ * ([BondedVpnService.getSessionSnapshot]). Top-level alongside
+ * [parseSessionPaths] so the forward is unit-testable. */
+internal fun sessionPathStatToMap(path: SessionPathStat): Map<String, Any?> =
+        mapOf(
+                "pathIndex" to path.pathIndex,
+                "kind" to path.kind,
+                "active" to path.active,
+                "paused" to path.paused,
+                "outboundBytes" to path.outboundBytes,
+                "inboundBytes" to path.inboundBytes,
+                "wireTxBytes" to path.wireTxBytes,
+                "wireRxBytes" to path.wireRxBytes,
+                "lastRttMs" to path.lastRttMs,
+                "serverSeenAddress" to path.serverSeenAddress,
+                "peerId" to path.peerId,
+                "quicPingFrames" to path.quicPingFrames,
+        )
 
 class BondedVpnService : VpnService() {
     private var vpnInterface: ParcelFileDescriptor? = null
@@ -828,37 +896,6 @@ class BondedVpnService : VpnService() {
         } catch (_: Exception) {
             null
         }
-    }
-
-    private fun parseSessionPaths(array: JSONArray?): List<SessionPathStat> {
-        if (array == null) return emptyList()
-        val paths = ArrayList<SessionPathStat>(array.length())
-        for (i in 0 until array.length()) {
-            val item = array.optJSONObject(i) ?: continue
-            paths.add(
-                    SessionPathStat(
-                            pathIndex =
-                                    if (item.isNull("pathIndex")) null
-                                    else item.optInt("pathIndex", -1).takeIf { it >= 0 },
-                            kind = item.optString("kind", "Unknown"),
-                            active = item.optBoolean("active", false),
-                            paused = item.optBoolean("paused", false),
-                            outboundBytes = item.optLong("outboundBytes", 0),
-                            inboundBytes = item.optLong("inboundBytes", 0),
-                            lastRttMs = item.optLong("lastRttMs", 0),
-                            serverSeenAddress =
-                                    if (item.isNull("serverSeenAddress")) null
-                                    else item.optString("serverSeenAddress").takeIf { it.isNotEmpty() },
-                            peerId =
-                                    if (item.isNull("peerId")) null
-                                    else item.optString("peerId").takeIf { it.isNotEmpty() },
-                            quicPingFrames =
-                                    if (item.isNull("quicPingFrames")) null
-                                    else item.optLong("quicPingFrames", 0),
-                    )
-            )
-        }
-        return paths
     }
 
     private fun updateSessionSnapshot(snapshot: SessionSnapshot?) {
@@ -1615,21 +1652,7 @@ class BondedVpnService : VpnService() {
                     "networkPathCount" to activeNetworkPathCount,
                     "networkBindAddresses" to activeNetworkBindAddresses,
                     "networkPathSummaries" to activeNetworkPathSummaries,
-                    "paths" to
-                            snapshot.paths.map { path ->
-                                mapOf<String, Any?>(
-                                        "pathIndex" to path.pathIndex,
-                                        "kind" to path.kind,
-                                        "active" to path.active,
-                                        "paused" to path.paused,
-                                        "outboundBytes" to path.outboundBytes,
-                                        "inboundBytes" to path.inboundBytes,
-                                        "lastRttMs" to path.lastRttMs,
-                                        "serverSeenAddress" to path.serverSeenAddress,
-                                        "peerId" to path.peerId,
-                                        "quicPingFrames" to path.quicPingFrames,
-                                )
-                            },
+                    "paths" to snapshot.paths.map(::sessionPathStatToMap),
             )
         }
 

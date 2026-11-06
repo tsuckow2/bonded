@@ -45,6 +45,10 @@ void main() {
     expect(status.relayedUpBytes, 19);
     expect(status.paths[0].quicPingFrames, 7);
     expect(status.paths[1].quicPingFrames, isNull);
+    expect(status.paths[0].wireTxBytes, 120);
+    expect(status.paths[0].wireRxBytes, 110);
+    expect(status.paths[1].wireTxBytes, isNull);
+    expect(status.paths[1].wireRxBytes, isNull);
 
     // An older snapshot without the keys still parses, with zeros.
     final legacy = SessionStatus.fromMap(<String, dynamic>{
@@ -57,5 +61,7 @@ void main() {
     expect(legacy.relayTasksStarted, 0);
     expect(legacy.relayTasksEnded, 0);
     expect(legacy.paths[0].quicPingFrames, isNull);
+    expect(legacy.paths[0].wireTxBytes, isNull);
+    expect(legacy.paths[0].wireRxBytes, isNull);
   });
 }

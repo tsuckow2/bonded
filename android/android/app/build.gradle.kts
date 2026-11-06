@@ -112,4 +112,8 @@ dependencies {
     // available on the Play track and offers the update flow.
     implementation("com.google.android.play:app-update:2.1.0")
     testImplementation("junit:junit:4.13.2")
+    // Test scope only: the android.jar org.json classes are stubs that
+    // throw in local unit tests, so the snapshot JSON parse
+    // (SessionSnapshotTest) needs the real implementation. Never ships.
+    testImplementation("org.json:json:20240303")
 }
