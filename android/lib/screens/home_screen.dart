@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import '../models/pairing_model.dart';
+import '../models/session_grade.dart';
 import '../models/session_status.dart';
 import '../services/app_settings_service.dart';
 import '../services/background_service.dart';
@@ -10,6 +11,7 @@ import '../services/pairing_service.dart';
 import '../widgets/app_update_checker.dart';
 import '../widgets/focusable_row.dart';
 import '../widgets/session_charts.dart';
+import '../widgets/session_grade_card.dart';
 
 /// The connect-first main screen (redesign, build 183): a server dropdown
 /// and one big connect button up top, live per-path stats and rolling
@@ -55,6 +57,13 @@ class _HomeScreenState extends State<HomeScreen> {
   int? _lastRelayedDownBytes;
   double _relayedUpRate = 0;
   double _relayedDownRate = 0;
+
+  // Session grade (4.47): accumulated from the same snapshot
+  // samples, one tracker per session. The final grade is kept as
+  // the last-session grade when the session ends, until the next
+  // session starts.
+  final SessionGradeTracker _gradeTracker = SessionGradeTracker();
+  SessionGrade? _lastSessionGrade;
 
   @override
   void initState() {
@@ -152,6 +161,10 @@ class _HomeScreenState extends State<HomeScreen> {
       _lastRelayedDownBytes = null;
       _relayedUpRate = 0;
       _relayedDownRate = 0;
+      // Session ended (or never started): keep the final grade as
+      // the last-session grade until the next session starts.
+      final grade = _gradeTracker.grade;
+      if (grade != null) _lastSessionGrade = grade;
       return;
     }
     if (status.connectedAtMs != _sampledConnectedAtMs) {
@@ -165,8 +178,13 @@ class _HomeScreenState extends State<HomeScreen> {
       _lastRelayedDownBytes = null;
       _relayedUpRate = 0;
       _relayedDownRate = 0;
+      // New session: the previous session's grade (if any) becomes
+      // the last-session grade; the tracker resets.
+      final prevGrade = _gradeTracker.beginSession(status.connectedAtMs);
+      if (prevGrade != null) _lastSessionGrade = prevGrade;
     }
     final now = DateTime.now();
+    _gradeTracker.record(status, now);
     if (_lastInBytes != null && _lastSampleAt != null) {
       final dt = now.difference(_lastSampleAt!).inMilliseconds / 1000.0;
       if (dt > 0) {
@@ -632,9 +650,39 @@ class _HomeScreenState extends State<HomeScreen> {
             const SizedBox(height: 16),
             _buildGraphsCard(),
           ],
+          // Session grade (4.47): live while connected, retained
+          // as the last-session grade after disconnect until the
+          // next session starts. Outside the connected block so
+          // it survives disconnect; near the Totals / Relayed
+          // cards it grades.
+          if (_showGradeCard) ...[
+            const SizedBox(height: 16),
+            _buildGradeCard(),
+          ],
         ],
       ),
     );
+  }
+
+  /// True when there is a grade to show: the live grade while
+  /// connected (once any component has data), or the retained
+  /// last-session grade while disconnected. While a new session
+  /// is still collecting its first samples, the previous
+  /// session's grade is not shown — the card is live-only then.
+  bool get _showGradeCard {
+    if (_vpnRunning && _status.isConnected) {
+      return _gradeTracker.grade != null;
+    }
+    return _lastSessionGrade != null;
+  }
+
+  Widget _buildGradeCard() {
+    final live = (_vpnRunning && _status.isConnected)
+        ? _gradeTracker.grade
+        : null;
+    final grade = live ?? _lastSessionGrade;
+    if (grade == null) return const SizedBox.shrink();
+    return SessionGradeCard(grade: grade, isLive: live != null);
   }
 
   String _uptimeText() {
