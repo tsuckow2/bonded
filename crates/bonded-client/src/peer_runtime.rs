@@ -22,7 +22,7 @@ use crate::peer_discovery::{PeerShareAdvertiser, PeerShareBrowser, utc_minute};
 use crate::peer_listener::{
     accept_peer_relay, connect_peer_relay, register_peer_relay_upstream,
     relay_peer_frames_rate_limited, AcceptedPeerRelay, PeerListenerIdentity, PeerRelayDial,
-    PeerRelayRateLimiter,
+    PeerRelayRateLimiter, PeerShareRelayStats,
 };
 use crate::{
     bootstrap_scheme_candidates, enumerate_interfaces, establish_single_transport_path,
@@ -32,6 +32,16 @@ use crate::{
 
 pub struct PeerShareRuntime {
     tasks: Vec<JoinHandle<()>>,
+    relay_stats: Arc<PeerShareRelayStats>,
+}
+
+impl PeerShareRuntime {
+    /// Aggregate bytes relayed for others by this runtime's provider
+    /// legs (up = consumer -> server, down = server -> consumer).
+    /// Zero when this runtime never provided (consumer-only mode).
+    pub fn relay_stats(&self) -> Arc<PeerShareRelayStats> {
+        Arc::clone(&self.relay_stats)
+    }
 }
 
 /// Sentinel path index for the default-network slot: a provider with
@@ -402,6 +412,7 @@ async fn run_peer_accept_loop(
     bandwidth_kbps: u64,
     path_claims: Arc<std::sync::Mutex<RelayPathClaims>>,
     active_relays: Arc<AtomicUsize>,
+    relay_stats: Arc<PeerShareRelayStats>,
     path_source: ProviderPathSource,
     config: ClientConfig,
 ) {
@@ -522,6 +533,7 @@ async fn run_peer_accept_loop(
         let relay_claims = path_claims.clone();
         let relay_path_source = path_source.clone();
         let relay_count = active_relays.clone();
+        let relay_stats = relay_stats.clone();
         tokio::spawn(async move {
             let mut peer = peer;
             // Resilience: if the upstream (provider->server) connection fails,
@@ -572,7 +584,14 @@ async fn run_peer_accept_loop(
                     }
                     tracing::warn!("provider: relay registration sent");
                     let mut limiter = PeerRelayRateLimiter::new(bandwidth_kbps);
-                    match relay_peer_frames_rate_limited(&mut peer, &mut upstream, &mut limiter).await {
+                    match relay_peer_frames_rate_limited(
+                        &mut peer,
+                        &mut upstream,
+                        &mut limiter,
+                        &relay_stats,
+                    )
+                    .await
+                    {
                         Ok(()) => {
                             // Relay completed normally (peer disconnected)
                             return Ok(());
@@ -695,6 +714,7 @@ async fn run_advertise_watcher(
     bandwidth_kbps: u64,
     path_claims: Arc<std::sync::Mutex<RelayPathClaims>>,
     active_relays: Arc<AtomicUsize>,
+    relay_stats: Arc<PeerShareRelayStats>,
     cert_der: Vec<u8>,
     key_der: Vec<u8>,
     port: u16,
@@ -762,6 +782,7 @@ async fn run_advertise_watcher(
                     bandwidth_kbps,
                     path_claims.clone(),
                     active_relays.clone(),
+                    relay_stats.clone(),
                     path_source.clone(),
                     config.clone(),
                 ));
@@ -892,6 +913,11 @@ pub async fn start_peer_share_runtime(
         );
     }
 
+    // Aggregate relayed-bytes counters for the provider legs, shared
+    // with the FFI snapshot. Created in all modes so the runtime
+    // always carries one; a consumer-only runtime stays at zero.
+    let relay_stats = Arc::new(PeerShareRelayStats::default());
+
     // Provider side: accept loops + advertise watcher. One accept loop
     // runs per bound endpoint; the watcher spawns a new loop on re-bind
     // and aborts loops whose IP is no longer assigned, so a path change
@@ -926,6 +952,7 @@ pub async fn start_peer_share_runtime(
             accept_bandwidth_kbps,
             path_claims.clone(),
             active_relays.clone(),
+            relay_stats.clone(),
             path_source.clone(),
             config.clone(),
         ));
@@ -938,6 +965,7 @@ pub async fn start_peer_share_runtime(
             accept_bandwidth_kbps,
             path_claims,
             active_relays,
+            relay_stats.clone(),
             listener_cert_der.expect("provider mode requires listener cert"),
             listener_key_der.expect("provider mode requires listener key"),
             listener_port.expect("provider mode requires listener port"),
@@ -1223,7 +1251,7 @@ pub async fn start_peer_share_runtime(
     // Endpoints are owned by their accept loops (spawned by the watcher),
     // never by the runtime struct, so pruning an endpoint actually tears
     // it down instead of lingering on a struct-kept clone.
-    Ok(PeerShareRuntime { tasks })
+    Ok(PeerShareRuntime { tasks, relay_stats })
 }
 
 /// Upstream protocols for relay legs: QUIC/WebSocket only, no

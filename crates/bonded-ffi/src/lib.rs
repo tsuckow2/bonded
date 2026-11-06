@@ -1,7 +1,8 @@
 #[cfg(any(target_os = "android", test))]
 use bonded_client::{
     establish_naive_tcp_session, establish_transport_paths,
-    establish_transport_paths_with_observer, peer_runtime, ClientTransport,
+    establish_transport_paths_with_observer, peer_listener::PeerShareRelayStats, peer_runtime,
+    ClientTransport,
 };
 #[cfg(any(target_os = "android", test))]
 use bonded_core::config::ClientConfig;
@@ -31,6 +32,8 @@ use std::os::fd::FromRawFd;
 #[cfg(any(target_os = "android", test))]
 use std::path::PathBuf;
 use std::slice;
+#[cfg(any(target_os = "android", test))]
+use std::sync::atomic::Ordering;
 #[cfg(any(target_os = "android", test))]
 use std::sync::{Arc, Mutex, OnceLock};
 #[cfg(any(target_os = "android", test))]
@@ -410,6 +413,12 @@ struct AndroidSessionSnapshot {
     inbound_packets: u64,
     outbound_bytes: u64,
     inbound_bytes: u64,
+    /// Aggregate bytes relayed for others by this session's provider
+    /// legs, read live from the peer-share runtime (up = consumer ->
+    /// server, down = server -> consumer). A shared atomic pair, not a
+    /// copied counter, so the JSON always reflects the current totals.
+    /// Zero when peer-share never provided (consumer-only or disabled).
+    relay_stats: Arc<PeerShareRelayStats>,
     /// Unix timestamp in milliseconds when the session reached "connected".
     connected_at_ms: u64,
     last_error: Option<String>,
@@ -672,7 +681,7 @@ fn snapshot_json(snapshot: &AndroidSessionSnapshot) -> String {
         .join(",");
 
     format!(
-        "{{\"state\":\"{}\",\"serverAddress\":\"{}\",\"activeTransport\":\"{}\",\"transportCount\":{},\"peerRelayCount\":{},\"outboundPackets\":{},\"inboundPackets\":{},\"outboundBytes\":{},\"inboundBytes\":{},\"connectedAtMs\":{},\"lastError\":{},\"peerShareError\":{},\"interception\":{},\"paths\":[{}]}}",
+        "{{\"state\":\"{}\",\"serverAddress\":\"{}\",\"activeTransport\":\"{}\",\"transportCount\":{},\"peerRelayCount\":{},\"outboundPackets\":{},\"inboundPackets\":{},\"outboundBytes\":{},\"inboundBytes\":{},\"relayedUpBytes\":{},\"relayedDownBytes\":{},\"connectedAtMs\":{},\"lastError\":{},\"peerShareError\":{},\"interception\":{},\"paths\":[{}]}}",
         escape_json(&snapshot.state),
         escape_json(&snapshot.server_address),
         escape_json(&snapshot.active_transport),
@@ -682,6 +691,14 @@ fn snapshot_json(snapshot: &AndroidSessionSnapshot) -> String {
         snapshot.inbound_packets,
         snapshot.outbound_bytes,
         snapshot.inbound_bytes,
+        snapshot
+            .relay_stats
+            .relayed_up_bytes
+            .load(Ordering::Relaxed),
+        snapshot
+            .relay_stats
+            .relayed_down_bytes
+            .load(Ordering::Relaxed),
         snapshot.connected_at_ms,
         last_error,
         peer_share_error,
@@ -1166,6 +1183,7 @@ fn start_android_session(
         inbound_packets: 0,
         outbound_bytes: 0,
         inbound_bytes: 0,
+        relay_stats: Arc::new(PeerShareRelayStats::default()),
         connected_at_ms: 0,
         last_error: None,
         peer_share_error: None,
@@ -1429,7 +1447,16 @@ fn start_android_session(
                     Some(peer_runtime::ProviderPathSource::Live(path_addresses.clone())),
                 )
                 .await {
-                    Ok(runtime) => Some(runtime),
+                    Ok(runtime) => {
+                        // Hand the runtime's live relay counters to the
+                        // snapshot so the app can show what others used
+                        // through this phone's paths.
+                        let relay_stats = runtime.relay_stats();
+                        update_snapshot(&worker_snapshot, |session_snapshot| {
+                            session_snapshot.relay_stats = relay_stats;
+                        });
+                        Some(runtime)
+                    }
                     Err(err) => {
                         // Peer-share is an enhancement, not the session itself:
                         // degrade to a direct-paths-only session instead of

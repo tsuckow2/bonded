@@ -118,6 +118,10 @@ class SessionStatus {
   final int peerRelayCount;
   final int outboundBytes;
   final int inboundBytes;
+  /// Bytes relayed for others by this session's provider legs:
+  /// up = consumer -> server, down = server -> consumer.
+  final int relayedUpBytes;
+  final int relayedDownBytes;
   final int connectedAtMs;
   final String? lastError;
   final String? peerShareError;
@@ -135,6 +139,8 @@ class SessionStatus {
     required this.peerRelayCount,
     required this.outboundBytes,
     required this.inboundBytes,
+    required this.relayedUpBytes,
+    required this.relayedDownBytes,
     required this.connectedAtMs,
     required this.lastError,
     required this.peerShareError,
@@ -153,6 +159,8 @@ class SessionStatus {
     peerRelayCount: 0,
     outboundBytes: 0,
     inboundBytes: 0,
+    relayedUpBytes: 0,
+    relayedDownBytes: 0,
     connectedAtMs: 0,
     lastError: null,
     peerShareError: null,
@@ -178,6 +186,8 @@ class SessionStatus {
       peerRelayCount: (map['peerRelayCount'] as num?)?.toInt() ?? 0,
       outboundBytes: (map['outboundBytes'] as num?)?.toInt() ?? 0,
       inboundBytes: (map['inboundBytes'] as num?)?.toInt() ?? 0,
+      relayedUpBytes: (map['relayedUpBytes'] as num?)?.toInt() ?? 0,
+      relayedDownBytes: (map['relayedDownBytes'] as num?)?.toInt() ?? 0,
       connectedAtMs: (map['connectedAtMs'] as num?)?.toInt() ?? 0,
       lastError: nonEmpty(map['lastError']),
       peerShareError: nonEmpty(map['peerShareError']),

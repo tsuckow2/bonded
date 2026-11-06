@@ -36,6 +36,10 @@ data class SessionSnapshot(
         val inboundPackets: Long,
         val outboundBytes: Long,
         val inboundBytes: Long,
+        /** Bytes relayed for others, consumer -> server. */
+        val relayedUpBytes: Long,
+        /** Bytes relayed for others, server -> consumer. */
+        val relayedDownBytes: Long,
         val connectedAtMs: Long,
         val lastError: String?,
         val peerShareError: String? = null,
@@ -740,6 +744,8 @@ class BondedVpnService : VpnService() {
                     inboundPackets = json.optLong("inboundPackets", 0),
                     outboundBytes = json.optLong("outboundBytes", 0),
                     inboundBytes = json.optLong("inboundBytes", 0),
+                    relayedUpBytes = json.optLong("relayedUpBytes", 0),
+                    relayedDownBytes = json.optLong("relayedDownBytes", 0),
                     connectedAtMs = json.optLong("connectedAtMs", 0),
                     lastError =
                             json.optString("lastError").takeIf { it.isNotBlank() && it != "null" },
@@ -1527,6 +1533,8 @@ class BondedVpnService : VpnService() {
                     "inboundPackets" to snapshot.inboundPackets,
                     "outboundBytes" to snapshot.outboundBytes,
                     "inboundBytes" to snapshot.inboundBytes,
+                    "relayedUpBytes" to snapshot.relayedUpBytes,
+                    "relayedDownBytes" to snapshot.relayedDownBytes,
                     "connectedAtMs" to snapshot.connectedAtMs,
                     "lastError" to snapshot.lastError,
                     "peerShareError" to snapshot.peerShareError,

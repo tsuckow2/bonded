@@ -4,6 +4,8 @@ use bonded_core::peer_share::{PeerRelayRegistration, SignedPeerShareIntroduction
 use bonded_core::transport::{QuicTransport, Transport};
 use serde::Deserialize;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::select;
 
@@ -145,6 +147,20 @@ pub async fn connect_peer_relay(
     }
 }
 
+/// Aggregate bytes relayed for other consumers while this phone acts
+/// as a peer-share provider. One shared instance covers all relay legs
+/// (a consumer with several provider paths holds several legs); the
+/// FFI snapshot reads it live when serializing, so no periodic copy
+/// is needed. Counts session-frame payload bytes — the unit the pump
+/// throttles on — not wire bytes.
+#[derive(Debug, Default)]
+pub struct PeerShareRelayStats {
+    /// Bytes forwarded peer -> upstream (consumer -> server).
+    pub relayed_up_bytes: AtomicU64,
+    /// Bytes forwarded upstream -> peer (server -> consumer).
+    pub relayed_down_bytes: AtomicU64,
+}
+
 /// Outcome of dialing a peer relay: either the provider accepted the
 /// leg, or it has no free provider path left for this consumer (the
 /// dial-until-reject stop signal: the consumer already holds a leg for
@@ -173,7 +189,11 @@ pub async fn accept_peer_relay(
     })
 }
 
-pub async fn relay_peer_frames<A, B>(peer: &mut A, upstream: &mut B) -> anyhow::Result<()>
+pub async fn relay_peer_frames<A, B>(
+    peer: &mut A,
+    upstream: &mut B,
+    stats: &PeerShareRelayStats,
+) -> anyhow::Result<()>
 where
     A: Transport,
     B: Transport,
@@ -189,11 +209,13 @@ where
                         return Err(e.into());
                     }
                 };
+                let len = frame.payload.len() as u64;
                 debug!(flags = frame.header.flags, payload_len = frame.payload.len(), seq = frame.header.sequence, "relay: peer->upstream forwarding frame");
                 if let Err(e) = upstream.send(frame).await {
                     warn!(error = %e, "relay: upstream send failed");
                     return Err(e.into());
                 }
+                stats.relayed_up_bytes.fetch_add(len, Ordering::Relaxed);
             }
             upstream_frame = upstream.recv() => {
                 let frame = match upstream_frame {
@@ -203,11 +225,13 @@ where
                         return Err(e.into());
                     }
                 };
+                let len = frame.payload.len() as u64;
                 debug!(flags = frame.header.flags, payload_len = frame.payload.len(), seq = frame.header.sequence, "relay: upstream->peer forwarding frame");
                 if let Err(e) = peer.send(frame).await {
                     warn!(error = %e, "relay: peer send failed");
                     return Err(e.into());
                 }
+                stats.relayed_down_bytes.fetch_add(len, Ordering::Relaxed);
             }
         }
     }
@@ -251,11 +275,14 @@ impl PeerRelayRateLimiter {
 }
 
 /// Relay frames between peer and upstream with an optional bandwidth cap
-/// applied in both directions.
+/// applied in both directions. Successfully forwarded payload bytes are
+/// counted into `stats` (up = consumer -> server, down = server ->
+/// consumer) so the app can show what others used through this phone.
 pub async fn relay_peer_frames_rate_limited<A, B>(
     peer: &mut A,
     upstream: &mut B,
     limiter: &mut PeerRelayRateLimiter,
+    stats: &PeerShareRelayStats,
 ) -> anyhow::Result<()>
 where
     A: Transport,
@@ -273,11 +300,13 @@ where
                         return Err(e.into());
                     }
                 };
-                limiter.throttle(frame.payload.len()).await;
+                let len = frame.payload.len();
+                limiter.throttle(len).await;
                 if let Err(e) = upstream.send(frame).await {
                     warn!(error = %e, "relay: upstream send failed");
                     return Err(e.into());
                 }
+                stats.relayed_up_bytes.fetch_add(len as u64, Ordering::Relaxed);
             }
             upstream_frame = upstream.recv() => {
                 let frame = match upstream_frame {
@@ -287,11 +316,13 @@ where
                         return Err(e.into());
                     }
                 };
-                limiter.throttle(frame.payload.len()).await;
+                let len = frame.payload.len();
+                limiter.throttle(len).await;
                 if let Err(e) = peer.send(frame).await {
                     warn!(error = %e, "relay: peer send failed");
                     return Err(e.into());
                 }
+                stats.relayed_down_bytes.fetch_add(len as u64, Ordering::Relaxed);
             }
         }
     }
@@ -339,9 +370,10 @@ fn parse_peer_endpoint(endpoint: &str) -> anyhow::Result<SocketAddr> {
 mod tests {
     use super::{
         accept_peer_relay, connect_peer_relay, parse_relay_accept_response,
-        register_peer_relay_upstream, relay_peer_frames, verify_consumer_introduction,
-        verify_provider_introduction, AcceptedPeerRelay, PeerListenerIdentity, PeerRelayDial,
-        PeerRelayRateLimiter, RelayAcceptVerdict,
+        register_peer_relay_upstream, relay_peer_frames, relay_peer_frames_rate_limited,
+        verify_consumer_introduction, verify_provider_introduction, AcceptedPeerRelay,
+        PeerListenerIdentity, PeerRelayDial, PeerRelayRateLimiter, PeerShareRelayStats,
+        RelayAcceptVerdict,
     };
     use bonded_core::auth::{sign_bytes, DeviceKeypair};
     use bonded_core::peer_share::{
@@ -353,6 +385,7 @@ mod tests {
     use quinn::ServerConfig as QuicServerConfig;
     use rcgen::generate_simple_self_signed;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use std::sync::atomic::Ordering;
     use std::time::{SystemTime, UNIX_EPOCH};
     use std::{sync::Arc, time::Duration};
     use tokio::sync::mpsc;
@@ -636,9 +669,10 @@ mod tests {
                 .await
                 .expect("provider should send accept response");
             let mut upstream = provider_upstream;
+            let relay_stats = PeerShareRelayStats::default();
             let relay_result = timeout(
                 Duration::from_secs(5),
-                relay_peer_frames(&mut peer, &mut upstream),
+                relay_peer_frames(&mut peer, &mut upstream, &relay_stats),
             )
             .await
             .expect("relay loop should stay active during exchange");
@@ -699,6 +733,72 @@ mod tests {
         provider_task
             .await
             .expect("provider relay task should join");
+    }
+
+    #[tokio::test]
+    async fn relay_pump_counts_forwarded_bytes_both_directions() {
+        let (mut peer, mut peer_control) = MockTransport::new(TransportKind::Quic);
+        let (mut upstream, mut upstream_control) =
+            MockTransport::new(TransportKind::NaiveTcp);
+        let stats = Arc::new(PeerShareRelayStats::default());
+        let pump_stats = Arc::clone(&stats);
+        let mut limiter = PeerRelayRateLimiter::unlimited();
+        let pump = tokio::spawn(async move {
+            relay_peer_frames_rate_limited(&mut peer, &mut upstream, &mut limiter, &pump_stats)
+                .await
+        });
+
+        // Consumer -> server: 19 payload bytes.
+        peer_control
+            .send_inbound(SessionFrame {
+                header: SessionHeader {
+                    connection_id: 1,
+                    sequence: 0,
+                    flags: 0,
+                },
+                payload: Bytes::from_static(b"forward-to-upstream"),
+            })
+            .expect("peer should accept injected frame");
+        let forwarded = timeout(Duration::from_secs(5), upstream_control.recv_sent())
+            .await
+            .expect("upstream recv should not time out")
+            .expect("upstream should receive forwarded frame");
+        assert_eq!(
+            forwarded.payload,
+            Bytes::from_static(b"forward-to-upstream")
+        );
+
+        // Server -> consumer: 18 payload bytes.
+        upstream_control
+            .send_inbound(SessionFrame {
+                header: SessionHeader {
+                    connection_id: 1,
+                    sequence: 1,
+                    flags: 0,
+                },
+                payload: Bytes::from_static(b"return-to-consumer"),
+            })
+            .expect("upstream should accept injected reply frame");
+        let response = timeout(Duration::from_secs(5), peer_control.recv_sent())
+            .await
+            .expect("peer recv should not time out")
+            .expect("peer should receive relayed reply frame");
+        assert_eq!(response.payload, Bytes::from_static(b"return-to-consumer"));
+
+        assert_eq!(stats.relayed_up_bytes.load(Ordering::Relaxed), 19);
+        assert_eq!(stats.relayed_down_bytes.load(Ordering::Relaxed), 18);
+
+        // Closing both channels ends the pump; the counters hold their
+        // final values afterwards.
+        drop(peer_control);
+        drop(upstream_control);
+        let pump_result = timeout(Duration::from_secs(5), pump)
+            .await
+            .expect("pump should stop")
+            .expect("pump task should join");
+        assert!(pump_result.is_err(), "pump should end once channels close");
+        assert_eq!(stats.relayed_up_bytes.load(Ordering::Relaxed), 19);
+        assert_eq!(stats.relayed_down_bytes.load(Ordering::Relaxed), 18);
     }
 
     #[tokio::test]

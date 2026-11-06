@@ -48,6 +48,14 @@ class _HomeScreenState extends State<HomeScreen> {
   int? _lastOutBytes;
   DateTime? _lastSampleAt;
 
+  // Live relayed-for-others rate, sampled the same way: latest 1s
+  // delta of the relayed byte totals (up = toward server, down =
+  // toward peer). Reset with the own-rate state below.
+  int? _lastRelayedUpBytes;
+  int? _lastRelayedDownBytes;
+  double _relayedUpRate = 0;
+  double _relayedDownRate = 0;
+
   @override
   void initState() {
     super.initState();
@@ -140,6 +148,10 @@ class _HomeScreenState extends State<HomeScreen> {
       _lastInBytes = null;
       _lastOutBytes = null;
       _lastSampleAt = null;
+      _lastRelayedUpBytes = null;
+      _lastRelayedDownBytes = null;
+      _relayedUpRate = 0;
+      _relayedDownRate = 0;
       return;
     }
     if (status.connectedAtMs != _sampledConnectedAtMs) {
@@ -149,6 +161,10 @@ class _HomeScreenState extends State<HomeScreen> {
       _lastInBytes = null;
       _lastOutBytes = null;
       _lastSampleAt = null;
+      _lastRelayedUpBytes = null;
+      _lastRelayedDownBytes = null;
+      _relayedUpRate = 0;
+      _relayedDownRate = 0;
     }
     final now = DateTime.now();
     if (_lastInBytes != null && _lastSampleAt != null) {
@@ -163,11 +179,21 @@ class _HomeScreenState extends State<HomeScreen> {
         final rtt = status.activePath?.lastRttMs ?? 0;
         _rttSamples.add(rtt.toDouble());
         if (_rttSamples.length > 180) _rttSamples.removeAt(0);
+        if (_lastRelayedUpBytes != null && _lastRelayedDownBytes != null) {
+          final relayedUp =
+              (status.relayedUpBytes - _lastRelayedUpBytes!) / dt;
+          final relayedDown =
+              (status.relayedDownBytes - _lastRelayedDownBytes!) / dt;
+          _relayedUpRate = relayedUp < 0 ? 0 : relayedUp;
+          _relayedDownRate = relayedDown < 0 ? 0 : relayedDown;
+        }
       }
     }
     _lastInBytes = status.inboundBytes;
     _lastOutBytes = status.outboundBytes;
     _lastSampleAt = now;
+    _lastRelayedUpBytes = status.relayedUpBytes;
+    _lastRelayedDownBytes = status.relayedDownBytes;
   }
 
   void _maybeAutoConnect() {
@@ -597,6 +623,10 @@ class _HomeScreenState extends State<HomeScreen> {
             _buildTotalsRow(),
             const SizedBox(height: 16),
             _buildPathsCard(),
+            if (_status.relayedUpBytes + _status.relayedDownBytes > 0) ...[
+              const SizedBox(height: 16),
+              _buildRelayedCard(),
+            ],
             const SizedBox(height: 16),
             _buildPeerCard(),
             const SizedBox(height: 16),
@@ -670,6 +700,98 @@ class _HomeScreenState extends State<HomeScreen> {
               ),
             for (final path in paths) _PathRow(status: _status, path: path),
           ],
+        ),
+      ),
+    );
+  }
+
+  /// Aggregate bandwidth others used through this phone's paths while
+  /// it acted as a peer-share provider: totals plus the live rate,
+  /// same ↓/↑ orientation as the Totals row (up = toward the server,
+  /// down = toward the peer). Shown only once anything has been
+  /// relayed this session. One FocusableRow stop for the whole card,
+  /// like the graphs card, so D-pad focus can scroll it into view on
+  /// a TV without adding a stop per line.
+  Widget _buildRelayedCard() {
+    return FocusableRow(
+      child: Card(
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  const Text(
+                    'Relayed for others',
+                    style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
+                  ),
+                  const Spacer(),
+                  Text(
+                    '↓ ${_fmtRate(_relayedDownRate)}  ↑ ${_fmtRate(_relayedUpRate)}',
+                    style: TextStyle(color: Colors.grey[700], fontSize: 13),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 12),
+              Row(
+                children: [
+                  Expanded(
+                    child: Column(
+                      children: [
+                        const Icon(
+                          Icons.arrow_downward,
+                          size: 18,
+                          color: Colors.teal,
+                        ),
+                        const SizedBox(height: 4),
+                        Text(
+                          _fmtBytes(_status.relayedDownBytes),
+                          style: const TextStyle(
+                            fontSize: 16,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                        Text(
+                          'To peers',
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: Colors.grey[600],
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  Expanded(
+                    child: Column(
+                      children: [
+                        const Icon(
+                          Icons.arrow_upward,
+                          size: 18,
+                          color: Colors.teal,
+                        ),
+                        const SizedBox(height: 4),
+                        Text(
+                          _fmtBytes(_status.relayedUpBytes),
+                          style: const TextStyle(
+                            fontSize: 16,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                        Text(
+                          'To server',
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: Colors.grey[600],
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
         ),
       ),
     );
