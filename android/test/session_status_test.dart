@@ -27,6 +27,9 @@ void main() {
           'wireTxBytes': 120,
           'wireRxBytes': 110,
           'quicPingFrames': 7,
+          'quicLostPackets': 3,
+          'quicLostBytes': 3600,
+          'quicSentPackets': 100,
           'lastRttMs': 12,
         },
         <String, dynamic>{
@@ -49,6 +52,18 @@ void main() {
     expect(status.paths[0].wireRxBytes, 110);
     expect(status.paths[1].wireTxBytes, isNull);
     expect(status.paths[1].wireRxBytes, isNull);
+    expect(status.paths[0].quicLostPackets, 3);
+    expect(status.paths[0].quicLostBytes, 3600);
+    expect(status.paths[0].quicSentPackets, 100);
+    expect(status.paths[1].quicLostPackets, isNull);
+    expect(status.paths[1].quicLostBytes, isNull);
+    expect(status.paths[1].quicSentPackets, isNull);
+    expect(status.paths[0].lossRate, closeTo(0.03, 1e-9));
+    expect(status.paths[0].lossDisplay, '3.0%');
+    expect(status.paths[1].lossRate, isNull);
+    expect(status.paths[1].lossDisplay, '—');
+    expect(status.lossRate, closeTo(0.03, 1e-9));
+    expect(status.lossDisplay, '3.0%');
 
     // An older snapshot without the keys still parses, with zeros.
     final legacy = SessionStatus.fromMap(<String, dynamic>{
@@ -63,5 +78,29 @@ void main() {
     expect(legacy.paths[0].quicPingFrames, isNull);
     expect(legacy.paths[0].wireTxBytes, isNull);
     expect(legacy.paths[0].wireRxBytes, isNull);
+    expect(legacy.paths[0].quicLostPackets, isNull);
+    expect(legacy.paths[0].lossRate, isNull);
+    expect(legacy.paths[0].lossDisplay, '—');
+    expect(legacy.lossRate, isNull);
+    expect(legacy.lossDisplay, '—');
+  });
+
+  test('loss rate is null while nothing has been sent', () {
+    final status = SessionStatus.fromMap(<String, dynamic>{
+      'state': 'connected',
+      'paths': <Map<String, dynamic>>[
+        <String, dynamic>{
+          'pathIndex': 0,
+          'kind': 'QUIC',
+          'active': true,
+          'quicLostPackets': 0,
+          'quicLostBytes': 0,
+          'quicSentPackets': 0,
+        },
+      ],
+    });
+    expect(status.paths[0].lossRate, isNull);
+    expect(status.paths[0].lossDisplay, '—');
+    expect(status.lossRate, isNull);
   });
 }

@@ -27,6 +27,16 @@ class PathStat {
   /// counter; a re-dialed path restarts from zero.
   final int? quicPingFrames;
 
+  /// QUIC packets lost / bytes lost / packets sent on this path's
+  /// connection (quinn `path.lost_packets` / `path.lost_bytes` /
+  /// `path.sent_packets`, cumulative). Null when the transport cannot
+  /// observe loss — only QUIC counts it (a lost QUIC packet is
+  /// retransmitted by quinn, so `lost_packets` is effectively the
+  /// retransmit count). A re-dialed path restarts from zero.
+  final int? quicLostPackets;
+  final int? quicLostBytes;
+  final int? quicSentPackets;
+
   /// "IP:port" source address the server sees for this path's
   /// connection, reported in its heartbeat pongs; null until reported
   /// (older servers never report one).
@@ -50,6 +60,9 @@ class PathStat {
     required this.serverSeenAddress,
     this.peerId,
     this.quicPingFrames,
+    this.quicLostPackets,
+    this.quicLostBytes,
+    this.quicSentPackets,
   });
 
   factory PathStat.fromMap(Map<dynamic, dynamic> map) {
@@ -64,6 +77,9 @@ class PathStat {
       wireRxBytes: (map['wireRxBytes'] as num?)?.toInt(),
       lastRttMs: (map['lastRttMs'] as num?)?.toInt() ?? 0,
       quicPingFrames: (map['quicPingFrames'] as num?)?.toInt(),
+      quicLostPackets: (map['quicLostPackets'] as num?)?.toInt(),
+      quicLostBytes: (map['quicLostBytes'] as num?)?.toInt(),
+      quicSentPackets: (map['quicSentPackets'] as num?)?.toInt(),
       serverSeenAddress:
           (map['serverSeenAddress'] as String?)?.trim().isNotEmpty == true
           ? map['serverSeenAddress'] as String
@@ -75,6 +91,24 @@ class PathStat {
   }
 
   bool get isDirect => pathIndex != null;
+
+  /// Packet-loss rate for this path (lost / sent), or null when the
+  /// transport cannot observe loss (non-QUIC) or nothing has been
+  /// sent yet.
+  double? get lossRate {
+    final lost = quicLostPackets;
+    final sent = quicSentPackets;
+    if (lost == null || sent == null || sent <= 0) return null;
+    return lost / sent;
+  }
+
+  /// Display form of [lossRate]: "0.5%" with one decimal, or "—"
+  /// when no rate exists. Never a fabricated number.
+  String get lossDisplay {
+    final rate = lossRate;
+    if (rate == null) return '—';
+    return '${(rate * 100).toStringAsFixed(1)}%';
+  }
 
   /// True for peer-relay transports. Relays are full transports for
   /// spreading and failover; they are only listed separately in the
@@ -252,6 +286,33 @@ class SessionStatus {
       if (path.active) return path;
     }
     return null;
+  }
+
+  /// Session-wide packet-loss rate: total lost / total sent over
+  /// the paths that observe loss, or null when none do or nothing
+  /// has been sent yet.
+  double? get lossRate {
+    var lost = 0;
+    var sent = 0;
+    var any = false;
+    for (final path in paths) {
+      final l = path.quicLostPackets;
+      final s = path.quicSentPackets;
+      if (l != null && s != null) {
+        lost += l;
+        sent += s;
+        any = true;
+      }
+    }
+    if (!any || sent <= 0) return null;
+    return lost / sent;
+  }
+
+  /// Display form of [lossRate], same shape as [PathStat.lossDisplay].
+  String get lossDisplay {
+    final rate = lossRate;
+    if (rate == null) return '—';
+    return '${(rate * 100).toStringAsFixed(1)}%';
   }
 
   /// Human (label, address) for a path's network from its summary,

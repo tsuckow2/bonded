@@ -91,6 +91,17 @@ data class SessionPathStat(
          * observe them (WebSocketTls); a re-dialed path restarts
          * from zero. Wakeup accounting for the profiler. */
         val quicPingFrames: Long? = null,
+        /** QUIC packets lost / bytes lost / packets sent on this
+         * path's connection (quinn `path.lost_packets` /
+         * `path.lost_bytes` / `path.sent_packets`, cumulative). Null
+         * when the transport cannot observe loss — only QUIC counts
+         * it (a lost QUIC packet is retransmitted by quinn, so
+         * `lost_packets` is effectively the retransmit count). Loss
+         * rate = lost / sent; no rate while sent is zero. A
+         * re-dialed path restarts from zero. */
+        val quicLostPackets: Long? = null,
+        val quicLostBytes: Long? = null,
+        val quicSentPackets: Long? = null,
 )
 
 /** Parse the native snapshot's per-path stats (transport-vec order).
@@ -130,6 +141,15 @@ internal fun parseSessionPaths(array: JSONArray?): List<SessionPathStat> {
                         quicPingFrames =
                                 if (item.isNull("quicPingFrames")) null
                                 else item.optLong("quicPingFrames", 0),
+                        quicLostPackets =
+                                if (item.isNull("quicLostPackets")) null
+                                else item.optLong("quicLostPackets", 0),
+                        quicLostBytes =
+                                if (item.isNull("quicLostBytes")) null
+                                else item.optLong("quicLostBytes", 0),
+                        quicSentPackets =
+                                if (item.isNull("quicSentPackets")) null
+                                else item.optLong("quicSentPackets", 0),
                 )
         )
     }
@@ -153,6 +173,9 @@ internal fun sessionPathStatToMap(path: SessionPathStat): Map<String, Any?> =
                 "serverSeenAddress" to path.serverSeenAddress,
                 "peerId" to path.peerId,
                 "quicPingFrames" to path.quicPingFrames,
+                "quicLostPackets" to path.quicLostPackets,
+                "quicLostBytes" to path.quicLostBytes,
+                "quicSentPackets" to path.quicSentPackets,
         )
 
 class BondedVpnService : VpnService() {

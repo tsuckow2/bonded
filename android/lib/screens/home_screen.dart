@@ -736,9 +736,19 @@ class _HomeScreenState extends State<HomeScreen> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Text(
-              'Paths',
-              style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
+            Row(
+              children: [
+                const Text(
+                  'Paths',
+                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
+                ),
+                const Spacer(),
+                if (_status.lossRate != null)
+                  Text(
+                    'loss ${_status.lossDisplay}',
+                    style: TextStyle(fontSize: 12, color: Colors.grey[700]),
+                  ),
+              ],
             ),
             const SizedBox(height: 8),
             if (paths.isEmpty)
@@ -1042,6 +1052,7 @@ class _PathRow extends StatelessWidget {
                     ?bindAddress,
                     path.kind,
                     if (path.lastRttMs > 0) '${path.lastRttMs} ms',
+                    'loss ${path.lossDisplay}',
                     '↓ ${_bytes(path.inboundBytes)} · ↑ ${_bytes(path.outboundBytes)}',
                   ].join(' · '),
                   style: TextStyle(fontSize: 12, color: Colors.grey[700]),
@@ -1185,6 +1196,7 @@ class _PeerRow extends StatelessWidget {
                     [
                       path.kind,
                       if (path.lastRttMs > 0) '${path.lastRttMs} ms',
+                      'loss ${path.lossDisplay}',
                       '↓ ${_PathRow._bytes(path.inboundBytes)} · ↑ ${_PathRow._bytes(path.outboundBytes)}',
                     ].join(' · '),
                     style: TextStyle(fontSize: 12, color: Colors.grey[700]),

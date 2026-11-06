@@ -120,6 +120,17 @@ pub struct WireStats {
     /// no PING frames; session heartbeat PINGs are counted separately
     /// at session level, not here).
     pub ping_frames_tx: u64,
+    /// QUIC packets lost / bytes lost / packets sent on this connection
+    /// (quinn `path.lost_packets` / `path.lost_bytes` /
+    /// `path.sent_packets`), cumulative. `None` for transports that
+    /// cannot observe loss: only QUIC counts it — a lost QUIC packet
+    /// is retransmitted by quinn, so `lost_packets` is effectively the
+    /// retransmit count. TCP and WireGuard have no such counter, and
+    /// WebSocketTls reports no wire stats at all. The loss rate is
+    /// lost / sent; no rate exists while sent is zero.
+    pub quic_lost_packets: Option<u64>,
+    pub quic_lost_bytes: Option<u64>,
+    pub quic_sent_packets: Option<u64>,
 }
 
 #[async_trait]
@@ -364,6 +375,11 @@ impl Transport for NaiveTcpTransport {
             tx_bytes: self.wire_tx_bytes,
             rx_bytes: self.wire_rx_bytes,
             ping_frames_tx: 0,
+            // TCP retransmits exist in the kernel (TCP_INFO) but this
+            // transport does not read them; loss is QUIC-only (4.49).
+            quic_lost_packets: None,
+            quic_lost_bytes: None,
+            quic_sent_packets: None,
         })
     }
 }
@@ -589,6 +605,12 @@ impl Transport for QuicTransport {
             tx_bytes: stats.udp_tx.bytes,
             rx_bytes: stats.udp_rx.bytes,
             ping_frames_tx: stats.frame_tx.ping,
+            // quinn counts loss per path; a lost packet is
+            // retransmitted, so lost_packets is effectively the
+            // retransmit count. Loss rate = lost / sent.
+            quic_lost_packets: Some(stats.path.lost_packets),
+            quic_lost_bytes: Some(stats.path.lost_bytes),
+            quic_sent_packets: Some(stats.path.sent_packets),
         })
     }
 }
@@ -793,10 +815,40 @@ mod tests {
             tx_bytes: 10,
             rx_bytes: 20,
             ping_frames_tx: 7,
+            quic_lost_packets: None,
+            quic_lost_bytes: None,
+            quic_sent_packets: None,
         };
         assert_eq!(stats.ping_frames_tx, 7);
         assert_eq!(stats.tx_bytes, 10);
         assert_eq!(stats.rx_bytes, 20);
+    }
+
+    #[test]
+    fn wire_stats_quic_loss_defaults_to_none() {
+        // QUIC loss is read live from quinn (`path.lost_packets` /
+        // `path.lost_bytes` / `path.sent_packets`) in the QUIC
+        // transport's `wire_stats`; a live-connection test is not
+        // possible in this sandbox (UDP is blocked, like the existing
+        // QUIC tests), so this pins the field's default and shape
+        // instead: a fresh connection reports no loss counters, and
+        // a literal round-trips.
+        use super::WireStats;
+        let default = WireStats::default();
+        assert_eq!(default.quic_lost_packets, None);
+        assert_eq!(default.quic_lost_bytes, None);
+        assert_eq!(default.quic_sent_packets, None);
+        let stats = WireStats {
+            tx_bytes: 10,
+            rx_bytes: 20,
+            ping_frames_tx: 7,
+            quic_lost_packets: Some(3),
+            quic_lost_bytes: Some(3600),
+            quic_sent_packets: Some(100),
+        };
+        assert_eq!(stats.quic_lost_packets, Some(3));
+        assert_eq!(stats.quic_lost_bytes, Some(3600));
+        assert_eq!(stats.quic_sent_packets, Some(100));
     }
 
     #[tokio::test]
@@ -1245,6 +1297,11 @@ impl Transport for WireGuardTransport {
             tx_bytes: self.wire_tx_bytes,
             rx_bytes: self.wire_rx_bytes,
             ping_frames_tx: 0,
+            // WireGuard has no retransmits and boringtun counts no
+            // loss; loss is QUIC-only (4.49).
+            quic_lost_packets: None,
+            quic_lost_bytes: None,
+            quic_sent_packets: None,
         })
     }
 }

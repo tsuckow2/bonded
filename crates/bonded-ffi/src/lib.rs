@@ -498,6 +498,17 @@ struct AndroidPathStat {
     /// transport cannot observe them (same rule as the wire bytes).
     /// Read live from the transport like the wire bytes.
     quic_ping_frames: Option<u64>,
+    /// QUIC packets lost / bytes lost / packets sent on this path's
+    /// connection (quinn `path.lost_packets` / `path.lost_bytes` /
+    /// `path.sent_packets`, cumulative). `None` when the transport
+    /// cannot observe loss — only QUIC counts it (a lost QUIC packet
+    /// is retransmitted by quinn, so `lost_packets` is effectively
+    /// the retransmit count). Loss rate = lost / sent; no rate while
+    /// sent is zero. Read live from the transport like the wire
+    /// bytes; a re-dialed path restarts from zero.
+    quic_lost_packets: Option<u64>,
+    quic_lost_bytes: Option<u64>,
+    quic_sent_packets: Option<u64>,
     /// Most recent heartbeat RTT in ms (0 = none measured yet). All
     /// paths are pinged on the same tick, so a pong's arrival transport
     /// identifies the path its RTT belongs to.
@@ -692,8 +703,20 @@ fn snapshot_json(snapshot: &AndroidSessionSnapshot) -> String {
                 .quic_ping_frames
                 .map(|frames| frames.to_string())
                 .unwrap_or_else(|| "null".to_owned());
+            let quic_lost_packets = stat
+                .quic_lost_packets
+                .map(|packets| packets.to_string())
+                .unwrap_or_else(|| "null".to_owned());
+            let quic_lost_bytes = stat
+                .quic_lost_bytes
+                .map(|bytes| bytes.to_string())
+                .unwrap_or_else(|| "null".to_owned());
+            let quic_sent_packets = stat
+                .quic_sent_packets
+                .map(|packets| packets.to_string())
+                .unwrap_or_else(|| "null".to_owned());
             format!(
-                "{{\"pathIndex\":{},\"kind\":\"{}\",\"active\":{},\"paused\":{},\"outboundBytes\":{},\"inboundBytes\":{},\"wireTxBytes\":{},\"wireRxBytes\":{},\"quicPingFrames\":{},\"lastRttMs\":{},\"serverSeenAddress\":{},\"peerId\":{}}}",
+                "{{\"pathIndex\":{},\"kind\":\"{}\",\"active\":{},\"paused\":{},\"outboundBytes\":{},\"inboundBytes\":{},\"wireTxBytes\":{},\"wireRxBytes\":{},\"quicPingFrames\":{},\"quicLostPackets\":{},\"quicLostBytes\":{},\"quicSentPackets\":{},\"lastRttMs\":{},\"serverSeenAddress\":{},\"peerId\":{}}}",
                 path_index,
                 escape_json(&stat.kind),
                 stat.active,
@@ -703,6 +726,9 @@ fn snapshot_json(snapshot: &AndroidSessionSnapshot) -> String {
                 wire_tx,
                 wire_rx,
                 quic_ping_frames,
+                quic_lost_packets,
+                quic_lost_bytes,
+                quic_sent_packets,
                 stat.last_rtt_ms,
                 server_seen,
                 peer_id,
@@ -1122,6 +1148,11 @@ fn publish_path_stats(
                     // a re-dialed path restarts from zero, like the
                     // wire bytes.
                     quic_ping_frames: wire.map(|stats| stats.ping_frames_tx),
+                    // QUIC loss per path (None when the transport
+                    // cannot observe it — only QUIC counts loss).
+                    quic_lost_packets: wire.and_then(|stats| stats.quic_lost_packets),
+                    quic_lost_bytes: wire.and_then(|stats| stats.quic_lost_bytes),
+                    quic_sent_packets: wire.and_then(|stats| stats.quic_sent_packets),
                     last_rtt_ms: prior.map(|stat| stat.last_rtt_ms).unwrap_or(0),
                     server_seen_address: prior
                         .and_then(|stat| stat.server_seen_address.clone()),
@@ -2635,6 +2666,12 @@ fn start_android_session(
                                         wire.map(|stats| stats.rx_bytes);
                                     stat.quic_ping_frames =
                                         wire.map(|stats| stats.ping_frames_tx);
+                                    stat.quic_lost_packets =
+                                        wire.and_then(|stats| stats.quic_lost_packets);
+                                    stat.quic_lost_bytes =
+                                        wire.and_then(|stats| stats.quic_lost_bytes);
+                                    stat.quic_sent_packets =
+                                        wire.and_then(|stats| stats.quic_sent_packets);
                                 }
                             }
                         });
@@ -3599,6 +3636,9 @@ mod tests {
                     wire_tx_bytes: Some(120),
                     wire_rx_bytes: Some(110),
                     quic_ping_frames: Some(7),
+                    quic_lost_packets: Some(3),
+                    quic_lost_bytes: Some(3600),
+                    quic_sent_packets: Some(100),
                     last_rtt_ms: 12,
                     server_seen_address: None,
                     peer_id: None,
@@ -3613,6 +3653,9 @@ mod tests {
                     wire_tx_bytes: None,
                     wire_rx_bytes: None,
                     quic_ping_frames: None,
+                    quic_lost_packets: None,
+                    quic_lost_bytes: None,
+                    quic_sent_packets: None,
                     last_rtt_ms: 0,
                     server_seen_address: None,
                     peer_id: None,
@@ -3640,6 +3683,26 @@ mod tests {
         assert!(
             json.contains("\"quicPingFrames\":null"),
             "unmeasured QUIC ping frames should be null: {json}"
+        );
+        assert!(
+            json.contains("\"quicLostPackets\":3"),
+            "QUIC lost packets missing: {json}"
+        );
+        assert!(
+            json.contains("\"quicLostBytes\":3600"),
+            "QUIC lost bytes missing: {json}"
+        );
+        assert!(
+            json.contains("\"quicSentPackets\":100"),
+            "QUIC sent packets missing: {json}"
+        );
+        assert!(
+            json.contains("\"quicLostPackets\":null"),
+            "unmeasured QUIC lost packets should be null: {json}"
+        );
+        assert!(
+            json.contains("\"quicSentPackets\":null"),
+            "unmeasured QUIC sent packets should be null: {json}"
         );
     }
 
