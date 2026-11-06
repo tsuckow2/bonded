@@ -14,6 +14,7 @@ import java.net.Socket
 import java.net.Inet4Address
 import java.net.Inet6Address
 import java.net.NetworkInterface
+import java.util.concurrent.atomic.AtomicLong
 
 data class NetworkPathBinding(
         val transport: Int,
@@ -43,6 +44,14 @@ class AndroidNetworkPathManager(
     private val trackedNetworks = linkedMapOf<Network, NetworkPathBinding>()
     private val callbacks = mutableListOf<ConnectivityManager.NetworkCallback>()
     private var running = false
+
+    /** Wakeup accounting (battery profiler): every NetworkCallback
+     * invocation, including no-op capability flaps — the callback
+     * itself is the wakeup, whether or not the path set changed. */
+    private val callbackInvocations = AtomicLong(0)
+
+    /** Total NetworkCallback invocations since start(). */
+    fun callbackInvocationCount(): Long = callbackInvocations.get()
 
     fun start(): Int {
         if (connectivityManager == null) {
@@ -234,6 +243,7 @@ class AndroidNetworkPathManager(
         val callback =
                 object : ConnectivityManager.NetworkCallback() {
                     override fun onAvailable(network: Network) {
+                        callbackInvocations.incrementAndGet()
                         trackNetwork(network)
                     }
 
@@ -241,6 +251,7 @@ class AndroidNetworkPathManager(
                             network: Network,
                             networkCapabilities: NetworkCapabilities
                     ) {
+                        callbackInvocations.incrementAndGet()
                         trackNetwork(network, networkCapabilities)
                     }
 
@@ -248,6 +259,7 @@ class AndroidNetworkPathManager(
                             network: Network,
                             linkProperties: LinkProperties
                     ) {
+                        callbackInvocations.incrementAndGet()
                         // Address churn without a capability event — the
                         // CLAT interface appearing seconds after the network
                         // registers, IPv6 renumbering, an address being
@@ -257,6 +269,7 @@ class AndroidNetworkPathManager(
                     }
 
                     override fun onLost(network: Network) {
+                        callbackInvocations.incrementAndGet()
                         trackedNetworks.remove(network)
                         notifyPathCountChanged()
                     }

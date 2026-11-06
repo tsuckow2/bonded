@@ -1,7 +1,11 @@
 import 'package:flutter/material.dart';
 
+import '../widgets/battery_card.dart';
+
 /// Hub for the active diagnostic tools — the things you *run*, as opposed
 /// to the read-only session details. Each tool keeps its own page.
+/// The Battery card lives here (not on its own page): it is a live
+/// readout, not a tool to run, and it polls while this screen is open.
 class DiagnosticsScreen extends StatelessWidget {
   const DiagnosticsScreen({super.key});
 
@@ -35,6 +39,11 @@ class DiagnosticsScreen extends StatelessWidget {
             subtitle: const Text('On-device diagnostic log ring'),
             trailing: const Icon(Icons.arrow_forward),
             onTap: () => Navigator.of(context).pushNamed('/client-logs'),
+          ),
+          const Divider(),
+          const Padding(
+            padding: EdgeInsets.all(8),
+            child: BatteryCard(),
           ),
         ],
       ),

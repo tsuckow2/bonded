@@ -534,6 +534,12 @@ async fn run_peer_accept_loop(
         let relay_path_source = path_source.clone();
         let relay_count = active_relays.clone();
         let relay_stats = relay_stats.clone();
+        // Wakeup accounting (battery profiler): one relay task per
+        // accepted leg. Counted here, not in the pump, so a leg that
+        // fails before its first pump still counts as started.
+        relay_stats
+            .relay_tasks_started
+            .fetch_add(1, Ordering::Relaxed);
         tokio::spawn(async move {
             let mut peer = peer;
             // Resilience: if the upstream (provider->server) connection fails,
@@ -640,6 +646,12 @@ async fn run_peer_accept_loop(
                     );
                 }
             }
+            // Wakeup accounting (battery profiler). A task dropped
+            // mid-flight by runtime shutdown never reaches this line,
+            // so `ended` is a lower bound on started tasks.
+            relay_stats
+                .relay_tasks_ended
+                .fetch_add(1, Ordering::Relaxed);
         });
     }
 }

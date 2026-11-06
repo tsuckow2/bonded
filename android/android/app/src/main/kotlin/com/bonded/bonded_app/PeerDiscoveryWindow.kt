@@ -1,5 +1,7 @@
 package com.bonded.bonded_app
 
+import java.util.concurrent.atomic.AtomicLong
+
 /**
  * Windowed Wi-Fi multicast lock schedule for peer discovery.
  *
@@ -61,6 +63,14 @@ class PeerDiscoveryWindowScheduler(
     @Volatile private var burstUntilMs = 0L
     private var thread: Thread? = null
 
+    /** Wakeup accounting (battery profiler): windows opened since
+     * start() — one per acquire transition (burst, sweep, or
+     * top-of-minute window), not per second held. */
+    private val windowsOpened = AtomicLong(0)
+
+    /** Total discovery windows opened since start(). */
+    fun windowsOpenedCount(): Long = windowsOpened.get()
+
     /** Starts the schedule (idempotent; a restart re-arms the burst). */
     fun start() {
         burstUntilMs = System.currentTimeMillis() + PeerDiscoveryWindow.BURST_MS
@@ -109,6 +119,7 @@ class PeerDiscoveryWindowScheduler(
                     inBurst || inSweep || PeerDiscoveryWindow.isInWindow(now)
                 if (want && !held) {
                     acquire()
+                    windowsOpened.incrementAndGet()
                     held = true
                 }
                 if (!want && held) {

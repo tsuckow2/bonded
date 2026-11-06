@@ -40,6 +40,13 @@ data class SessionSnapshot(
         val relayedUpBytes: Long,
         /** Bytes relayed for others, server -> consumer. */
         val relayedDownBytes: Long,
+        /** Session heartbeat PINGs sent by the native worker (all
+         * paths, all ticks). Wakeup accounting for the profiler. */
+        val heartbeatPingsSent: Long = 0,
+        /** Relay pump tasks started / ended (one per accepted leg).
+         * Wakeup accounting for the profiler. */
+        val relayTasksStarted: Long = 0,
+        val relayTasksEnded: Long = 0,
         val connectedAtMs: Long,
         val lastError: String?,
         val peerShareError: String? = null,
@@ -73,6 +80,11 @@ data class SessionPathStat(
         val serverSeenAddress: String?,
         /** Provider device key for peer-relay transports; null for direct transports. */
         val peerId: String? = null,
+        /** QUIC PING frames sent on this path's connection (quinn
+         * frame_tx.ping, cumulative). Null when the transport cannot
+         * observe them (WebSocketTls); a re-dialed path restarts
+         * from zero. Wakeup accounting for the profiler. */
+        val quicPingFrames: Long? = null,
 )
 
 class BondedVpnService : VpnService() {
@@ -84,6 +96,16 @@ class BondedVpnService : VpnService() {
     private var multicastLock: WifiManager.MulticastLock? = null
     private var peerDiscoveryWindow: PeerDiscoveryWindowScheduler? = null
     private var activeDeviceId: String? = null
+
+    /** Battery profiler (plan 4.46): samples on the session
+     * monitor's existing tick. Created in onCreate so the history
+     * survives session restarts within one service lifetime. */
+    private var batteryProfiler: BatteryProfiler? = null
+
+    /** Whether peer sharing is enabled for the current session's
+     * server record — the profiler's peer-sharing tag. Set at
+     * session start; false when no session is running. */
+    private var peerShareEnabledForSession: Boolean = false
 
     @Volatile private var packetIoRunning = false
 
@@ -124,6 +146,9 @@ class BondedVpnService : VpnService() {
     override fun onCreate() {
         super.onCreate()
         activeInstance = this
+        if (batteryProfiler == null) {
+            batteryProfiler = BatteryProfiler(applicationContext)
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -200,6 +225,7 @@ class BondedVpnService : VpnService() {
         if (pairedServer.peerShareEnabled) {
             startPeerDiscoveryWindow()
         }
+        peerShareEnabledForSession = pairedServer.peerShareEnabled
 
         if (vpnInterface == null) {
             try {
@@ -353,6 +379,10 @@ class BondedVpnService : VpnService() {
 
         stopPacketIoLoop()
         stopSessionMonitor()
+        // Battery profiler: flush the open hour's aggregates so the
+        // history survives the shutdown (raw samples are not kept).
+        batteryProfiler?.persistAggregates()
+        peerShareEnabledForSession = false
         networkPathManager?.stop()
         networkPathManager = null
         lastNetworkBindingSignature = ""
@@ -680,6 +710,14 @@ class BondedVpnService : VpnService() {
                         val snapshot = getNativeSessionSnapshot()
                         if (snapshot != null) {
                             updateSessionSnapshot(snapshot)
+                            // Battery profiler (plan 4.46): sample on
+                            // this existing tick — no new timers or
+                            // wakeups. The profiler reads BatteryManager
+                            // / PowerManager / /proc and tags the sample
+                            // with the session context; a failure inside
+                            // sample() degrades that sample, never this
+                            // loop.
+                            sampleBatteryProfile(snapshot)
                             monitorTick += 1
                             if (monitorTick % 5L == 0L) {
                                 android.util.Log.i(
@@ -720,6 +758,25 @@ class BondedVpnService : VpnService() {
         lastEmittedSessionState = null
     }
 
+    /** One battery-profiler sample from a fresh native snapshot.
+     * Runs on the session-monitor thread, on its existing tick. */
+    private fun sampleBatteryProfile(snapshot: SessionSnapshot) {
+        val profiler = batteryProfiler ?: return
+        try {
+            profiler.sample(
+                    snapshot = snapshot,
+                    peerSharing = peerShareEnabledForSession,
+                    batterySaver = AppSettingsStore.batterySaver(this),
+                    networkSummaries = activeNetworkPathSummaries,
+                    networkCallbacks =
+                            networkPathManager?.callbackInvocationCount() ?: 0,
+                    mdnsWindows = peerDiscoveryWindow?.windowsOpenedCount() ?: 0,
+            )
+        } catch (e: Exception) {
+            android.util.Log.w("BondedVPN", "battery profile sample failed: ${e.message}")
+        }
+    }
+
     private fun getNativeSessionSnapshot(): SessionSnapshot? {
         return try {
             nativeGetSessionSnapshot()?.let(::parseSessionSnapshot)
@@ -746,6 +803,9 @@ class BondedVpnService : VpnService() {
                     inboundBytes = json.optLong("inboundBytes", 0),
                     relayedUpBytes = json.optLong("relayedUpBytes", 0),
                     relayedDownBytes = json.optLong("relayedDownBytes", 0),
+                    heartbeatPingsSent = json.optLong("heartbeatPingsSent", 0),
+                    relayTasksStarted = json.optLong("relayTasksStarted", 0),
+                    relayTasksEnded = json.optLong("relayTasksEnded", 0),
                     connectedAtMs = json.optLong("connectedAtMs", 0),
                     lastError =
                             json.optString("lastError").takeIf { it.isNotBlank() && it != "null" },
@@ -792,6 +852,9 @@ class BondedVpnService : VpnService() {
                             peerId =
                                     if (item.isNull("peerId")) null
                                     else item.optString("peerId").takeIf { it.isNotEmpty() },
+                            quicPingFrames =
+                                    if (item.isNull("quicPingFrames")) null
+                                    else item.optLong("quicPingFrames", 0),
                     )
             )
         }
@@ -1535,6 +1598,9 @@ class BondedVpnService : VpnService() {
                     "inboundBytes" to snapshot.inboundBytes,
                     "relayedUpBytes" to snapshot.relayedUpBytes,
                     "relayedDownBytes" to snapshot.relayedDownBytes,
+                    "heartbeatPingsSent" to snapshot.heartbeatPingsSent,
+                    "relayTasksStarted" to snapshot.relayTasksStarted,
+                    "relayTasksEnded" to snapshot.relayTasksEnded,
                     "connectedAtMs" to snapshot.connectedAtMs,
                     "lastError" to snapshot.lastError,
                     "peerShareError" to snapshot.peerShareError,
@@ -1561,6 +1627,46 @@ class BondedVpnService : VpnService() {
                                         "lastRttMs" to path.lastRttMs,
                                         "serverSeenAddress" to path.serverSeenAddress,
                                         "peerId" to path.peerId,
+                                        "quicPingFrames" to path.quicPingFrames,
+                                )
+                            },
+            )
+        }
+
+        /** Battery profile for the Diagnostics screen (plan 4.46).
+         * Live rates + persisted aggregates while the service runs;
+         * aggregates only (from the persisted file) when it does not.
+         * Null only when there is no data at all yet. */
+        fun getBatteryProfile(context: Context): Map<String, Any?>? {
+            val service = activeInstance
+            if (service != null) {
+                return service.batteryProfiler?.profileForUi()
+            }
+            val aggregates = BatteryProfiler.loadPersistedAggregates(context)
+            if (aggregates.isEmpty()) return null
+            return mapOf(
+                    "live" to false,
+                    "chargeCounterAvailable" to null,
+                    "windowMs" to BatteryProfileMath.HOUR_MS,
+                    "windowSamples" to 0,
+                    "windowStartMs" to null,
+                    "mahPerHour" to null,
+                    "cpuMsPerHour" to null,
+                    "wakeupsPerHour" to null,
+                    "currentUa" to null,
+                    "capacityPct" to null,
+                    "segments" to emptyMap<String, Double?>(),
+                    "segmentSamples" to emptyMap<String, Int>(),
+                    "totalSamples" to 0,
+                    "aggregates" to
+                            aggregates.map { agg ->
+                                mapOf<String, Any?>(
+                                        "hourStartMs" to agg.hourStartMs,
+                                        "samples" to agg.sampleCount,
+                                        "mahPerHour" to agg.mahPerHour,
+                                        "cpuMsPerHour" to agg.cpuMsPerHour,
+                                        "wakeupsPerHour" to agg.wakeupsPerHour,
+                                        "segments" to agg.segments,
                                 )
                             },
             )

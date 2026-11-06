@@ -152,13 +152,21 @@ pub async fn connect_peer_relay(
 /// (a consumer with several provider paths holds several legs); the
 /// FFI snapshot reads it live when serializing, so no periodic copy
 /// is needed. Counts session-frame payload bytes — the unit the pump
-/// throttles on — not wire bytes.
+/// throttles on — not wire bytes. The task counters below are the
+/// wakeup accounting for the battery profiler: one relay task is
+/// spawned per accepted leg, and it ends when the leg's pump returns
+/// (a task dropped mid-flight by runtime shutdown may never record
+/// its end, so `ended` is a lower bound).
 #[derive(Debug, Default)]
 pub struct PeerShareRelayStats {
     /// Bytes forwarded peer -> upstream (consumer -> server).
     pub relayed_up_bytes: AtomicU64,
     /// Bytes forwarded upstream -> peer (server -> consumer).
     pub relayed_down_bytes: AtomicU64,
+    /// Relay pump tasks started (one per accepted leg).
+    pub relay_tasks_started: AtomicU64,
+    /// Relay pump tasks ended (pump returned normally or on error).
+    pub relay_tasks_ended: AtomicU64,
 }
 
 /// Outcome of dialing a peer relay: either the provider accepted the
@@ -799,6 +807,22 @@ mod tests {
         assert!(pump_result.is_err(), "pump should end once channels close");
         assert_eq!(stats.relayed_up_bytes.load(Ordering::Relaxed), 19);
         assert_eq!(stats.relayed_down_bytes.load(Ordering::Relaxed), 18);
+    }
+
+    #[test]
+    fn relay_task_counters_default_to_zero_and_increment() {
+        // The accept loop (peer_runtime) increments these at spawn
+        // and at task end; the pump test above never touches them, so
+        // this pins the fields' defaults and shape instead of the
+        // spawn-site wiring (covered by a live relay session, not a
+        // unit test).
+        let stats = PeerShareRelayStats::default();
+        assert_eq!(stats.relay_tasks_started.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.relay_tasks_ended.load(Ordering::Relaxed), 0);
+        stats.relay_tasks_started.fetch_add(1, Ordering::Relaxed);
+        stats.relay_tasks_ended.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(stats.relay_tasks_started.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.relay_tasks_ended.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]

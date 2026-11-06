@@ -20,6 +20,13 @@ class PathStat {
   final int? wireRxBytes;
   final int lastRttMs;
 
+  /// QUIC PING frames sent on this path's connection (quinn
+  /// `frame_tx.ping`, cumulative): the 25 s keepalive PINGs are the
+  /// transport's steady wakeup source. Null when the transport cannot
+  /// observe them (WebSocketTls) or the native snapshot predates the
+  /// counter; a re-dialed path restarts from zero.
+  final int? quicPingFrames;
+
   /// "IP:port" source address the server sees for this path's
   /// connection, reported in its heartbeat pongs; null until reported
   /// (older servers never report one).
@@ -42,6 +49,7 @@ class PathStat {
     required this.lastRttMs,
     required this.serverSeenAddress,
     this.peerId,
+    this.quicPingFrames,
   });
 
   factory PathStat.fromMap(Map<dynamic, dynamic> map) {
@@ -55,6 +63,7 @@ class PathStat {
       wireTxBytes: (map['wireTxBytes'] as num?)?.toInt(),
       wireRxBytes: (map['wireRxBytes'] as num?)?.toInt(),
       lastRttMs: (map['lastRttMs'] as num?)?.toInt() ?? 0,
+      quicPingFrames: (map['quicPingFrames'] as num?)?.toInt(),
       serverSeenAddress:
           (map['serverSeenAddress'] as String?)?.trim().isNotEmpty == true
           ? map['serverSeenAddress'] as String
@@ -122,6 +131,13 @@ class SessionStatus {
   /// up = consumer -> server, down = server -> consumer.
   final int relayedUpBytes;
   final int relayedDownBytes;
+  /// Session heartbeat PINGs sent by the native worker (all paths,
+  /// all ticks). Wakeup accounting for the battery profiler.
+  final int heartbeatPingsSent;
+  /// Relay pump tasks started / ended (one per accepted leg).
+  /// Wakeup accounting for the battery profiler.
+  final int relayTasksStarted;
+  final int relayTasksEnded;
   final int connectedAtMs;
   final String? lastError;
   final String? peerShareError;
@@ -141,6 +157,9 @@ class SessionStatus {
     required this.inboundBytes,
     required this.relayedUpBytes,
     required this.relayedDownBytes,
+    required this.heartbeatPingsSent,
+    required this.relayTasksStarted,
+    required this.relayTasksEnded,
     required this.connectedAtMs,
     required this.lastError,
     required this.peerShareError,
@@ -161,6 +180,9 @@ class SessionStatus {
     inboundBytes: 0,
     relayedUpBytes: 0,
     relayedDownBytes: 0,
+    heartbeatPingsSent: 0,
+    relayTasksStarted: 0,
+    relayTasksEnded: 0,
     connectedAtMs: 0,
     lastError: null,
     peerShareError: null,
@@ -188,6 +210,9 @@ class SessionStatus {
       inboundBytes: (map['inboundBytes'] as num?)?.toInt() ?? 0,
       relayedUpBytes: (map['relayedUpBytes'] as num?)?.toInt() ?? 0,
       relayedDownBytes: (map['relayedDownBytes'] as num?)?.toInt() ?? 0,
+      heartbeatPingsSent: (map['heartbeatPingsSent'] as num?)?.toInt() ?? 0,
+      relayTasksStarted: (map['relayTasksStarted'] as num?)?.toInt() ?? 0,
+      relayTasksEnded: (map['relayTasksEnded'] as num?)?.toInt() ?? 0,
       connectedAtMs: (map['connectedAtMs'] as num?)?.toInt() ?? 0,
       lastError: nonEmpty(map['lastError']),
       peerShareError: nonEmpty(map['peerShareError']),

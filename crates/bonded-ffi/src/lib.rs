@@ -33,7 +33,7 @@ use std::os::fd::FromRawFd;
 use std::path::PathBuf;
 use std::slice;
 #[cfg(any(target_os = "android", test))]
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(any(target_os = "android", test))]
 use std::sync::{Arc, Mutex, OnceLock};
 #[cfg(any(target_os = "android", test))]
@@ -400,6 +400,22 @@ struct AndroidSessionHandle {
     worker: Option<JoinHandle<()>>,
 }
 
+/// Session-level wakeup counters for the battery profiler, in the
+/// same style as [`PeerShareRelayStats`]: shared atomics read live
+/// at snapshot serialization, never copied on a tick. Only the
+/// counters the Android worker itself produces live here: heartbeat
+/// PINGs sent by the worker's heartbeat loop (one per pinged path
+/// per tick). QUIC keepalive PINGs are per-path and come from quinn
+/// via `WireStats::ping_frames_tx`; relay task counts live on
+/// [`PeerShareRelayStats`]. A fresh instance is created per session
+/// start, so the counters are per-session like the relayed bytes.
+#[cfg(any(target_os = "android", test))]
+#[derive(Debug, Default)]
+struct SessionWakeupStats {
+    /// Session heartbeat PING frames sent (all paths, all ticks).
+    pub heartbeat_pings_sent: AtomicU64,
+}
+
 #[cfg(any(target_os = "android", test))]
 #[derive(Clone, Debug)]
 struct AndroidSessionSnapshot {
@@ -419,6 +435,10 @@ struct AndroidSessionSnapshot {
     /// copied counter, so the JSON always reflects the current totals.
     /// Zero when peer-share never provided (consumer-only or disabled).
     relay_stats: Arc<PeerShareRelayStats>,
+    /// Session-level wakeup counters (heartbeat PINGs sent by the
+    /// worker), read live like `relay_stats`. Created per session
+    /// start; the worker holds a second clone and increments it.
+    wakeup_stats: Arc<SessionWakeupStats>,
     /// Unix timestamp in milliseconds when the session reached "connected".
     connected_at_ms: u64,
     last_error: Option<String>,
@@ -472,6 +492,12 @@ struct AndroidPathStat {
     /// re-dialed path restarts from zero.
     wire_tx_bytes: Option<u64>,
     wire_rx_bytes: Option<u64>,
+    /// QUIC PING frames sent on this path's connection (quinn
+    /// `frame_tx.ping`, cumulative): the 25 s keepalive PINGs are
+    /// the transport's steady wakeup source. `None` when the
+    /// transport cannot observe them (same rule as the wire bytes).
+    /// Read live from the transport like the wire bytes.
+    quic_ping_frames: Option<u64>,
     /// Most recent heartbeat RTT in ms (0 = none measured yet). All
     /// paths are pinged on the same tick, so a pong's arrival transport
     /// identifies the path its RTT belongs to.
@@ -662,8 +688,12 @@ fn snapshot_json(snapshot: &AndroidSessionSnapshot) -> String {
                 .wire_rx_bytes
                 .map(|bytes| bytes.to_string())
                 .unwrap_or_else(|| "null".to_owned());
+            let quic_ping_frames = stat
+                .quic_ping_frames
+                .map(|frames| frames.to_string())
+                .unwrap_or_else(|| "null".to_owned());
             format!(
-                "{{\"pathIndex\":{},\"kind\":\"{}\",\"active\":{},\"paused\":{},\"outboundBytes\":{},\"inboundBytes\":{},\"wireTxBytes\":{},\"wireRxBytes\":{},\"lastRttMs\":{},\"serverSeenAddress\":{},\"peerId\":{}}}",
+                "{{\"pathIndex\":{},\"kind\":\"{}\",\"active\":{},\"paused\":{},\"outboundBytes\":{},\"inboundBytes\":{},\"wireTxBytes\":{},\"wireRxBytes\":{},\"quicPingFrames\":{},\"lastRttMs\":{},\"serverSeenAddress\":{},\"peerId\":{}}}",
                 path_index,
                 escape_json(&stat.kind),
                 stat.active,
@@ -672,6 +702,7 @@ fn snapshot_json(snapshot: &AndroidSessionSnapshot) -> String {
                 stat.inbound_bytes,
                 wire_tx,
                 wire_rx,
+                quic_ping_frames,
                 stat.last_rtt_ms,
                 server_seen,
                 peer_id,
@@ -681,7 +712,7 @@ fn snapshot_json(snapshot: &AndroidSessionSnapshot) -> String {
         .join(",");
 
     format!(
-        "{{\"state\":\"{}\",\"serverAddress\":\"{}\",\"activeTransport\":\"{}\",\"transportCount\":{},\"peerRelayCount\":{},\"outboundPackets\":{},\"inboundPackets\":{},\"outboundBytes\":{},\"inboundBytes\":{},\"relayedUpBytes\":{},\"relayedDownBytes\":{},\"connectedAtMs\":{},\"lastError\":{},\"peerShareError\":{},\"interception\":{},\"paths\":[{}]}}",
+        "{{\"state\":\"{}\",\"serverAddress\":\"{}\",\"activeTransport\":\"{}\",\"transportCount\":{},\"peerRelayCount\":{},\"outboundPackets\":{},\"inboundPackets\":{},\"outboundBytes\":{},\"inboundBytes\":{},\"relayedUpBytes\":{},\"relayedDownBytes\":{},\"heartbeatPingsSent\":{},\"relayTasksStarted\":{},\"relayTasksEnded\":{},\"connectedAtMs\":{},\"lastError\":{},\"peerShareError\":{},\"interception\":{},\"paths\":[{}]}}",
         escape_json(&snapshot.state),
         escape_json(&snapshot.server_address),
         escape_json(&snapshot.active_transport),
@@ -698,6 +729,18 @@ fn snapshot_json(snapshot: &AndroidSessionSnapshot) -> String {
         snapshot
             .relay_stats
             .relayed_down_bytes
+            .load(Ordering::Relaxed),
+        snapshot
+            .wakeup_stats
+            .heartbeat_pings_sent
+            .load(Ordering::Relaxed),
+        snapshot
+            .relay_stats
+            .relay_tasks_started
+            .load(Ordering::Relaxed),
+        snapshot
+            .relay_stats
+            .relay_tasks_ended
             .load(Ordering::Relaxed),
         snapshot.connected_at_ms,
         last_error,
@@ -1063,6 +1106,7 @@ fn publish_path_stats(
                         .find(|stat| stat.path_index == Some(path_index)),
                     None => previous.get(index),
                 };
+                let wire = transport.wire_stats();
                 AndroidPathStat {
                     path_index,
                     kind: client_transport_kind(transport).to_owned(),
@@ -1070,12 +1114,14 @@ fn publish_path_stats(
                     paused: prior.map(|stat| stat.paused).unwrap_or(false),
                     outbound_bytes: prior.map(|stat| stat.outbound_bytes).unwrap_or(0),
                     inbound_bytes: prior.map(|stat| stat.inbound_bytes).unwrap_or(0),
-                    wire_tx_bytes: transport
-                        .wire_stats()
-                        .map(|stats| stats.tx_bytes),
-                    wire_rx_bytes: transport
-                        .wire_stats()
-                        .map(|stats| stats.rx_bytes),
+                    wire_tx_bytes: wire.map(|stats| stats.tx_bytes),
+                    wire_rx_bytes: wire.map(|stats| stats.rx_bytes),
+                    // QUIC keepalive PINGs per path (None when the
+                    // transport cannot observe them, same rule as
+                    // the wire bytes). Cumulative per connection;
+                    // a re-dialed path restarts from zero, like the
+                    // wire bytes.
+                    quic_ping_frames: wire.map(|stats| stats.ping_frames_tx),
                     last_rtt_ms: prior.map(|stat| stat.last_rtt_ms).unwrap_or(0),
                     server_seen_address: prior
                         .and_then(|stat| stat.server_seen_address.clone()),
@@ -1172,6 +1218,7 @@ fn start_android_session(
     let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
     let inbound_queue = Arc::new(Mutex::new(VecDeque::new()));
     let worker_inbound_queue = Arc::clone(&inbound_queue);
+    let wakeup_stats = Arc::new(SessionWakeupStats::default());
     let snapshot = Arc::new(Mutex::new(AndroidSessionSnapshot {
         state: "connecting".to_owned(),
         server_address: server_address.to_owned(),
@@ -1184,6 +1231,7 @@ fn start_android_session(
         outbound_bytes: 0,
         inbound_bytes: 0,
         relay_stats: Arc::new(PeerShareRelayStats::default()),
+        wakeup_stats: Arc::clone(&wakeup_stats),
         connected_at_ms: 0,
         last_error: None,
         peer_share_error: None,
@@ -1243,6 +1291,9 @@ fn start_android_session(
 
     let (path_control_tx, mut path_control_rx) =
         tokio::sync::mpsc::unbounded_channel::<PathControl>();
+    // The worker thread moves its own clone: the snapshot holds one
+    // Arc and the worker increments the other; the JSON reads live.
+    let worker_wakeup_stats = Arc::clone(&wakeup_stats);
     let worker = thread::spawn(move || {
         let runtime = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -2577,14 +2628,13 @@ fn start_android_session(
                                 if let Some(stat) =
                                     session_snapshot.path_stats.get_mut(index)
                                 {
-                                    let (tx, rx) = match transport.wire_stats() {
-                                        Some(stats) => {
-                                            (Some(stats.tx_bytes), Some(stats.rx_bytes))
-                                        }
-                                        None => (None, None),
-                                    };
-                                    stat.wire_tx_bytes = tx;
-                                    stat.wire_rx_bytes = rx;
+                                    let wire = transport.wire_stats();
+                                    stat.wire_tx_bytes =
+                                        wire.map(|stats| stats.tx_bytes);
+                                    stat.wire_rx_bytes =
+                                        wire.map(|stats| stats.rx_bytes);
+                                    stat.quic_ping_frames =
+                                        wire.map(|stats| stats.ping_frames_tx);
                                 }
                             }
                         });
@@ -2626,6 +2676,12 @@ fn start_android_session(
                             match transport.send(ping.clone()).await {
                                 Ok(()) => {
                                     any_sent = true;
+                                    // Wakeup accounting (battery
+                                    // profiler): one heartbeat PING per
+                                    // pinged path per tick.
+                                    worker_wakeup_stats
+                                        .heartbeat_pings_sent
+                                        .fetch_add(1, Ordering::Relaxed);
                                     standby_ping_failures.remove(&path_index);
                                 }
                                 Err(err) => {
@@ -3492,6 +3548,100 @@ mod tests {
     use super::diff_path_addresses;
     use super::order_candidates_for_send;
     use super::prefer_wireguard_first;
+
+    #[test]
+    fn snapshot_json_carries_wakeup_counters() {
+        use super::AndroidPathStat;
+        use super::AndroidSessionSnapshot;
+        use super::PeerShareRelayStats;
+        use super::SessionWakeupStats;
+        use std::sync::Arc;
+
+        // A hand-built snapshot: the worker's counters are plain
+        // atomics, so this pins the JSON keys without starting a
+        // session (the live wiring is covered by the session tests
+        // below, which assert the snapshot parses end to end).
+        let relay_stats = Arc::new(PeerShareRelayStats::default());
+        relay_stats
+            .relay_tasks_started
+            .fetch_add(2, super::Ordering::Relaxed);
+        relay_stats
+            .relay_tasks_ended
+            .fetch_add(1, super::Ordering::Relaxed);
+        let wakeup_stats = Arc::new(SessionWakeupStats::default());
+        wakeup_stats
+            .heartbeat_pings_sent
+            .fetch_add(42, super::Ordering::Relaxed);
+        let snapshot = AndroidSessionSnapshot {
+            state: "connected".to_owned(),
+            server_address: "example.test:443".to_owned(),
+            active_transport: "QUIC".to_owned(),
+            transport_count: 2,
+            peer_relay_count: 0,
+            accepted_peer_relay_count: 0,
+            outbound_packets: 10,
+            inbound_packets: 9,
+            outbound_bytes: 100,
+            inbound_bytes: 90,
+            relay_stats,
+            wakeup_stats,
+            connected_at_ms: 1_700_000_000_000,
+            last_error: None,
+            peer_share_error: None,
+            path_stats: vec![
+                AndroidPathStat {
+                    path_index: Some(0),
+                    kind: "QUIC".to_owned(),
+                    active: true,
+                    paused: false,
+                    outbound_bytes: 100,
+                    inbound_bytes: 90,
+                    wire_tx_bytes: Some(120),
+                    wire_rx_bytes: Some(110),
+                    quic_ping_frames: Some(7),
+                    last_rtt_ms: 12,
+                    server_seen_address: None,
+                    peer_id: None,
+                },
+                AndroidPathStat {
+                    path_index: Some(1),
+                    kind: "WebSocketTls".to_owned(),
+                    active: false,
+                    paused: false,
+                    outbound_bytes: 0,
+                    inbound_bytes: 0,
+                    wire_tx_bytes: None,
+                    wire_rx_bytes: None,
+                    quic_ping_frames: None,
+                    last_rtt_ms: 0,
+                    server_seen_address: None,
+                    peer_id: None,
+                },
+            ],
+            interception: None,
+        };
+        let json = super::snapshot_json(&snapshot);
+        assert!(
+            json.contains("\"heartbeatPingsSent\":42"),
+            "heartbeat pings missing: {json}"
+        );
+        assert!(
+            json.contains("\"relayTasksStarted\":2"),
+            "relay tasks started missing: {json}"
+        );
+        assert!(
+            json.contains("\"relayTasksEnded\":1"),
+            "relay tasks ended missing: {json}"
+        );
+        assert!(
+            json.contains("\"quicPingFrames\":7"),
+            "QUIC ping frames missing: {json}"
+        );
+        assert!(
+            json.contains("\"quicPingFrames\":null"),
+            "unmeasured QUIC ping frames should be null: {json}"
+        );
+    }
 
     #[test]
     fn path_diff_removes_vanished_and_reuses_freed_indexes() {

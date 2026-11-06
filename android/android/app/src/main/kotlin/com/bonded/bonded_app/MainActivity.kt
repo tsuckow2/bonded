@@ -668,6 +668,9 @@ class MainActivity : FlutterActivity() {
                         "getVpnSessionStatus" -> {
                             result.success(BondedVpnService.getSessionSnapshot())
                         }
+                        "getBatteryProfile" -> {
+                            result.success(BondedVpnService.getBatteryProfile(this))
+                        }
                         "pausePath" -> {
                             val args = call.arguments as? Map<*, *>
                             val pathIndex = (args?.get("pathIndex") as? Number)?.toInt()

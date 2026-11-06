@@ -113,6 +113,13 @@ pub enum TransportKind {
 pub struct WireStats {
     pub tx_bytes: u64,
     pub rx_bytes: u64,
+    /// QUIC PING frames sent on this connection (quinn `frame_tx.ping`),
+    /// cumulative like the byte counters. The 25 s keepalive PINGs are
+    /// the transport's steady wakeup source; the battery profiler reads
+    /// this per path. Zero for non-QUIC transports (TCP/WireGuard have
+    /// no PING frames; session heartbeat PINGs are counted separately
+    /// at session level, not here).
+    pub ping_frames_tx: u64,
 }
 
 #[async_trait]
@@ -356,6 +363,7 @@ impl Transport for NaiveTcpTransport {
         Some(WireStats {
             tx_bytes: self.wire_tx_bytes,
             rx_bytes: self.wire_rx_bytes,
+            ping_frames_tx: 0,
         })
     }
 }
@@ -573,10 +581,14 @@ impl Transport for QuicTransport {
         // connection (all streams, incl. ACKs, PINGs, retransmits);
         // the diagnostic takes deltas around the transfer, so the
         // handshake and any background streams are excluded.
+        // frame_tx.ping counts the keepalive PING frames (plus any
+        // PING sent for path validation); it is the per-path QUIC
+        // wakeup count for the battery profiler.
         let stats = self._connection.stats();
         Some(WireStats {
             tx_bytes: stats.udp_tx.bytes,
             rx_bytes: stats.udp_rx.bytes,
+            ping_frames_tx: stats.frame_tx.ping,
         })
     }
 }
@@ -765,6 +777,26 @@ mod tests {
             "websocket wire bytes stay unmeasured even after traffic"
         );
         server_task.await.expect("server task should join");
+    }
+
+    #[test]
+    fn wire_stats_ping_frames_default_to_zero() {
+        // The QUIC PING counter is read live from quinn
+        // (`frame_tx.ping`) in the QUIC transport's `wire_stats`;
+        // a live-connection test is not possible in this sandbox
+        // (UDP is blocked, like the existing QUIC tests), so this
+        // pins the field's default and shape instead: a fresh
+        // connection reports zero PINGs, and a literal round-trips.
+        use super::WireStats;
+        assert_eq!(WireStats::default().ping_frames_tx, 0);
+        let stats = WireStats {
+            tx_bytes: 10,
+            rx_bytes: 20,
+            ping_frames_tx: 7,
+        };
+        assert_eq!(stats.ping_frames_tx, 7);
+        assert_eq!(stats.tx_bytes, 10);
+        assert_eq!(stats.rx_bytes, 20);
     }
 
     #[tokio::test]
@@ -1212,6 +1244,7 @@ impl Transport for WireGuardTransport {
         Some(WireStats {
             tx_bytes: self.wire_tx_bytes,
             rx_bytes: self.wire_rx_bytes,
+            ping_frames_tx: 0,
         })
     }
 }
