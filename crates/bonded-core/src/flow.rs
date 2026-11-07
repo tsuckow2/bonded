@@ -45,6 +45,38 @@ pub fn pick_index(hash: u64, count: usize) -> usize {
     (hash % count as u64) as usize
 }
 
+/// Direction-independent flow key for return-path tracking (4.52).
+///
+/// The same 5-tuple hashes identically in both directions: the two
+/// endpoint (address, port) pairs are ordered canonically before
+/// hashing, so an uplink packet and its reply share a key while two
+/// different flows never do (up to hash collision). `None` for
+/// packets whose tuple cannot be parsed — those fall back to hash
+/// pinning, since no canonical key exists for them. Unlike
+/// [`flow_hash`], which deliberately pins each direction
+/// independently, this key exists to MATCH directions: the server
+/// records the transport an uplink packet arrived on under this key
+/// and looks the reply up under the same key.
+pub fn flow_key(packet: &[u8]) -> Option<u64> {
+    let (src, dst, protocol, ports) = parse_flow_tuple(packet)?;
+    let mut src_ep = src;
+    let mut dst_ep = dst;
+    if let Some((src_port, dst_port)) = ports {
+        src_ep.extend_from_slice(&src_port.to_be_bytes());
+        dst_ep.extend_from_slice(&dst_port.to_be_bytes());
+    }
+    let (first, second) = if src_ep <= dst_ep {
+        (src_ep, dst_ep)
+    } else {
+        (dst_ep, src_ep)
+    };
+    let mut hash = Fnv1a::new();
+    hash.write(&first);
+    hash.write(&second);
+    hash.write(&[protocol]);
+    Some(hash.finish())
+}
+
 /// The destination IP of an inner IP packet (IPv4 or IPv6), or
 /// `None` for non-IP / truncated packets. Used by the traffic-mode
 /// engine (4.51) to resolve a mode per flow; the flow hash still pins
@@ -198,5 +230,31 @@ mod tests {
         assert_eq!(flow_hash(&[0x45, 0x00]), flow_hash(&[0x45, 0x00]));
         assert_eq!(flow_hash(b"not an ip packet"), flow_hash(b"not an ip packet"));
         assert_ne!(flow_hash(b"one"), flow_hash(b"two"));
+    }
+
+    #[test]
+    fn flow_key_matches_both_directions() {
+        use super::flow_key;
+        let uplink = ipv4_tcp([10, 8, 0, 2], [93, 184, 216, 34], 51000, 443);
+        let downlink = ipv4_tcp([93, 184, 216, 34], [10, 8, 0, 2], 443, 51000);
+        assert_ne!(flow_hash(&uplink), flow_hash(&downlink));
+        assert_eq!(
+            flow_key(&uplink),
+            flow_key(&downlink),
+            "the same 5-tuple must key identically in both directions"
+        );
+        // A different flow (different client port) keys differently.
+        let other = ipv4_tcp([10, 8, 0, 2], [93, 184, 216, 34], 51001, 443);
+        assert_ne!(flow_key(&uplink), flow_key(&other));
+        // IPv6 UDP, both directions.
+        let src: [u8; 16] = [0x26, 0x07, 0xfb, 0x91, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+        let dst: [u8; 16] = [0x26, 0x07, 0x77, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9];
+        let up6 = ipv6_udp(src, dst, 40000, 53);
+        let down6 = ipv6_udp(dst, src, 53, 40000);
+        assert_eq!(flow_key(&up6), flow_key(&down6));
+        // Unparseable packets have no key — the server falls back to
+        // hash pinning for them.
+        assert_eq!(flow_key(&[0x45, 0x00]), None);
+        assert_eq!(flow_key(b"not an ip packet"), None);
     }
 }

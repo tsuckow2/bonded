@@ -10,10 +10,10 @@ import '../services/traffic_rules_service.dart';
 /// are pre-resolved to their IPs when saved (and again on VPN start)
 /// — matching is IP-based only, never DNS snooping.
 ///
-/// Only `default` has behavior in this slice. Picking another mode —
-/// here or on a rule — falls back to default until its slice lands,
-/// and the screen says so next to the picker instead of pretending
-/// the mode is live.
+/// A mode whose slice has not landed yet — here or on a rule — falls
+/// back to default, and the screen says so next to the picker
+/// instead of pretending the mode is live. Since 4.52 that is only
+/// `bandwidthBoost` and `redundant`.
 class TrafficRulesScreen extends StatefulWidget {
   const TrafficRulesScreen({super.key});
 

@@ -9,6 +9,7 @@ import '../models/transport_grade.dart';
 import '../services/app_settings_service.dart';
 import '../services/background_service.dart';
 import '../services/pairing_service.dart';
+import '../services/path_grades_service.dart';
 import '../services/traffic_rules_service.dart';
 import '../widgets/app_update_checker.dart';
 import '../widgets/focusable_row.dart';
@@ -196,6 +197,19 @@ class _HomeScreenState extends State<HomeScreen> {
     final now = DateTime.now();
     _gradeTracker.record(status, now);
     _transportGradeTracker.record(status, now);
+    // Per-transport grades (4.52): push the live grades to Rust on
+    // the existing poll tick so the best-transport mode ranks on the
+    // grades the Paths card shows. Best-effort and unawaited — a
+    // failed push leaves the previous grades in place and best
+    // transport ranks on RTT/loss until the next tick. The list is in
+    // snapshot paths order, so the Rust side indexes it by transport.
+    unawaited(
+      PathGradesService.pushLive(
+        status.paths
+            .map((path) => _transportGradeTracker.gradeFor(path.gradeKey)?.total)
+            .toList(),
+      ),
+    );
     if (_lastInBytes != null && _lastSampleAt != null) {
       final dt = now.difference(_lastSampleAt!).inMilliseconds / 1000.0;
       if (dt > 0) {

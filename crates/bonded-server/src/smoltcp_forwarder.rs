@@ -425,11 +425,28 @@ struct RouterInner {
     /// last-active-only behavior, because an old client only reads its
     /// active transport and would lose frames sent anywhere else.
     multipath_capable: bool,
+    /// Last transport an uplink packet for each flow arrived on, by
+    /// direction-independent flow key (4.52, see
+    /// [`bonded_core::flow::flow_key`]). `deliver` sends a flow's
+    /// return traffic back on this transport when it is still live;
+    /// a flow with no entry falls back to the hash pin. Bounded
+    /// (see `MAX_FLOW_LAST_TRANSPORT_ENTRIES`): a flow scan must not
+    /// grow the router without limit, and an evicted flow simply
+    /// re-learns on its next uplink packet.
+    flow_last_transport: HashMap<u64, u64>,
     /// Epoch of the worker currently bound to this session (0 = none
     /// yet; worker epochs are ms timestamps, always > 0). A newer
     /// epoch retires every other transport (see `adopt_epoch`).
     epoch: u64,
 }
+
+/// Cap on the per-flow last-transport map (4.52). When the map is
+/// full, recording a new flow evicts one arbitrary entry — the
+/// evicted flow re-learns on its next uplink packet and hash-pins
+/// until then. 4096 flows is far above a single session's live set
+/// (a phone holds tens of concurrent flows) while bounding memory
+/// even under a flow scan.
+const MAX_FLOW_LAST_TRANSPORT_ENTRIES: usize = 4096;
 
 impl SessionOutboundRouter {
     pub fn new() -> (Self, mpsc::UnboundedSender<SessionFrame>) {
@@ -440,6 +457,7 @@ impl SessionOutboundRouter {
                 peers: HashMap::new(),
                 last_active: None,
                 multipath_capable: false,
+                flow_last_transport: HashMap::new(),
                 epoch: 0,
             })),
             tx: tx.clone(),
@@ -485,6 +503,7 @@ impl SessionOutboundRouter {
         }
         inner.epoch = epoch;
         inner.transports.retain(|id, _| *id == keep_id);
+        inner.flow_last_transport.retain(|_, t| *t == keep_id);
         if inner.last_active != Some(keep_id) {
             inner.last_active = None;
         }
@@ -502,6 +521,10 @@ impl SessionOutboundRouter {
         let mut inner = self.inner.write().expect("router lock poisoned");
         inner.transports.remove(&id);
         inner.peers.remove(&id);
+        // A flow whose last-used transport is gone must not keep
+        // pointing at it: the next `deliver` would skip the dead id
+        // anyway, but pruning keeps the map honest.
+        inner.flow_last_transport.retain(|_, t| *t != id);
         if inner.last_active == Some(id) {
             inner.last_active = None;
         }
@@ -536,6 +559,9 @@ impl SessionOutboundRouter {
                 inner.last_active = None;
             }
         }
+        inner
+            .flow_last_transport
+            .retain(|_, t| !retired.contains(t));
         retired
     }
 
@@ -564,10 +590,34 @@ impl SessionOutboundRouter {
     }
 
     /// `mark_active` plus `note_frame_flags`, for data-frame sites that
-    /// have both the transport id and the frame in hand.
-    pub fn note_frame(&self, id: u64, flags: u32) {
-        self.note_frame_flags(flags);
+    /// have both the transport id and the frame in hand. Also records
+    /// the flow's last-used transport (4.52): the return half of this
+    /// flow goes back on the transport its most recent uplink data
+    /// arrived on. Heartbeat and control frames are skipped — their
+    /// payloads are not flow traffic and must not claim a flow. A
+    /// packet whose tuple cannot be parsed (non-IP, truncated) has no
+    /// direction-independent key, so it records nothing and its return
+    /// traffic falls back to the hash pin.
+    pub fn note_frame(&self, id: u64, frame: &SessionFrame) {
+        self.note_frame_flags(frame.header.flags);
         self.mark_active(id);
+        if frame.header.flags
+            & (bonded_core::session::FLAG_PING | bonded_core::session::FLAG_PONG)
+            != 0
+        {
+            return;
+        }
+        if let Some(key) = bonded_core::flow::flow_key(&frame.payload) {
+            let mut inner = self.inner.write().expect("router lock poisoned");
+            if inner.flow_last_transport.len() >= MAX_FLOW_LAST_TRANSPORT_ENTRIES
+                && !inner.flow_last_transport.contains_key(&key)
+            {
+                if let Some(victim) = inner.flow_last_transport.keys().next().copied() {
+                    inner.flow_last_transport.remove(&victim);
+                }
+            }
+            inner.flow_last_transport.insert(key, id);
+        }
     }
 
     pub fn transport_count(&self) -> usize {
@@ -581,11 +631,12 @@ impl SessionOutboundRouter {
     fn deliver(&self, frame: SessionFrame) {
         // Build an ordered candidate list. For a multipath-capable
         // session with more than one live transport, the first candidate
-        // is this flow's pinned transport — the flow hash over the
-        // downlink packet picks deterministically from the sorted
-        // transport ids, so a flow stays on one path while the set is
-        // stable — followed by last_active and then the rest in sorted
-        // order. Otherwise the list is the pre-multipath order:
+        // is the transport this flow's most recent uplink data arrived
+        // on (4.52: return on the transport the most recent data came
+        // on), falling back to the flow-hash pin when the flow has no
+        // uplink data yet — a flow stays on one path while the set is
+        // stable either way — followed by last_active and then the rest
+        // in sorted order. Otherwise the list is the pre-multipath order:
         // last_active first, then every other live transport. Either
         // way, if a candidate's sender is closed we retry the SAME
         // frame immediately on the next live sender instead of
@@ -597,10 +648,16 @@ impl SessionOutboundRouter {
             if inner.multipath_capable && inner.transports.len() > 1 {
                 let mut sorted_ids: Vec<u64> = inner.transports.keys().copied().collect();
                 sorted_ids.sort_unstable();
-                let pick = sorted_ids[bonded_core::flow::pick_index(
-                    bonded_core::flow::flow_hash(&frame.payload),
-                    sorted_ids.len(),
-                )];
+                let last_used = bonded_core::flow::flow_key(&frame.payload)
+                    .and_then(|key| inner.flow_last_transport.get(&key).copied())
+                    .filter(|id| inner.transports.contains_key(id));
+                let pick = match last_used {
+                    Some(id) => id,
+                    None => sorted_ids[bonded_core::flow::pick_index(
+                        bonded_core::flow::flow_hash(&frame.payload),
+                        sorted_ids.len(),
+                    )],
+                };
                 let mut ordered = vec![pick];
                 if let Some(last) = inner.last_active {
                     if last != pick && inner.transports.contains_key(&last) {
@@ -3513,6 +3570,144 @@ mod tests {
             arrived.is_err(),
             "an IPv6 packet must produce no outbound frame"
         );
+    }
+
+    /// Minimal IPv4/TCP packet for router tests: 20-byte header plus
+    /// ports, no options, no payload. Only the tuple matters.
+    fn router_test_packet(
+        src: Ipv4Addr,
+        dst: Ipv4Addr,
+        src_port: u16,
+        dst_port: u16,
+    ) -> Vec<u8> {
+        let mut packet = vec![0u8; 40];
+        packet[0] = 0x45;
+        packet[9] = 6; // TCP
+        packet[12..16].copy_from_slice(&src.octets());
+        packet[16..20].copy_from_slice(&dst.octets());
+        packet[20..22].copy_from_slice(&src_port.to_be_bytes());
+        packet[22..24].copy_from_slice(&dst_port.to_be_bytes());
+        packet
+    }
+
+    fn router_test_frame(payload: Vec<u8>) -> SessionFrame {
+        SessionFrame {
+            header: SessionHeader {
+                connection_id: 1,
+                sequence: 1,
+                flags: 0,
+            },
+            payload: payload.into(),
+        }
+    }
+
+    /// Return traffic follows the transport the flow's most recent
+    /// uplink data arrived on (4.52), and re-pins when the uplink
+    /// moves. The reply packet is the tuple-reversed uplink packet,
+    /// so the direction-independent flow key is what matches them —
+    /// the per-direction flow hash would not.
+    #[tokio::test]
+    async fn deliver_returns_on_last_used_transport() {
+        let (router, _tx) = SessionOutboundRouter::new();
+        let (tx1, mut rx1) = mpsc::unbounded_channel::<SessionFrame>();
+        let (tx2, mut rx2) = mpsc::unbounded_channel::<SessionFrame>();
+        router.add_transport(1, tx1);
+        router.add_transport(2, tx2);
+        router.note_frame_flags(bonded_core::session::FLAG_MULTIPATH_RECV);
+        let client = Ipv4Addr::new(10, 8, 0, 2);
+        let server = Ipv4Addr::new(93, 184, 216, 34);
+        let uplink = router_test_packet(client, server, 51000, 443);
+        let downlink = router_test_packet(server, client, 443, 51000);
+
+        // Uplink on transport 2: the reply goes back on 2, even
+        // though the hash pin may point at 1.
+        router.note_frame(2, &router_test_frame(uplink.clone()));
+        router.deliver(router_test_frame(downlink.clone()));
+        assert!(
+            rx2.try_recv().is_ok(),
+            "reply must return on the last-used transport"
+        );
+        assert!(rx1.try_recv().is_err(), "reply must not also go to 1");
+
+        // The same flow's next uplink arrives on transport 1: the
+        // reply re-pins to 1.
+        router.note_frame(1, &router_test_frame(uplink.clone()));
+        router.deliver(router_test_frame(downlink.clone()));
+        assert!(rx1.try_recv().is_ok(), "reply must follow the uplink move");
+        assert!(rx2.try_recv().is_err(), "reply must leave 2 after the move");
+    }
+
+    /// A flow with no uplink data yet falls back to the existing
+    /// hash pin, and a flow whose last-used transport died falls back
+    /// the same way (the dead id is never a candidate).
+    #[tokio::test]
+    async fn deliver_falls_back_to_hash_pin_without_uplink() {
+        let (router, _tx) = SessionOutboundRouter::new();
+        let (tx1, mut rx1) = mpsc::unbounded_channel::<SessionFrame>();
+        let (tx2, mut rx2) = mpsc::unbounded_channel::<SessionFrame>();
+        router.add_transport(1, tx1);
+        router.add_transport(2, tx2);
+        router.note_frame_flags(bonded_core::session::FLAG_MULTIPATH_RECV);
+        let client = Ipv4Addr::new(10, 8, 0, 2);
+        let server = Ipv4Addr::new(93, 184, 216, 34);
+        let downlink = router_test_packet(server, client, 443, 51000);
+
+        // No uplink noted: exactly one transport gets the frame, and
+        // it is the hash pin over the sorted ids [1, 2].
+        router.deliver(router_test_frame(downlink.clone()));
+        let expected = [1u64, 2u64][bonded_core::flow::pick_index(
+            bonded_core::flow::flow_hash(&downlink),
+            2,
+        )];
+        let got1 = rx1.try_recv().is_ok();
+        let got2 = rx2.try_recv().is_ok();
+        assert_ne!(got1, got2, "exactly one transport must receive the frame");
+        assert_eq!(
+            got1, expected == 1,
+            "fallback must be the hash pin (transport {expected})"
+        );
+
+        // Uplink on 2, then 2 dies: the reply falls back to 1 instead
+        // of being offered to the dead transport.
+        let uplink = router_test_packet(client, server, 51000, 443);
+        router.note_frame(2, &router_test_frame(uplink));
+        router.remove_transport(2);
+        drop(rx2);
+        router.deliver(router_test_frame(downlink));
+        assert!(rx1.try_recv().is_ok(), "reply must fall back to 1");
+    }
+
+    /// Heartbeat frames must not claim a flow: a PING's payload is
+    /// not flow traffic, so noting one must leave the return routing
+    /// of real flows untouched.
+    #[tokio::test]
+    async fn ping_frames_do_not_claim_a_flow() {
+        let (router, _tx) = SessionOutboundRouter::new();
+        let (tx1, mut rx1) = mpsc::unbounded_channel::<SessionFrame>();
+        let (tx2, mut rx2) = mpsc::unbounded_channel::<SessionFrame>();
+        router.add_transport(1, tx1);
+        router.add_transport(2, tx2);
+        router.note_frame_flags(bonded_core::session::FLAG_MULTIPATH_RECV);
+        let client = Ipv4Addr::new(10, 8, 0, 2);
+        let server = Ipv4Addr::new(93, 184, 216, 34);
+        let downlink = router_test_packet(server, client, 443, 51000);
+
+        // A PING whose payload happens to be a flow packet, arriving
+        // on transport 2, must not pin the flow to 2.
+        let mut ping = router_test_frame(router_test_packet(client, server, 51000, 443));
+        ping.header.flags = bonded_core::session::FLAG_PING;
+        router.note_frame(2, &ping);
+        router.deliver(router_test_frame(downlink.clone()));
+        let expected = [1u64, 2u64][bonded_core::flow::pick_index(
+            bonded_core::flow::flow_hash(&downlink),
+            2,
+        )];
+        assert_eq!(
+            rx1.try_recv().is_ok(),
+            expected == 1,
+            "a PING must not move the flow off its hash pin"
+        );
+        assert_eq!(rx2.try_recv().is_ok(), expected == 2);
     }
 
     #[tokio::test]

@@ -1135,7 +1135,7 @@ async fn handle_transport_session<T: Transport>(
                     break;
                 }
             } else {
-                session_ctx.router.note_frame(transport_id, frame.header.flags);
+                session_ctx.router.note_frame(transport_id, &frame);
                 forwarder.ingest_packet(frame);
             }
             continue;
@@ -1224,7 +1224,7 @@ async fn handle_transport_session<T: Transport>(
                             }
                             continue;
                         }
-                        session_ctx.router.note_frame(transport_id, frame.header.flags);
+                        session_ctx.router.note_frame(transport_id, &frame);
                         forwarder.ingest_packet(frame);
                     }
                     Err(err) => {

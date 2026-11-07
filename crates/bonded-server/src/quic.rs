@@ -350,7 +350,7 @@ async fn handle_quic_connection(
                     break 'session;
                 }
             } else {
-                session_ctx.router.note_frame(transport_id, frame.header.flags);
+                session_ctx.router.note_frame(transport_id, &frame);
                 forwarder.ingest_packet(frame);
             }
             continue;
@@ -419,7 +419,7 @@ async fn handle_quic_connection(
                             }
                             continue;
                         }
-                        session_ctx.router.note_frame(transport_id, frame.header.flags);
+                        session_ctx.router.note_frame(transport_id, &frame);
                         forwarder.ingest_packet(frame);
                     }
                     Err(err) => {

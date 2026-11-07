@@ -1139,6 +1139,8 @@ class BondedVpnService : VpnService() {
 
     private external fun nativeUpdateTrafficRules(trafficRulesJson: String): Boolean
 
+    private external fun nativeUpdatePathGrades(pathGradesJson: String): Boolean
+
     private external fun nativeStopSession()
 
     private external fun nativePausePath(pathIndex: Int, paused: Boolean): Boolean
@@ -1639,6 +1641,23 @@ class BondedVpnService : VpnService() {
             val service = activeInstance ?: return false
             return try {
                 service.nativeUpdateTrafficRules(trafficRulesJson)
+            } catch (_: Exception) {
+                false
+            }
+        }
+
+        /** Live per-transport grades update (4.52): hands the running
+         * Rust session the Dart grader's current grades (JSON array,
+         * one entry per transport vec index, null when a path has no
+         * grade yet) without restarting it. False when no service
+         * instance is running — the worker then ranks best transport
+         * on RTT/loss until the next push. The Kotlin side is a
+         * string passthrough, like the rule table: it never parses
+         * the JSON. */
+        fun updatePathGrades(pathGradesJson: String): Boolean {
+            val service = activeInstance ?: return false
+            return try {
+                service.nativeUpdatePathGrades(pathGradesJson)
             } catch (_: Exception) {
                 false
             }

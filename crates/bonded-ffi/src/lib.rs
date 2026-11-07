@@ -106,6 +106,77 @@ fn set_traffic_mode_engine(json: &str) {
     }
 }
 
+/// Live per-transport grades from the Dart grader (4.50), in snapshot
+/// paths-list order (one entry per transport vec index, `null` when a
+/// path has no grade yet). The Dart UI pushes the current grades on
+/// its existing 1 s poll tick; the worker reads them on the packet
+/// path, so the best-transport mode ranks on the grades the user sees
+/// on the Paths card. Not `#[cfg(android)]`-gated: the session tests
+/// exercise it on Linux too.
+static PATH_GRADES: std::sync::RwLock<Vec<Option<u8>>> =
+    std::sync::RwLock::new(Vec::new());
+
+/// Replace the live grades from the JSON array the UI hands over.
+/// Malformed JSON clears the grades rather than keeping stale ones —
+/// best transport then ranks on RTT/loss until the next good push.
+fn set_path_grades(json: &str) {
+    let grades: Vec<Option<u8>> = serde_json::from_str(json).unwrap_or_default();
+    if let Ok(mut guard) = PATH_GRADES.write() {
+        *guard = grades;
+    }
+}
+
+/// Snapshot the live grades for one packet's pin decision. Cloned
+/// under a read lock so the worker never holds the lock while
+/// ordering; grade pushes are once a second and the table is tiny.
+fn path_grades_snapshot() -> Vec<Option<u8>> {
+    PATH_GRADES
+        .read()
+        .map(|guard| guard.clone())
+        .unwrap_or_default()
+}
+
+/// Build the per-transport signals for one packet's pin decision
+/// (4.52): RTT from the last heartbeat pong (0 = none measured yet),
+/// QUIC loss rate from the cumulative counters (none while sent is
+/// zero, or for transports that cannot observe loss), and the live
+/// Dart grade by vec index. The snapshot's `path_stats` are in
+/// transport vec-index order (see `publish_path_stats`), so index
+/// `i` is transport `i`; a snapshot shorter than the transport set
+/// pads with the all-unknown signal.
+#[cfg(any(target_os = "android", test))]
+fn path_signals(
+    snapshot: &Arc<Mutex<AndroidSessionSnapshot>>,
+    count: usize,
+) -> Vec<bonded_core::traffic_mode::PathSignal> {
+    use bonded_core::traffic_mode::PathSignal;
+    let grades = path_grades_snapshot();
+    let snapshot = snapshot
+        .lock()
+        .expect("android session snapshot lock poisoned");
+    (0..count)
+        .map(|index| {
+            let stat = snapshot.path_stats.get(index);
+            PathSignal {
+                rtt_ms: stat.and_then(|stat| {
+                    if stat.last_rtt_ms > 0 {
+                        Some(stat.last_rtt_ms)
+                    } else {
+                        None
+                    }
+                }),
+                loss_rate: stat.and_then(|stat| match (stat.quic_lost_packets, stat.quic_sent_packets) {
+                    (Some(lost), Some(sent)) if sent > 0 => {
+                        Some(lost as f64 / sent as f64)
+                    }
+                    _ => None,
+                }),
+                grade: grades.get(index).copied().flatten(),
+            }
+        })
+        .collect()
+}
+
 /// Called by the JVM when the native library is first loaded.  We grab the
 /// JavaVM here so we can attach arbitrary threads later.
 #[cfg(target_os = "android")]
@@ -1272,6 +1343,11 @@ fn start_android_session(
     // pinned under a stale or empty engine.
     set_traffic_mode_engine(traffic_rules_json);
 
+    // Grades (4.52): a new session starts with no grades — the
+    // previous session's grades must not rank this session's paths
+    // before the UI's first poll-tick push lands.
+    set_path_grades("[]");
+
     let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
     let inbound_queue = Arc::new(Mutex::new(VecDeque::new()));
     let worker_inbound_queue = Arc::clone(&inbound_queue);
@@ -2313,12 +2389,19 @@ fn start_android_session(
                                 // pre-multipath behavior. (Ordered before
                                 // the frame is built: building the frame
                                 // moves the packet.)
+                                //
+                                // Signals (4.52): the live per-path
+                                // signals — heartbeat RTT, QUIC loss,
+                                // and the Dart grades pushed on the
+                                // 1 s poll tick — so best-transport and
+                                // lowest-latency have something to rank
+                                // on. The default mode ignores them.
                                 let engine = traffic_mode_engine_snapshot();
                                 let ordered = engine.order_for_packet(
                                     &packet,
                                     transports.len(),
                                     active_index,
-                                    &[],
+                                    &path_signals(&worker_snapshot, transports.len()),
                                 );
                                 let frame = session.create_outbound_frame(Bytes::from(packet), 0);
                                 // Paused paths go last in the try-list:
@@ -3542,6 +3625,29 @@ pub extern "system" fn Java_com_bonded_bonded_1app_BondedVpnService_nativeUpdate
     1
 }
 
+/// Live per-transport grades update (4.52): hands the running worker
+/// the Dart grader's current grades (JSON array, one entry per
+/// transport vec index, `null` when a path has no grade yet) without
+/// restarting the session. The worker picks the snapshot up on its
+/// next packet. Always returns true — malformed JSON clears the
+/// grades inside `set_path_grades`, so there is no failure to
+/// report; best transport then ranks on RTT/loss until the next
+/// good push.
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_bonded_bonded_1app_BondedVpnService_nativeUpdatePathGrades(
+    mut env: jni::JNIEnv,
+    _obj: jni::objects::JObject,
+    path_grades_json: jni::objects::JString,
+) -> jni::sys::jboolean {
+    let path_grades_json: String = match env.get_string(&path_grades_json) {
+        Ok(value) => value.into(),
+        Err(_) => return 0,
+    };
+    set_path_grades(&path_grades_json);
+    1
+}
+
 /// In-app QUIC handshake probe (diagnostics): dials one production-shaped
 /// QUIC session connection using the same protect / network-bind
 /// callbacks as a live session, from a dedicated thread + runtime (the
@@ -3772,6 +3878,106 @@ mod tests {
             json.contains("\"quicSentPackets\":null"),
             "unmeasured QUIC sent packets should be null: {json}"
         );
+    }
+
+    #[test]
+    fn path_grades_parse_and_signal_build() {
+        use super::AndroidPathStat;
+        use super::AndroidSessionSnapshot;
+        use super::PeerShareRelayStats;
+        use super::SessionWakeupStats;
+        use std::sync::Arc;
+
+        // Grade JSON is a bare array in snapshot paths-list order:
+        // one grade total (0–100) per transport vec index, null
+        // when the path has no grade yet.
+        super::set_path_grades("[84,null,71]");
+        assert_eq!(
+            super::path_grades_snapshot(),
+            vec![Some(84), None, Some(71)]
+        );
+        // Malformed JSON clears the grades instead of keeping stale
+        // ones — best transport then ranks on RTT/loss.
+        super::set_path_grades("{not json");
+        assert!(super::path_grades_snapshot().is_empty());
+        super::set_path_grades("[84,null]");
+        assert_eq!(super::path_grades_snapshot(), vec![Some(84), None]);
+
+        let snapshot = Arc::new(std::sync::Mutex::new(AndroidSessionSnapshot {
+            state: "connected".to_owned(),
+            server_address: "example.test:443".to_owned(),
+            active_transport: "QUIC".to_owned(),
+            transport_count: 2,
+            peer_relay_count: 0,
+            accepted_peer_relay_count: 0,
+            outbound_packets: 10,
+            inbound_packets: 9,
+            outbound_bytes: 100,
+            inbound_bytes: 90,
+            relay_stats: Arc::new(PeerShareRelayStats::default()),
+            wakeup_stats: Arc::new(SessionWakeupStats::default()),
+            connected_at_ms: 1_700_000_000_000,
+            last_error: None,
+            peer_share_error: None,
+            path_stats: vec![
+                AndroidPathStat {
+                    path_index: Some(0),
+                    kind: "QUIC".to_owned(),
+                    active: true,
+                    paused: false,
+                    outbound_bytes: 100,
+                    inbound_bytes: 90,
+                    wire_tx_bytes: Some(120),
+                    wire_rx_bytes: Some(110),
+                    quic_ping_frames: Some(7),
+                    quic_lost_packets: Some(3),
+                    quic_lost_bytes: Some(3600),
+                    quic_sent_packets: Some(100),
+                    last_rtt_ms: 12,
+                    server_seen_address: None,
+                    peer_id: None,
+                },
+                AndroidPathStat {
+                    path_index: Some(1),
+                    kind: "WebSocketTls".to_owned(),
+                    active: false,
+                    paused: false,
+                    outbound_bytes: 0,
+                    inbound_bytes: 0,
+                    wire_tx_bytes: None,
+                    wire_rx_bytes: None,
+                    quic_ping_frames: None,
+                    quic_lost_packets: None,
+                    quic_lost_bytes: None,
+                    quic_sent_packets: None,
+                    last_rtt_ms: 0,
+                    server_seen_address: None,
+                    peer_id: None,
+                },
+            ],
+            interception: None,
+        }));
+        let signals = super::path_signals(&snapshot, 2);
+        assert_eq!(signals.len(), 2);
+        // Path 0: grade 84 from the push, RTT 12 ms from the last
+        // heartbeat pong, loss 3/100 from the QUIC counters.
+        assert_eq!(signals[0].grade, Some(84));
+        assert_eq!(signals[0].rtt_ms, Some(12));
+        assert_eq!(signals[0].loss_rate, Some(0.03));
+        // Path 1: no grade pushed, no pong yet (RTT 0 = unmeasured),
+        // no loss counters — all unknown, never a fabricated 0.
+        assert_eq!(signals[1].grade, None);
+        assert_eq!(signals[1].rtt_ms, None);
+        assert_eq!(signals[1].loss_rate, None);
+        // A snapshot shorter than the transport set pads with the
+        // all-unknown signal.
+        let padded = super::path_signals(&snapshot, 3);
+        assert_eq!(padded.len(), 3);
+        assert_eq!(padded[2].grade, None);
+        assert_eq!(padded[2].rtt_ms, None);
+        assert_eq!(padded[2].loss_rate, None);
+        // Leave the global clean for the next test run.
+        super::set_path_grades("[]");
     }
 
     #[test]

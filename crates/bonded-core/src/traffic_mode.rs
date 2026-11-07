@@ -2,9 +2,9 @@
 //!
 //! A mode picks how a flow's packets are spread over the session's
 //! transports. The default mode is today's behavior: pin each flow to
-//! one transport by flow hash. The other modes (`best_transport`,
-//! `lowest_latency`, `bandwidth_boost`, `redundant`) land in slices
-//! 4.52–4.54; until a mode's slice lands, selecting it falls back to
+//! one transport by flow hash. `best_transport` and `lowest_latency`
+//! landed in 4.52; `bandwidth_boost` lands in 4.53 and `redundant`
+//! in 4.54. Until a mode's slice lands, selecting it falls back to
 //! default behavior — never silently pretending the mode is live.
 //!
 //! Rules resolve a mode per flow from the destination IP only. A rule
@@ -17,7 +17,7 @@
 //! The engine is deliberately data-only: it knows nothing about
 //! transports, sessions, or the UI. Both flow-pin points (the Linux
 //! client loop and the Android worker) consult it the same way, so
-//! 4.52–4.54 only add ordering arms in [`TrafficModeEngine::order_candidates`].
+//! 4.53–4.54 only add ordering arms in [`TrafficModeEngine::order_candidates`].
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -35,7 +35,7 @@ pub enum TrafficMode {
     Default,
     /// Send on the transport the most recent data came on (4.52).
     BestTransport,
-    /// Send on the lowest-latency transport (4.53).
+    /// Send on the lowest-latency transport (4.52).
     LowestLatency,
     /// Flow-level spreading weighted by grade/loss (4.53).
     BandwidthBoost,
@@ -67,11 +67,15 @@ impl TrafficMode {
         }
     }
 
-    /// Only `default` has behavior in this slice. The rest are
-    /// selectable in the UI but fall back to default until their slice
-    /// lands (4.52–4.54) — the UI says so, and so does this function.
+    /// `default`, `best_transport`, and `lowest_latency` have behavior
+    /// (4.51–4.52). The rest are selectable in the UI but fall back to
+    /// default until their slice lands (4.53–4.54) — the UI says so,
+    /// and so does this function.
     pub fn is_implemented(self) -> bool {
-        matches!(self, TrafficMode::Default)
+        matches!(
+            self,
+            TrafficMode::Default | TrafficMode::BestTransport | TrafficMode::LowestLatency
+        )
     }
 
     /// The mode that actually governs behavior: an unimplemented mode
@@ -248,26 +252,40 @@ impl TrafficModeEngine {
     /// entry is tried first; on send failure the caller tries the next
     /// one (the existing failover discipline is unchanged).
     ///
-    /// Only `default` is implemented in this slice: hash-spread the
-    /// flow over all transports, active transport last as the final
-    /// fallback (it is already in the rotation when transports exist,
-    /// so the append only fires for the empty-transport case). The
-    /// catch-all arm is the same default order — that is the honest
-    /// fallback for modes whose slices have not landed yet, and it is
-    /// what makes 4.52–4.54 pure additions: each adds one arm here and
-    /// flips its `is_implemented`.
+    /// `default` hash-spreads the flow over all transports, active
+    /// transport last as the final fallback (it is already in the
+    /// rotation when transports exist, so the append only fires for
+    /// the empty-transport case). `best_transport` (4.52) ranks by the
+    /// 4.50 per-transport grade first, then RTT, then loss; a missing
+    /// signal sorts after any measured one, so an unmeasured path is
+    /// never preferred over a measured one and never treated as
+    /// perfect. `lowest_latency` (4.52) ranks on RTT alone — one
+    /// metric, no grade or loss tiebreak. Both are deterministic in
+    /// the signals, so a flow stays pinned to its first candidate
+    /// while the transport set and the signals are stable (the same
+    /// pinning discipline as the hash rotation, without per-packet
+    /// re-pinning). The catch-all arm is the same default order —
+    /// that is the honest fallback for modes whose slices have not
+    /// landed yet, and it is what makes 4.53–4.54 pure additions:
+    /// each adds one arm here and flips its `is_implemented`.
     pub fn order_candidates(
         &self,
         mode: TrafficMode,
         flow_hash: u64,
         count: usize,
         active_index: usize,
-        _signals: &[PathSignal],
+        signals: &[PathSignal],
     ) -> Vec<usize> {
         match mode {
             TrafficMode::Default => default_order(flow_hash, count, active_index),
-            // 4.52: BestTransport. 4.53: LowestLatency, BandwidthBoost.
-            // 4.54: Redundant. Until then, fall back to default order.
+            TrafficMode::BestTransport => {
+                ranked_order(count, active_index, signals, best_transport_cmp)
+            }
+            TrafficMode::LowestLatency => {
+                ranked_order(count, active_index, signals, lowest_latency_cmp)
+            }
+            // 4.53: BandwidthBoost. 4.54: Redundant. Until then, fall
+            // back to default order.
             _ => default_order(flow_hash, count, active_index),
         }
     }
@@ -304,6 +322,96 @@ fn default_order(flow_hash: u64, count: usize, active_index: usize) -> Vec<usize
         }
     }
     candidates
+}
+
+/// Compare two optional measurements so a measured value always beats
+/// an unknown one (the 4.49 discipline: missing is unknown, never a
+/// fabricated 0). `higher_better` flips the measured order — grade
+/// ranks higher-first, RTT and loss rank lower-first — without moving
+/// the unknowns ahead of measured values.
+fn cmp_measured<T: Ord>(
+    a: Option<T>,
+    b: Option<T>,
+    higher_better: bool,
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a, b) {
+        (Some(x), Some(y)) => {
+            if higher_better {
+                y.cmp(&x)
+            } else {
+                x.cmp(&y)
+            }
+        }
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+/// Same as [`cmp_measured`] for the loss rate, which is an `f64` and
+/// has no `Ord`. A NaN rate (which the signal builders never produce
+/// — loss is lost/sent over real counters) compares equal.
+fn cmp_loss_rate(a: Option<f64>, b: Option<f64>) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a, b) {
+        (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(Ordering::Equal),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+/// Best-transport ranking (4.52): the 4.50 grade first (higher wins),
+/// then RTT (lower wins), then loss rate (lower wins). A missing
+/// signal at any step sorts after any measured one, so the ranking
+/// degrades gracefully as signals arrive: no grades yet → RTT
+/// decides; no RTT yet either → loss decides; nothing measured →
+/// index order (there is nothing to rank on, so every flow starts on
+/// transport 0 until the first heartbeat pong or grade push).
+fn best_transport_cmp(a: &PathSignal, b: &PathSignal) -> std::cmp::Ordering {
+    cmp_measured(a.grade, b.grade, true)
+        .then(cmp_measured(a.rtt_ms, b.rtt_ms, false))
+        .then(cmp_loss_rate(a.loss_rate, b.loss_rate))
+}
+
+/// Lowest-latency ranking (4.52): a single metric — RTT, lower wins.
+/// Deliberately NOT a re-skin of best transport: grade and loss never
+/// enter the comparison, so a high-grade path with a slow RTT loses
+/// to a low-grade path with a fast one. Missing RTT sorts after any
+/// measured RTT; with nothing measured the order is index order.
+fn lowest_latency_cmp(a: &PathSignal, b: &PathSignal) -> std::cmp::Ordering {
+    cmp_measured(a.rtt_ms, b.rtt_ms, false)
+}
+
+/// Order `0..count` by a signal comparator. The transport index
+/// breaks remaining ties so the order is deterministic for a given
+/// signal set — that determinism is what pins a flow while the set
+/// is stable. With no transports the active transport is the only
+/// candidate (the same empty-set shape as [`default_order`]).
+/// Signals are looked up by transport index; a short slice pads with
+/// the default (all-unknown) signal, so a caller whose snapshot lags
+/// the transport set still gets a full order.
+fn ranked_order(
+    count: usize,
+    active_index: usize,
+    signals: &[PathSignal],
+    compare: fn(&PathSignal, &PathSignal) -> std::cmp::Ordering,
+) -> Vec<usize> {
+    let mut indices: Vec<usize> = (0..count).collect();
+    if indices.is_empty() {
+        indices.push(active_index);
+        return indices;
+    }
+    indices.sort_by(|&a, &b| {
+        let sa = signals.get(a).copied().unwrap_or_default();
+        let sb = signals.get(b).copied().unwrap_or_default();
+        compare(&sa, &sb).then(a.cmp(&b))
+    });
+    if !indices.contains(&active_index) {
+        indices.push(active_index);
+    }
+    indices
 }
 
 /// Parse `address/prefix` into (network address, prefix length).
@@ -400,12 +508,20 @@ mod tests {
     }
 
     #[test]
-    fn only_default_is_implemented() {
+    fn default_best_and_lowest_latency_are_implemented() {
         assert!(TrafficMode::Default.is_implemented());
-        assert!(!TrafficMode::BestTransport.is_implemented());
-        assert!(!TrafficMode::LowestLatency.is_implemented());
+        assert!(TrafficMode::BestTransport.is_implemented());
+        assert!(TrafficMode::LowestLatency.is_implemented());
         assert!(!TrafficMode::BandwidthBoost.is_implemented());
         assert!(!TrafficMode::Redundant.is_implemented());
+        assert_eq!(
+            TrafficMode::BestTransport.effective(),
+            TrafficMode::BestTransport
+        );
+        assert_eq!(
+            TrafficMode::LowestLatency.effective(),
+            TrafficMode::LowestLatency
+        );
         assert_eq!(
             TrafficMode::Redundant.effective(),
             TrafficMode::Default
@@ -601,18 +717,200 @@ mod tests {
             vec![3]
         );
         // Unimplemented modes fall back to exactly the default order.
-        for mode in [
-            TrafficMode::BestTransport,
-            TrafficMode::LowestLatency,
-            TrafficMode::BandwidthBoost,
-            TrafficMode::Redundant,
-        ] {
+        for mode in [TrafficMode::BandwidthBoost, TrafficMode::Redundant] {
             assert_eq!(
                 engine.order_candidates(mode, 5, 3, 1, &[]),
                 engine.order_candidates(TrafficMode::Default, 5, 3, 1, &[]),
                 "mode {mode:?} must fall back to default order"
             );
         }
+    }
+
+    fn signal(grade: Option<u8>, rtt_ms: Option<u64>, loss_rate: Option<f64>) -> PathSignal {
+        PathSignal {
+            grade,
+            rtt_ms,
+            loss_rate,
+        }
+    }
+
+    #[test]
+    fn best_transport_ranks_grade_first() {
+        let engine = TrafficModeEngine::default();
+        // Grades 80 / 95 / 70: the 95-grade transport leads even
+        // though its RTT is the worst of the three.
+        let signals = [
+            signal(Some(80), Some(20), Some(0.01)),
+            signal(Some(95), Some(200), Some(0.09)),
+            signal(Some(70), Some(10), Some(0.0)),
+        ];
+        assert_eq!(
+            engine.order_candidates(TrafficMode::BestTransport, 7, 3, 0, &signals),
+            vec![1, 0, 2]
+        );
+        // The flow hash must not move the pick: every flow of this
+        // mode goes to the best-graded transport first.
+        for flow in 0..16u64 {
+            let ordered =
+                engine.order_candidates(TrafficMode::BestTransport, flow, 3, 0, &signals);
+            assert_eq!(ordered[0], 1, "flow {flow} must start on the best grade");
+        }
+    }
+
+    #[test]
+    fn best_transport_tiebreaks_rtt_then_loss() {
+        let engine = TrafficModeEngine::default();
+        // Equal grades: RTT decides (30 beats 50); the two 30 ms
+        // paths are split by loss (1% beats 5%).
+        let signals = [
+            signal(Some(80), Some(50), Some(0.0)),
+            signal(Some(80), Some(30), Some(0.05)),
+            signal(Some(80), Some(30), Some(0.01)),
+        ];
+        assert_eq!(
+            engine.order_candidates(TrafficMode::BestTransport, 7, 3, 0, &signals),
+            vec![2, 1, 0]
+        );
+        // Equal grades and RTT: loss alone decides.
+        let signals = [
+            signal(Some(80), Some(30), Some(0.04)),
+            signal(Some(80), Some(30), Some(0.02)),
+        ];
+        assert_eq!(
+            engine.order_candidates(TrafficMode::BestTransport, 7, 2, 0, &signals),
+            vec![1, 0]
+        );
+    }
+
+    #[test]
+    fn best_transport_unknown_signals_sort_last() {
+        let engine = TrafficModeEngine::default();
+        // An ungraded path never outranks a graded one, even with a
+        // perfect-looking RTT: unknown is not good.
+        let signals = [
+            signal(None, Some(5), Some(0.0)),
+            signal(Some(60), Some(500), Some(0.09)),
+        ];
+        assert_eq!(
+            engine.order_candidates(TrafficMode::BestTransport, 7, 2, 0, &signals),
+            vec![1, 0]
+        );
+        // No grades at all: RTT decides, unmeasured RTT last.
+        let signals = [
+            signal(None, None, Some(0.0)),
+            signal(None, Some(40), None),
+            signal(None, Some(20), None),
+        ];
+        assert_eq!(
+            engine.order_candidates(TrafficMode::BestTransport, 7, 3, 0, &signals),
+            vec![2, 1, 0]
+        );
+        // Nothing measured anywhere: index order — deterministic, and
+        // every flow starts on transport 0 until signals arrive.
+        assert_eq!(
+            engine.order_candidates(TrafficMode::BestTransport, 7, 3, 0, &[]),
+            vec![0, 1, 2]
+        );
+        // A short signals slice pads with unknown: the missing path
+        // sorts last behind measured ones.
+        let signals = [signal(Some(90), Some(10), Some(0.0))];
+        assert_eq!(
+            engine.order_candidates(TrafficMode::BestTransport, 7, 3, 0, &signals),
+            vec![0, 1, 2]
+        );
+        // Empty transport set: the active transport is the only
+        // candidate, same shape as the default order.
+        assert_eq!(
+            engine.order_candidates(TrafficMode::BestTransport, 7, 0, 3, &signals),
+            vec![3]
+        );
+    }
+
+    #[test]
+    fn lowest_latency_ranks_rtt_only() {
+        let engine = TrafficModeEngine::default();
+        // RTT 100 / 20 / 50: the 20 ms transport leads.
+        let signals = [
+            signal(Some(99), Some(100), Some(0.0)),
+            signal(Some(10), Some(20), Some(0.09)),
+            signal(Some(50), Some(50), Some(0.01)),
+        ];
+        assert_eq!(
+            engine.order_candidates(TrafficMode::LowestLatency, 7, 3, 0, &signals),
+            vec![1, 2, 0],
+            "grade and loss must not enter a lowest-latency ranking"
+        );
+        // A high-grade path with a slow RTT loses to a low-grade path
+        // with a fast one — this is what makes lowest-latency its own
+        // mode, not a re-skin of best transport.
+        let signals = [
+            signal(Some(99), Some(300), Some(0.0)),
+            signal(Some(40), Some(25), Some(0.09)),
+        ];
+        assert_eq!(
+            engine.order_candidates(TrafficMode::LowestLatency, 7, 2, 0, &signals),
+            vec![1, 0]
+        );
+        // The flow hash must not move the pick either.
+        for flow in 0..16u64 {
+            let ordered =
+                engine.order_candidates(TrafficMode::LowestLatency, flow, 2, 0, &signals);
+            assert_eq!(ordered[0], 1, "flow {flow} must start on the lowest RTT");
+        }
+    }
+
+    #[test]
+    fn lowest_latency_unknown_rtt_sorts_last() {
+        let engine = TrafficModeEngine::default();
+        let signals = [signal(None, None, None), signal(None, Some(40), None)];
+        assert_eq!(
+            engine.order_candidates(TrafficMode::LowestLatency, 7, 2, 0, &signals),
+            vec![1, 0]
+        );
+        // Nothing measured: index order.
+        assert_eq!(
+            engine.order_candidates(TrafficMode::LowestLatency, 7, 3, 0, &[]),
+            vec![0, 1, 2]
+        );
+        // Equal RTTs: index order (deterministic, no second metric).
+        let signals = [signal(None, Some(30), None), signal(None, Some(30), None)];
+        assert_eq!(
+            engine.order_candidates(TrafficMode::LowestLatency, 7, 2, 0, &signals),
+            vec![0, 1]
+        );
+        // Empty transport set: active transport only.
+        assert_eq!(
+            engine.order_candidates(TrafficMode::LowestLatency, 7, 0, 2, &[]),
+            vec![2]
+        );
+    }
+
+    #[test]
+    fn order_for_packet_modes_use_signals() {
+        // IPv4 UDP packet to 10.1.2.3 with a best-transport rule for
+        // 10.0.0.0/8: the best-graded transport leads the try-list.
+        let engine = TrafficModeEngine {
+            default_mode: TrafficMode::Default,
+            rules: vec![subnet_rule("s", "10.0.0.0/8", TrafficMode::BestTransport)],
+        };
+        let mut packet = vec![0x45u8, 0, 0, 28, 0, 0, 0, 0, 64, 17, 0, 0];
+        packet.extend_from_slice(&[192, 0, 2, 1]); // src
+        packet.extend_from_slice(&[10, 1, 2, 3]); // dst
+        packet.extend_from_slice(&[1234u16.to_be_bytes(), 53u16.to_be_bytes()].concat());
+        let signals = [
+            signal(Some(70), Some(10), Some(0.0)),
+            signal(Some(90), Some(80), Some(0.0)),
+        ];
+        let ordered = engine.order_for_packet(&packet, 2, 0, &signals);
+        assert_eq!(ordered, vec![1, 0]);
+        // Same packet, lowest-latency rule: the fast-RTT transport
+        // leads even though its grade is worse.
+        let engine = TrafficModeEngine {
+            default_mode: TrafficMode::Default,
+            rules: vec![subnet_rule("s", "10.0.0.0/8", TrafficMode::LowestLatency)],
+        };
+        let ordered = engine.order_for_packet(&packet, 2, 0, &signals);
+        assert_eq!(ordered, vec![0, 1]);
     }
 
     #[test]

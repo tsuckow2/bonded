@@ -776,6 +776,25 @@ class MainActivity : FlutterActivity() {
                                 result.success(BondedVpnService.updateTrafficRules(json))
                             }
                         }
+                        // Live per-transport grades push (4.52): hands
+                        // the running Rust session the Dart grader's
+                        // current grades without restarting it. False
+                        // when no session is running — the worker then
+                        // ranks best transport on RTT/loss until the
+                        // next push.
+                        "updatePathGrades" -> {
+                            val args = call.arguments as? Map<*, *>
+                            val json = args?.get("pathGradesJson") as? String
+                            if (json == null) {
+                                result.error(
+                                        "bad_args",
+                                        "pathGradesJson is required",
+                                        null,
+                                )
+                            } else {
+                                result.success(BondedVpnService.updatePathGrades(json))
+                            }
+                        }
                         // Launchable apps for the exclusion picker. Intent
                         // queries need no QUERY_ALL_PACKAGES permission, and
                         // our own package is never listed (it can never be

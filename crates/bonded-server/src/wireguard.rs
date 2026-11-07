@@ -889,7 +889,7 @@ async fn handle_decoded_frames(
 
         if let Some(forwarder) = &peer.forwarder {
             if let Some(ctx) = &peer.session_ctx {
-                ctx.router.note_frame(peer.transport_id, frame.header.flags);
+                ctx.router.note_frame(peer.transport_id, &frame);
             }
             forwarder.ingest_packet(frame);
         }

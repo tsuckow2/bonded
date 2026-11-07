@@ -790,7 +790,7 @@ async fn run_server(
                                 } else if let Some(f) = &forwarder {
                                     if let Some(ctx) = &session_ctx {
                                         ctx.router
-                                            .note_frame(transport_id, frame.header.flags);
+                                            .note_frame(transport_id, &frame);
                                     }
                                     f.ingest_packet(frame);
                                 }
@@ -916,12 +916,13 @@ async fn run_server(
                                         }
                                         if let Some(f) = &forwarder {
                                             // Track the last transport that delivered inbound
-                                            // traffic so the outbound router sends replies on
-                                            // the currently-live path (failover).
+                                            // traffic for this flow, so the outbound router
+                                            // sends the reply back on the same transport
+                                            // (4.52); `last_active` still covers failover.
                                             if let Some(ctx) = &session_ctx {
                                                 ctx.router.note_frame(
                                                     transport_id,
-                                                    frame.header.flags,
+                                                    &frame,
                                                 );
                                             }
                                             debug!(

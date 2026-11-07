@@ -1,13 +1,12 @@
 /// Traffic modes + per-destination rules (plan 4.51).
 ///
 /// A mode picks how a flow's packets are placed on the session's
-/// transports. Only `default` has behavior in this slice: today's
-/// flow-hash spreading across transports. The other modes
-/// (`bestTransport`, `lowestLatency`, `bandwidthBoost`, `redundant`)
-/// land in slices 4.52–4.54; until a mode's slice lands, selecting it
-/// falls back to default behavior — the UI says so, and so does the
-/// Rust engine, so a selected-but-unimplemented mode is never
-/// silently pretended.
+/// transports. `default` has behavior since 4.51; `bestTransport`
+/// and `lowestLatency` since 4.52. The other modes
+/// (`bandwidthBoost`, `redundant`) land in slices 4.53–4.54; until a
+/// mode's slice lands, selecting it falls back to default behavior —
+/// the UI says so, and so does the Rust engine, so a
+/// selected-but-unimplemented mode is never silently pretended.
 ///
 /// Rules resolve a mode per flow from the destination IP only, in
 /// Rust (`bonded-core` `TrafficModeEngine`). A rule matches an exact
@@ -32,7 +31,7 @@ enum TrafficMode {
   /// Send on the transport the most recent data came on (4.52).
   bestTransport,
 
-  /// Send on the lowest-latency transport (4.53).
+  /// Send on the lowest-latency transport (4.52).
   lowestLatency,
 
   /// Flow-level spreading weighted by grade/loss (4.53).
@@ -59,15 +58,19 @@ enum TrafficMode {
     TrafficMode.redundant => 'Redundant (all transports)',
   };
 
-  /// Only `default` has behavior in this slice. The rest are
-  /// selectable but fall back to default until their slice lands.
-  bool get isImplemented => this == TrafficMode.defaultMode;
+  /// `default`, `bestTransport`, and `lowestLatency` have behavior
+  /// (4.51–4.52). The rest are selectable but fall back to default
+  /// until their slice lands.
+  bool get isImplemented =>
+      this == TrafficMode.defaultMode ||
+      this == TrafficMode.bestTransport ||
+      this == TrafficMode.lowestLatency;
 
   /// The slice that implements this mode, for the UI fallback note.
   String get implementedIn => switch (this) {
     TrafficMode.defaultMode => '4.51',
     TrafficMode.bestTransport => '4.52',
-    TrafficMode.lowestLatency => '4.53',
+    TrafficMode.lowestLatency => '4.52',
     TrafficMode.bandwidthBoost => '4.53',
     TrafficMode.redundant => '4.54',
   };
