@@ -15,7 +15,7 @@ use bonded_core::session::SessionFrame;
 #[cfg(any(target_os = "android", test))]
 use bonded_core::session::{
     decode_observed_address, SessionHeader, SessionState, FLAG_MULTIPATH_RECV, FLAG_PATH_RETIRE,
-    FLAG_PING, FLAG_PONG, FLAG_SESSION_EPOCH,
+    FLAG_PING, FLAG_PONG, FLAG_REDUNDANT, FLAG_SESSION_EPOCH,
 };
 #[cfg(any(target_os = "android", test))]
 use bonded_core::transport::{NaiveTcpTransport, Transport};
@@ -996,6 +996,28 @@ fn demote_paused_paths(
         candidates.into_iter().partition(|&index| !is_paused(index));
     healthy.append(&mut paused);
     healthy
+}
+
+/// The fan-out set for a redundant flow (4.54): the healthy prefix
+/// of a demoted candidate list. `demote_paused_paths` is a stable
+/// partition — healthy first, paused last — so taking the prefix up
+/// to the first paused entry is exactly "every live transport".
+/// Paused paths (debug pause and battery-saver auto-pause alike)
+/// never receive a duplicate. When every candidate is paused the
+/// set is empty, and the caller falls back to the ordinary try-list
+/// so the packet still goes out once on a paused path instead of
+/// being dropped. With one transport the set is just it, so the
+/// single-transport degenerate case sends exactly one copy.
+#[cfg(any(target_os = "android", test))]
+fn redundant_fan_out_targets(
+    candidates: &[usize],
+    is_paused: impl Fn(usize) -> bool,
+) -> Vec<usize> {
+    candidates
+        .iter()
+        .copied()
+        .take_while(|&index| !is_paused(index))
+        .collect()
 }
 
 /// Move WireGuard to the front of the transport preference list for
@@ -2397,13 +2419,27 @@ fn start_android_session(
                                 // lowest-latency have something to rank
                                 // on. The default mode ignores them.
                                 let engine = traffic_mode_engine_snapshot();
+                                // Redundant (4.54): a flow in this mode
+                                // is NOT pinned — its packet is fanned
+                                // out to every live transport, and the
+                                // frame carries FLAG_REDUNDANT so the
+                                // server fans the return traffic out
+                                // the same way (the server has no rule
+                                // table; the flag is the signaling).
+                                // Non-redundant flows keep the
+                                // try-list discipline below.
+                                let mode = engine.mode_for_packet(&packet);
+                                let redundant = mode
+                                    == bonded_core::traffic_mode::TrafficMode::Redundant;
+                                let frame_flags = if redundant { FLAG_REDUNDANT } else { 0 };
                                 let ordered = engine.order_for_packet(
                                     &packet,
                                     transports.len(),
                                     active_index,
                                     &path_signals(&worker_snapshot, transports.len()),
                                 );
-                                let frame = session.create_outbound_frame(Bytes::from(packet), 0);
+                                let frame = session
+                                    .create_outbound_frame(Bytes::from(packet), frame_flags);
                                 // Paused paths go last in the try-list:
                                 // they stay connected, but a healthy path
                                 // is always tried first. (Relays never
@@ -2412,9 +2448,13 @@ fn start_android_session(
                                 // auto-pause counts exactly like a debug
                                 // pause here. Demotion preserves the
                                 // mode's order within each group.
-                                let mut candidates = demote_paused_paths(
-                                    ordered,
-                                    |vec_index| {
+                                //
+                                // The pause predicate is scoped to this
+                                // block: the send loops below mutate
+                                // `path_index_map`, so the closure must
+                                // be dropped before they run.
+                                let (mut candidates, fan_out) = {
+                                    let is_paused = |vec_index: usize| {
                                         path_index_map
                                             .path_of(vec_index)
                                             .map(|path| {
@@ -2422,71 +2462,161 @@ fn start_android_session(
                                                     || auto_paused_paths.contains(&path)
                                             })
                                             .unwrap_or(false)
-                                    },
-                                );
-                                if candidates.is_empty() {
-                                    candidates.push(active_index);
-                                } else if !candidates.contains(&active_index) {
-                                    candidates.push(active_index);
-                                }
-                                let mut send_queue: std::collections::VecDeque<usize> =
-                                    candidates.into();
-                                let mut sent = false;
-                                let mut sent_index: Option<usize> = None;
-                                let mut fatal_error: Option<String> = None;
-                                while let Some(index) = send_queue.pop_front() {
-                                    match transports[index].send(frame.clone()).await {
-                                        Ok(()) => {
-                                            sent = true;
-                                            sent_index = Some(index);
-                                            break;
+                                    };
+                                    let mut candidates =
+                                        demote_paused_paths(ordered, &is_paused);
+                                    if candidates.is_empty() {
+                                        candidates.push(active_index);
+                                    } else if !candidates.contains(&active_index) {
+                                        candidates.push(active_index);
+                                    }
+                                    // Redundant fan-out set: the healthy
+                                    // prefix of the demoted list — every
+                                    // live transport, no paused path.
+                                    // Empty when every transport is
+                                    // paused: then the fan-out is off
+                                    // and the ordinary try-list runs,
+                                    // so the packet still goes out once
+                                    // on a paused path instead of being
+                                    // dropped.
+                                    let fan_out = if redundant {
+                                        let targets = redundant_fan_out_targets(
+                                            &candidates,
+                                            &is_paused,
+                                        );
+                                        if targets.is_empty() {
+                                            None
+                                        } else {
+                                            Some(targets)
                                         }
-                                        Err(err) => {
-                                            alog_warn!(
-                                                "Worker: send on transport[{}] failed: {}",
-                                                index, err
-                                            );
-                                            if transports.len() == 1 {
-                                                fatal_error = Some(err.to_string());
+                                    } else {
+                                        None
+                                    };
+                                    (candidates, fan_out)
+                                };
+                                let mut sent = false;
+                                let mut sent_indices: Vec<usize> = Vec::new();
+                                let mut fatal_error: Option<String> = None;
+                                if let Some(targets) = fan_out {
+                                    // Redundant fan-out: one copy on
+                                    // every live transport. A failed
+                                    // target is removed and the fan-out
+                                    // continues on the rest — unlike
+                                    // the try-list, a success does NOT
+                                    // stop the loop. Targets are
+                                    // ascending (redundant order is
+                                    // index order, demotion is a stable
+                                    // partition), so each removal shifts
+                                    // every later target down by exactly
+                                    // one; `shift` tracks that instead
+                                    // of re-queuing.
+                                    let mut shift = 0usize;
+                                    for orig in targets {
+                                        let index = orig - shift;
+                                        match transports[index].send(frame.clone()).await {
+                                            Ok(()) => {
+                                                sent = true;
+                                                sent_indices.push(index);
+                                            }
+                                            Err(err) => {
+                                                alog_warn!(
+                                                    "Worker: redundant send on transport[{}] failed: {}",
+                                                    index, err
+                                                );
+                                                if transports.len() == 1 {
+                                                    fatal_error = Some(err.to_string());
+                                                    break;
+                                                }
+                                                if let Some(lost_path) =
+                                                    path_index_map.path_of(index)
+                                                {
+                                                    let _ = path_lost_tx.send(lost_path);
+                                                }
+                                                last_transport_change = Instant::now();
+                                                transports.remove(index);
+                                                path_index_map.on_remove(index);
+                                                if index < active_index {
+                                                    active_index -= 1;
+                                                } else if index == active_index
+                                                    && active_index >= transports.len()
+                                                {
+                                                    active_index = 0;
+                                                }
+                                                shift += 1;
+                                                sync_transport_snapshot(
+                                                    &worker_snapshot,
+                                                    &transports,
+                                                    active_index,
+                                                );
+                                                publish_path_stats(
+                                                    &worker_snapshot,
+                                                    &transports,
+                                                    &path_index_slots(
+                                                        &path_index_map,
+                                                        transports.len(),
+                                                    ),
+                                                    active_index,
+                                                );
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    let mut send_queue: std::collections::VecDeque<usize> =
+                                        candidates.into();
+                                    while let Some(index) = send_queue.pop_front() {
+                                        match transports[index].send(frame.clone()).await {
+                                            Ok(()) => {
+                                                sent = true;
+                                                sent_indices.push(index);
                                                 break;
                                             }
-                                            if let Some(lost_path) =
-                                                path_index_map.path_of(index)
-                                            {
-                                                let _ = path_lost_tx.send(lost_path);
-                                            }
-                                            last_transport_change = Instant::now();
-                                            transports.remove(index);
-                                            path_index_map.on_remove(index);
-                                            if index < active_index {
-                                                active_index -= 1;
-                                            } else if index == active_index
-                                                && active_index >= transports.len()
-                                            {
-                                                active_index = 0;
-                                            }
-                                            // The removal shifts every
-                                            // queued candidate above the
-                                            // removed index down by one.
-                                            for queued in send_queue.iter_mut() {
-                                                if *queued > index {
-                                                    *queued -= 1;
+                                            Err(err) => {
+                                                alog_warn!(
+                                                    "Worker: send on transport[{}] failed: {}",
+                                                    index, err
+                                                );
+                                                if transports.len() == 1 {
+                                                    fatal_error = Some(err.to_string());
+                                                    break;
                                                 }
+                                                if let Some(lost_path) =
+                                                    path_index_map.path_of(index)
+                                                {
+                                                    let _ = path_lost_tx.send(lost_path);
+                                                }
+                                                last_transport_change = Instant::now();
+                                                transports.remove(index);
+                                                path_index_map.on_remove(index);
+                                                if index < active_index {
+                                                    active_index -= 1;
+                                                } else if index == active_index
+                                                    && active_index >= transports.len()
+                                                {
+                                                    active_index = 0;
+                                                }
+                                                // The removal shifts every
+                                                // queued candidate above the
+                                                // removed index down by one.
+                                                for queued in send_queue.iter_mut() {
+                                                    if *queued > index {
+                                                        *queued -= 1;
+                                                    }
+                                                }
+                                                sync_transport_snapshot(
+                                                    &worker_snapshot,
+                                                    &transports,
+                                                    active_index,
+                                                );
+                                                publish_path_stats(
+                                                    &worker_snapshot,
+                                                    &transports,
+                                                    &path_index_slots(
+                                                        &path_index_map,
+                                                        transports.len(),
+                                                    ),
+                                                    active_index,
+                                                );
                                             }
-                                            sync_transport_snapshot(
-                                                &worker_snapshot,
-                                                &transports,
-                                                active_index,
-                                            );
-                                            publish_path_stats(
-                                                &worker_snapshot,
-                                                &transports,
-                                                &path_index_slots(
-                                                    &path_index_map,
-                                                    transports.len(),
-                                                ),
-                                                active_index,
-                                            );
                                         }
                                     }
                                 }
@@ -2506,9 +2636,15 @@ fn start_android_session(
                                     update_snapshot(&worker_snapshot, |session_snapshot| {
                                         session_snapshot.outbound_packets = session_snapshot.outbound_packets.saturating_add(1);
                                         session_snapshot.outbound_bytes = session_snapshot.outbound_bytes.saturating_add(packet_len);
-                                        if let Some(index) = sent_index {
+                                        // Session-level counters count the
+                                        // user packet once; each path that
+                                        // carried a copy is credited its
+                                        // own bytes, so a redundant packet
+                                        // shows once at the session level
+                                        // and N times across the paths.
+                                        for index in &sent_indices {
                                             if let Some(stat) =
-                                                session_snapshot.path_stats.get_mut(index)
+                                                session_snapshot.path_stats.get_mut(*index)
                                             {
                                                 stat.outbound_bytes =
                                                     stat.outbound_bytes.saturating_add(packet_len);
@@ -3759,6 +3895,7 @@ mod tests {
     use super::demote_paused_paths;
     use super::diff_path_addresses;
     use super::prefer_wireguard_first;
+    use super::redundant_fan_out_targets;
 
     #[test]
     fn snapshot_json_carries_wakeup_counters() {
@@ -4092,6 +4229,35 @@ mod tests {
             assert_eq!(ordered, expected);
         }
         assert!(demote_paused_paths(vec![], |_| false).is_empty());
+    }
+
+    #[test]
+    fn redundant_fan_out_covers_healthy_prefix_only() {
+        // Three transports, none paused: the fan-out is all of them.
+        assert_eq!(
+            redundant_fan_out_targets(&[0, 1, 2], |_| false),
+            vec![0, 1, 2]
+        );
+        // Transport 1 paused (after demotion it sits last): the
+        // fan-out is the healthy prefix [0, 2], never the paused one.
+        let demoted = demote_paused_paths(vec![0, 1, 2], |i| i == 1);
+        assert_eq!(demoted, vec![0, 2, 1]);
+        assert_eq!(
+            redundant_fan_out_targets(&demoted, |i| i == 1),
+            vec![0, 2]
+        );
+        // A paused transport first in the demoted list cannot happen
+        // (demotion is a stable partition), but the helper only ever
+        // takes the prefix up to the first paused entry, so a
+        // paused-first list fans out to nothing.
+        assert!(redundant_fan_out_targets(&[1, 0, 2], |i| i == 1).is_empty());
+        // All paused: empty — the caller falls back to the try-list
+        // instead of dropping the packet.
+        assert!(redundant_fan_out_targets(&[0, 1, 2], |_| true).is_empty());
+        // Single transport: exactly one copy — the degenerate case.
+        assert_eq!(redundant_fan_out_targets(&[0], |_| false), vec![0]);
+        // Empty list: empty.
+        assert!(redundant_fan_out_targets(&[], |_| false).is_empty());
     }
 
     use super::{

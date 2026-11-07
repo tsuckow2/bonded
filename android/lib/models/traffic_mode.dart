@@ -2,11 +2,10 @@
 ///
 /// A mode picks how a flow's packets are placed on the session's
 /// transports. `default` has behavior since 4.51; `bestTransport`
-/// and `lowestLatency` since 4.52; `bandwidthBoost` since 4.53. The
-/// other mode (`redundant`) lands in slice 4.54; until a mode's
-/// slice lands, selecting it falls back to default behavior —
-/// the UI says so, and so does the Rust engine, so a
-/// selected-but-unimplemented mode is never silently pretended.
+/// and `lowestLatency` since 4.52; `bandwidthBoost` since 4.53;
+/// `redundant` since 4.54. All five modes are implemented — no mode
+/// falls back to default any more, and the fallback note shows for
+/// no mode.
 ///
 /// Rules resolve a mode per flow from the destination IP only, in
 /// Rust (`bonded-core` `TrafficModeEngine`). A rule matches an exact
@@ -58,14 +57,15 @@ enum TrafficMode {
     TrafficMode.redundant => 'Redundant (all transports)',
   };
 
-  /// `default`, `bestTransport`, `lowestLatency`, and
-  /// `bandwidthBoost` have behavior (4.51–4.53). The rest are
-  /// selectable but fall back to default until their slice lands.
+  /// All five modes have behavior (4.51–4.54). `isImplemented`
+  /// stays as the UI's source of truth for the fallback note — it
+  /// is now true for every mode, so no mode shows the note.
   bool get isImplemented =>
       this == TrafficMode.defaultMode ||
       this == TrafficMode.bestTransport ||
       this == TrafficMode.lowestLatency ||
-      this == TrafficMode.bandwidthBoost;
+      this == TrafficMode.bandwidthBoost ||
+      this == TrafficMode.redundant;
 
   /// The slice that implements this mode, for the UI fallback note.
   String get implementedIn => switch (this) {

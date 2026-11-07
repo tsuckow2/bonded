@@ -12,8 +12,8 @@ import '../services/traffic_rules_service.dart';
 ///
 /// A mode whose slice has not landed yet — here or on a rule — falls
 /// back to default, and the screen says so next to the picker
-/// instead of pretending the mode is live. Since 4.52 that is only
-/// `bandwidthBoost` and `redundant`.
+/// instead of pretending the mode is live. Since 4.54 every mode has
+/// landed, so no mode falls back and the note shows nowhere.
 class TrafficRulesScreen extends StatefulWidget {
   const TrafficRulesScreen({super.key});
 

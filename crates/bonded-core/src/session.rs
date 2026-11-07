@@ -42,6 +42,20 @@ pub const FLAG_SESSION_EPOCH: u32 = 0x0010;
 /// sessions keep the idle-timeout behavior). QUIC/WSS only: a
 /// WireGuard transport carries no session frames.
 pub const FLAG_PATH_RETIRE: u32 = 0x0020;
+/// Frame flag: set on a client's outbound data frame when the flow's
+/// resolved traffic mode is `redundant` (4.54). It tells the server
+/// this flow is duplicated on every live transport, so the server
+/// must duplicate the return traffic the same way — the server has
+/// no rule table of its own, so the flag IS the signaling: one bit
+/// on frames the client already sends, no new control message, no
+/// extra round trip. The server records it per flow in the router
+/// (see `SessionOutboundRouter::note_frame`) and refreshes it on
+/// every uplink data frame, so a live rule change takes effect on
+/// the flow's next uplink packet. Old servers ignore unknown flag
+/// bits, so a new client degrades to single-transport return
+/// traffic against them; PING/PONG frames never carry it (the
+/// router skips control frames when recording flows).
+pub const FLAG_REDUNDANT: u32 = 0x0040;
 
 /// Parse a session-epoch binding PING's epoch, if present: the flag
 /// must be set and the payload must be exactly 8 bytes.

@@ -5,8 +5,11 @@ use bonded_core::config::ClientConfig;
 use bonded_core::heartbeat::{is_idle, pong_silence_timeout, IDLE_INTERVAL};
 #[cfg(target_os = "linux")]
 use bonded_core::session::{
-    SessionFrame, SessionHeader, SessionState, FLAG_MULTIPATH_RECV, FLAG_PING, FLAG_PONG,
+    SessionFrame, SessionHeader, SessionState, SessionStateError, FLAG_MULTIPATH_RECV,
+    FLAG_PING, FLAG_PONG, FLAG_REDUNDANT,
 };
+#[cfg(target_os = "linux")]
+use bonded_core::traffic_mode::TrafficMode;
 use bonded_core::transport::{
     NaiveTcpTransport, QuicTransport, Transport, WebSocketTlsTransport, WireGuardTransport,
 };
@@ -2789,7 +2792,19 @@ async fn run_linux_packet_loop(
                 last_traffic = Instant::now();
 
                 let packet = Bytes::copy_from_slice(&tun_buf[..read]);
-                let frame = state.create_outbound_frame(packet.clone(), 0);
+                // Redundant (4.54): a flow in this mode is NOT pinned
+                // — its packet is fanned out to every live transport,
+                // and the frame carries FLAG_REDUNDANT so the server
+                // fans the return traffic out the same way. The CLI
+                // runs the default engine (no rule input yet), so no
+                // flow resolves redundant here today — the branch is
+                // the same fan-out the Android worker runs, kept so
+                // the two pin points cannot drift when CLI rule
+                // input lands.
+                let redundant = traffic_engine.mode_for_packet(&packet)
+                    == TrafficMode::Redundant;
+                let frame_flags = if redundant { FLAG_REDUNDANT } else { 0 };
+                let frame = state.create_outbound_frame(packet.clone(), frame_flags);
                 // Traffic modes (4.51): the engine resolves the mode
                 // for this packet's destination IP and orders the
                 // try-list. The Linux CLI has no rule input in this
@@ -2799,40 +2814,74 @@ async fn run_linux_packet_loop(
                 // as a last resort. A failed candidate is removed and
                 // the next one is tried with the same frame; failing
                 // the last remaining transport ends the session, as
-                // before.
+                // before. For a redundant flow the candidates are
+                // the fan-out set (every transport, index order) and
+                // each gets a copy instead of the first success
+                // stopping the loop.
                 let candidates: Vec<usize> = traffic_engine.order_for_packet(
                     &packet,
                     transports.len(),
                     active_index,
                     &[],
                 );
-                let mut send_queue: std::collections::VecDeque<usize> = candidates.into();
                 let mut sent = false;
-                while let Some(index) = send_queue.pop_front() {
-                    match transports[index].send(frame.clone()).await {
-                        Ok(()) => {
-                            sent = true;
-                            break;
-                        }
-                        Err(err) => {
-                            if transports.len() == 1 {
-                                return Err(err);
+                if redundant {
+                    // Fan out: targets are ascending (redundant
+                    // order is index order), so each removal shifts
+                    // every later target down by exactly one.
+                    let mut shift = 0usize;
+                    for orig in candidates {
+                        let index = orig - shift;
+                        match transports[index].send(frame.clone()).await {
+                            Ok(()) => {
+                                sent = true;
                             }
-                            last_transport_change = Instant::now();
-                            transports.remove(index);
-                            if index < active_index {
-                                active_index -= 1;
-                            } else if index == active_index
-                                && active_index >= transports.len()
-                            {
-                                active_index = 0;
-                            }
-                            for queued in send_queue.iter_mut() {
-                                if *queued > index {
-                                    *queued -= 1;
+                            Err(err) => {
+                                if transports.len() == 1 {
+                                    return Err(err);
                                 }
+                                last_transport_change = Instant::now();
+                                transports.remove(index);
+                                if index < active_index {
+                                    active_index -= 1;
+                                } else if index == active_index
+                                    && active_index >= transports.len()
+                                {
+                                    active_index = 0;
+                                }
+                                shift += 1;
+                                info!(active_path = active_index, remaining_paths = transports.len(), "switched path after send failure");
                             }
-                            info!(active_path = active_index, remaining_paths = transports.len(), "switched path after send failure");
+                        }
+                    }
+                } else {
+                    let mut send_queue: std::collections::VecDeque<usize> = candidates.into();
+                    while let Some(index) = send_queue.pop_front() {
+                        match transports[index].send(frame.clone()).await {
+                            Ok(()) => {
+                                sent = true;
+                                break;
+                            }
+                            Err(err) => {
+                                if transports.len() == 1 {
+                                    return Err(err);
+                                }
+                                last_transport_change = Instant::now();
+                                transports.remove(index);
+                                if index < active_index {
+                                    active_index -= 1;
+                                } else if index == active_index
+                                    && active_index >= transports.len()
+                                {
+                                    active_index = 0;
+                                }
+                                for queued in send_queue.iter_mut() {
+                                    if *queued > index {
+                                        *queued -= 1;
+                                    }
+                                }
+                                info!(active_path = active_index, remaining_paths = transports.len(), "switched path after send failure");
+                            }
                         }
                     }
                 }
@@ -2960,7 +3009,26 @@ async fn run_linux_packet_loop(
                             }
                             // Inbound user traffic resets the idle clock.
                             last_traffic = Instant::now();
-                            let ready = state.ingest_inbound(frame)?;
+                            // A stale sequence is a duplicate: the
+                            // payload was already delivered (redundant
+                            // mode, 4.54, delivers every downlink
+                            // packet on every transport, so the second
+                            // copy routinely arrives after the first
+                            // was consumed). Drop it instead of ending
+                            // the session — only a connection mismatch
+                            // is still fatal.
+                            let ready = match state.ingest_inbound(frame) {
+                                Ok(ready) => ready,
+                                Err(SessionStateError::StaleSequence { expected, found }) => {
+                                    debug!(
+                                        expected = expected,
+                                        found = found,
+                                        "dropping duplicate/stale inbound frame"
+                                    );
+                                    continue;
+                                }
+                                Err(err) => return Err(err.into()),
+                            };
                             for packet in ready {
                                 let _ = device.send(&packet.payload).await?;
                             }

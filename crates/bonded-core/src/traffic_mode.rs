@@ -4,8 +4,8 @@
 //! transports. The default mode is today's behavior: pin each flow to
 //! one transport by flow hash. `best_transport` and `lowest_latency`
 //! landed in 4.52, `bandwidth_boost` in 4.53, and `redundant` in
-//! 4.54. Until a mode's slice lands, selecting it falls back to
-//! default behavior — never silently pretending the mode is live.
+//! 4.54 — all five modes now have behavior, and no mode falls back
+//! to default any more.
 //!
 //! Rules resolve a mode per flow from the destination IP only. A rule
 //! matches an exact IP, a subnet (CIDR), or the IPs a domain resolved
@@ -18,7 +18,9 @@
 //! transports, sessions, or the UI. Both flow-pin points (the Linux
 //! client loop and the Android worker) consult it the same way, so
 //! 4.54 only adds one more ordering arm in
-//! [`TrafficModeEngine::order_candidates`].
+//! [`TrafficModeEngine::order_candidates`], plus the fan-out at the
+//! two pin points and the server return half — the engine itself
+//! stays data-only.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -68,11 +70,10 @@ impl TrafficMode {
         }
     }
 
-    /// `default`, `best_transport`, `lowest_latency`, and
-    /// `bandwidth_boost` have behavior (4.51–4.53). The rest are
-    /// selectable in the UI but fall back to default until their
-    /// slice lands (4.54) — the UI says so, and so does this
-    /// function.
+    /// All five modes have behavior (4.51–4.54). `is_implemented`
+    /// stays as the UI's source of truth for the fallback note — it
+    /// is now true for every mode, so no mode shows the note any
+    /// more — and `effective` is the identity for every mode.
     pub fn is_implemented(self) -> bool {
         matches!(
             self,
@@ -80,6 +81,7 @@ impl TrafficMode {
                 | TrafficMode::BestTransport
                 | TrafficMode::LowestLatency
                 | TrafficMode::BandwidthBoost
+                | TrafficMode::Redundant
         )
     }
 
@@ -223,12 +225,10 @@ impl TrafficModeEngine {
     }
 
     /// The mode governing one flow, from its destination IP: the most
-    /// specific matching rule wins, else the default mode. The returned
-    /// mode is the *selected* one, not the effective one — an
-    /// unimplemented mode is still returned here, and
-    /// [`TrafficModeEngine::order_candidates`] applies the fallback to
-    /// default ordering. Keeping selection and fallback separate is
-    /// what makes the specificity rule testable before 4.52–4.54 land.
+    /// specific matching rule wins, else the default mode. All five
+    /// modes have behavior since 4.54, so the returned mode is the
+    /// one that governs the flow — there is no fallback left to
+    /// apply in [`TrafficModeEngine::order_candidates`].
     pub fn mode_for(&self, dst: IpAddr) -> TrafficMode {
         let mut best: Option<&TrafficRule> = None;
         for rule in &self.rules {
@@ -276,10 +276,15 @@ impl TrafficModeEngine {
     /// proportional to its weight — flows still stay pinned to one
     /// transport, there is no per-packet striping, and the remaining
     /// transports follow in weight order as the failover try-list.
-    /// The catch-all arm is the same default order — that is the
-    /// honest fallback for modes whose slices have not landed yet,
-    /// and it is what makes 4.54 a pure addition: one arm here plus
-    /// flipping its `is_implemented`.
+    /// `redundant` (4.54) is NOT a pinning at all: the order is
+    /// every transport in index order, and the caller fans the
+    /// packet out to all of them instead of trying them in turn —
+    /// duplication replaces pinning for that flow. The flow hash
+    /// and the signals are ignored, so the fan-out set is the same
+    /// for every packet of the flow; the pin points filter it to
+    /// the live (non-paused) transports before sending. With one
+    /// transport the fan-out is exactly one copy, i.e. the
+    /// degenerate case is the default behavior.
     pub fn order_candidates(
         &self,
         mode: TrafficMode,
@@ -299,9 +304,18 @@ impl TrafficModeEngine {
             TrafficMode::BandwidthBoost => {
                 bandwidth_boost_order(flow_hash, count, active_index, signals)
             }
-            // 4.54: Redundant. Until then, fall back to default order.
-            _ => default_order(flow_hash, count, active_index),
+            TrafficMode::Redundant => redundant_order(count, active_index),
         }
+    }
+
+    /// The mode governing one packet, from its destination IP:
+    /// [`TrafficModeEngine::mode_for`] when the packet parses as IP,
+    /// else the default mode. The pin points use this to decide
+    /// whether the packet is a redundant fan-out (and to flag the
+    /// frame for the server) before [`order_for_packet`] orders the
+    /// candidates.
+    pub fn mode_for_packet(&self, packet: &[u8]) -> TrafficMode {
+        dst_ip(packet).map(|dst| self.mode_for(dst)).unwrap_or_default()
     }
 
     /// Convenience for the pin points: hash the packet, resolve its
@@ -316,9 +330,26 @@ impl TrafficModeEngine {
         signals: &[PathSignal],
     ) -> Vec<usize> {
         let flow = flow_hash(packet);
-        let mode = dst_ip(packet).map(|dst| self.mode_for(dst)).unwrap_or_default();
+        let mode = self.mode_for_packet(packet);
         self.order_candidates(mode, flow, count, active_index, signals)
     }
+}
+
+/// Redundant order (4.54): every transport in index order — the
+/// fan-out set, not a try-list. The caller sends to all of them;
+/// the pin points filter out paused paths first, so a paused path
+/// never receives a duplicate. With no transports the active
+/// transport is the only candidate, the same empty-set shape as
+/// [`default_order`]; with one transport the list is just it, so
+/// the single-transport degenerate case sends exactly one copy.
+fn redundant_order(count: usize, active_index: usize) -> Vec<usize> {
+    let mut candidates: Vec<usize> = (0..count).collect();
+    if candidates.is_empty() {
+        candidates.push(active_index);
+    } else if !candidates.contains(&active_index) {
+        candidates.push(active_index);
+    }
+    candidates
 }
 
 /// Today's spreading, extracted so both pin points share it: rotate
@@ -645,12 +676,12 @@ mod tests {
     }
 
     #[test]
-    fn default_best_lowest_and_boost_are_implemented() {
+    fn all_five_modes_are_implemented() {
         assert!(TrafficMode::Default.is_implemented());
         assert!(TrafficMode::BestTransport.is_implemented());
         assert!(TrafficMode::LowestLatency.is_implemented());
         assert!(TrafficMode::BandwidthBoost.is_implemented());
-        assert!(!TrafficMode::Redundant.is_implemented());
+        assert!(TrafficMode::Redundant.is_implemented());
         assert_eq!(
             TrafficMode::BestTransport.effective(),
             TrafficMode::BestTransport
@@ -665,7 +696,7 @@ mod tests {
         );
         assert_eq!(
             TrafficMode::Redundant.effective(),
-            TrafficMode::Default
+            TrafficMode::Redundant
         );
     }
 
@@ -857,14 +888,76 @@ mod tests {
             engine.order_candidates(TrafficMode::Default, 7, 0, 3, &[]),
             vec![3]
         );
-        // Unimplemented modes fall back to exactly the default order.
-        for mode in [TrafficMode::Redundant] {
+    }
+
+    #[test]
+    fn redundant_order_covers_all_transports_regardless_of_hash() {
+        let engine = TrafficModeEngine::default();
+        // Every transport, in index order, for every flow hash — the
+        // fan-out set, not a try-list. The hash must not move it.
+        for flow in 0..64u64 {
             assert_eq!(
-                engine.order_candidates(mode, 5, 3, 1, &[]),
-                engine.order_candidates(TrafficMode::Default, 5, 3, 1, &[]),
-                "mode {mode:?} must fall back to default order"
+                engine.order_candidates(TrafficMode::Redundant, flow, 3, 0, &[]),
+                vec![0, 1, 2],
+                "flow {flow}: redundant must cover all transports"
             );
         }
+        // Signals must not move it either: redundant ignores grade,
+        // RTT, and loss alike.
+        let signals = [
+            signal(Some(99), Some(5), Some(0.0)),
+            signal(Some(10), Some(500), Some(0.9)),
+            signal(None, None, None),
+        ];
+        assert_eq!(
+            engine.order_candidates(TrafficMode::Redundant, 7, 3, 0, &signals),
+            vec![0, 1, 2]
+        );
+        // Single transport: exactly one copy — the degenerate case
+        // is the default behavior.
+        assert_eq!(
+            engine.order_candidates(TrafficMode::Redundant, 7, 1, 0, &[]),
+            vec![0]
+        );
+        // Empty transport set: active transport is the only candidate.
+        assert_eq!(
+            engine.order_candidates(TrafficMode::Redundant, 7, 0, 3, &[]),
+            vec![3]
+        );
+    }
+
+    #[test]
+    fn mode_for_packet_resolves_redundant_rules() {
+        // IPv4 UDP packet to 10.1.2.3 with a redundant rule for
+        // 10.0.0.0/8: the packet's mode is redundant, and its
+        // candidate list is the full fan-out set.
+        let engine = TrafficModeEngine {
+            default_mode: TrafficMode::Default,
+            rules: vec![subnet_rule("s", "10.0.0.0/8", TrafficMode::Redundant)],
+        };
+        let mut packet = vec![0x45u8, 0, 0, 28, 0, 0, 0, 0, 64, 17, 0, 0];
+        packet.extend_from_slice(&[192, 0, 2, 1]); // src
+        packet.extend_from_slice(&[10, 1, 2, 3]); // dst
+        packet.extend_from_slice(&[1234u16.to_be_bytes(), 53u16.to_be_bytes()].concat());
+        assert_eq!(engine.mode_for_packet(&packet), TrafficMode::Redundant);
+        assert_eq!(engine.order_for_packet(&packet, 3, 0, &[]), vec![0, 1, 2]);
+        // Same packet shape to an unmatched destination: default mode,
+        // hash-spread order, not a fan-out.
+        let mut other = packet.clone();
+        other[16] = 203;
+        assert_eq!(engine.mode_for_packet(&other), TrafficMode::Default);
+        assert_eq!(
+            engine.order_for_packet(&other, 3, 0, &[]),
+            engine.order_candidates(
+                TrafficMode::Default,
+                flow_hash(&other),
+                3,
+                0,
+                &[]
+            )
+        );
+        // A non-IP packet has no destination to resolve: default.
+        assert_eq!(engine.mode_for_packet(&[0x00, 0x01, 0x02]), TrafficMode::Default);
     }
 
     fn signal(grade: Option<u8>, rtt_ms: Option<u64>, loss_rate: Option<f64>) -> PathSignal {

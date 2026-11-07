@@ -427,17 +427,31 @@ struct RouterInner {
     multipath_capable: bool,
     /// Last transport an uplink packet for each flow arrived on, by
     /// direction-independent flow key (4.52, see
-    /// [`bonded_core::flow::flow_key`]). `deliver` sends a flow's
+    /// [`bonded_core::flow::flow_key`]), plus whether the flow is
+    /// redundant (4.54 — see [`FlowReturn`]). `deliver` sends a flow's
     /// return traffic back on this transport when it is still live;
     /// a flow with no entry falls back to the hash pin. Bounded
     /// (see `MAX_FLOW_LAST_TRANSPORT_ENTRIES`): a flow scan must not
     /// grow the router without limit, and an evicted flow simply
     /// re-learns on its next uplink packet.
-    flow_last_transport: HashMap<u64, u64>,
+    flow_last_transport: HashMap<u64, FlowReturn>,
     /// Epoch of the worker currently bound to this session (0 = none
     /// yet; worker epochs are ms timestamps, always > 0). A newer
     /// epoch retires every other transport (see `adopt_epoch`).
     epoch: u64,
+}
+
+/// What the router remembers about one flow's return path: the
+/// transport its most recent uplink data arrived on (4.52), and
+/// whether the flow is redundant (4.54). Keeping both in one map
+/// entry — one bound, one eviction, one prune — keeps them in sync:
+/// a flow's redundancy is refreshed on every uplink data frame
+/// alongside its last-used transport, so a live rule change on the
+/// client takes effect on the flow's next uplink packet.
+#[derive(Clone, Copy)]
+struct FlowReturn {
+    transport: u64,
+    redundant: bool,
 }
 
 /// Cap on the per-flow last-transport map (4.52). When the map is
@@ -503,7 +517,7 @@ impl SessionOutboundRouter {
         }
         inner.epoch = epoch;
         inner.transports.retain(|id, _| *id == keep_id);
-        inner.flow_last_transport.retain(|_, t| *t == keep_id);
+        inner.flow_last_transport.retain(|_, r| r.transport == keep_id);
         if inner.last_active != Some(keep_id) {
             inner.last_active = None;
         }
@@ -524,7 +538,7 @@ impl SessionOutboundRouter {
         // A flow whose last-used transport is gone must not keep
         // pointing at it: the next `deliver` would skip the dead id
         // anyway, but pruning keeps the map honest.
-        inner.flow_last_transport.retain(|_, t| *t != id);
+        inner.flow_last_transport.retain(|_, r| r.transport != id);
         if inner.last_active == Some(id) {
             inner.last_active = None;
         }
@@ -561,7 +575,7 @@ impl SessionOutboundRouter {
         }
         inner
             .flow_last_transport
-            .retain(|_, t| !retired.contains(t));
+            .retain(|_, r| !retired.contains(&r.transport));
         retired
     }
 
@@ -598,6 +612,17 @@ impl SessionOutboundRouter {
     /// packet whose tuple cannot be parsed (non-IP, truncated) has no
     /// direction-independent key, so it records nothing and its return
     /// traffic falls back to the hash pin.
+    ///
+    /// Redundant (4.54): the flow's redundancy is recorded from the
+    /// frame's FLAG_REDUNDANT bit and refreshed on every uplink data
+    /// frame, alongside the last-used transport — an uplink copy
+    /// without the flag (the client changed the rule, or the mode
+    /// changed) clears the flow back to single-transport return on
+    /// the next packet. The flag is the whole signaling: the server
+    /// has no rule table, so it learns a flow is redundant only
+    /// from the client's frames. A redundant uplink that arrives
+    /// on a framed transport marks the flow even if other copies
+    /// arrived on transports that cannot carry the flag.
     pub fn note_frame(&self, id: u64, frame: &SessionFrame) {
         self.note_frame_flags(frame.header.flags);
         self.mark_active(id);
@@ -608,6 +633,8 @@ impl SessionOutboundRouter {
             return;
         }
         if let Some(key) = bonded_core::flow::flow_key(&frame.payload) {
+            let redundant =
+                frame.header.flags & bonded_core::session::FLAG_REDUNDANT != 0;
             let mut inner = self.inner.write().expect("router lock poisoned");
             if inner.flow_last_transport.len() >= MAX_FLOW_LAST_TRANSPORT_ENTRIES
                 && !inner.flow_last_transport.contains_key(&key)
@@ -616,7 +643,9 @@ impl SessionOutboundRouter {
                     inner.flow_last_transport.remove(&victim);
                 }
             }
-            inner.flow_last_transport.insert(key, id);
+            inner
+                .flow_last_transport
+                .insert(key, FlowReturn { transport: id, redundant });
         }
     }
 
@@ -629,6 +658,82 @@ impl SessionOutboundRouter {
     }
 
     fn deliver(&self, frame: SessionFrame) {
+        // Redundant (4.54) goes first and does NOT use the
+        // try-list below: when the flow's most recent uplink data
+        // carried FLAG_REDUNDANT, the SAME frame (same sequence —
+        // the client's copies are one frame cloned onto every
+        // transport, not re-sequenced) is sent to EVERY live
+        // transport of the session. The fan-out is gated on
+        // multipath_capable, the same gate as per-flow spreading:
+        // an old client that never advertised FLAG_MULTIPATH_RECV
+        // only reads its active transport, so copies sent anywhere
+        // else would be lost — and only a new client can set the
+        // redundant flag at all. A closed sender is pruned and
+        // the fan-out continues on the rest; the frame is dropped
+        // only when no live transport remains. With one live
+        // transport the fan-out is exactly one copy.
+        let redundant = {
+            let inner = self.inner.read().expect("router lock poisoned");
+            inner.multipath_capable
+                && bonded_core::flow::flow_key(&frame.payload)
+                    .and_then(|key| inner.flow_last_transport.get(&key).copied())
+                    .map(|r| r.redundant)
+                    .unwrap_or(false)
+        };
+        if redundant {
+            let targets: Vec<(u64, mpsc::UnboundedSender<SessionFrame>)> = {
+                let inner = self.inner.read().expect("router lock poisoned");
+                let mut ids: Vec<u64> = inner.transports.keys().copied().collect();
+                ids.sort_unstable();
+                ids.into_iter()
+                    .filter_map(|id| inner.transports.get(&id).map(|tx| (id, tx.clone())))
+                    .collect()
+            };
+            // Clone per target except the last, which takes the
+            // original: SessionFrame clones are cheap (the Bytes
+            // payload is refcounted), and every transport must
+            // receive the SAME frame (same sequence — the client
+            // deduplicates, or tolerates, by sequence). On a failed
+            // send the returned frame is the clone that was sent,
+            // except on the last target where it is the original —
+            // restore `pending` only in that case.
+            let mut pending = Some(frame);
+            let mut delivered = false;
+            let target_count = targets.len();
+            for (i, (id, tx)) in targets.into_iter().enumerate() {
+                let is_last = i + 1 == target_count;
+                let f = if is_last {
+                    pending.take().expect("pending frame should be present")
+                } else {
+                    pending
+                        .as_ref()
+                        .expect("pending frame should be present")
+                        .clone()
+                };
+                match tx.send(f) {
+                    Ok(()) => delivered = true,
+                    Err(tokio::sync::mpsc::error::SendError(returned)) => {
+                        tracing::debug!(
+                            transport_id = id,
+                            "ROUTER deliver: redundant fan-out sender closed, pruning"
+                        );
+                        let mut inner = self.inner.write().expect("router lock poisoned");
+                        inner.transports.remove(&id);
+                        inner.flow_last_transport.retain(|_, r| r.transport != id);
+                        if inner.last_active == Some(id) {
+                            inner.last_active = None;
+                        }
+                        if is_last {
+                            pending = Some(returned);
+                        }
+                    }
+                }
+            }
+            if !delivered {
+                tracing::warn!("ROUTER deliver: no live transports, frame dropped");
+            }
+            return;
+        }
         // Build an ordered candidate list. For a multipath-capable
         // session with more than one live transport, the first candidate
         // is the transport this flow's most recent uplink data arrived
@@ -650,6 +755,7 @@ impl SessionOutboundRouter {
                 sorted_ids.sort_unstable();
                 let last_used = bonded_core::flow::flow_key(&frame.payload)
                     .and_then(|key| inner.flow_last_transport.get(&key).copied())
+                    .map(|r| r.transport)
                     .filter(|id| inner.transports.contains_key(id));
                 let pick = match last_used {
                     Some(id) => id,
@@ -3591,11 +3697,15 @@ mod tests {
     }
 
     fn router_test_frame(payload: Vec<u8>) -> SessionFrame {
+        router_test_frame_flags(payload, 0)
+    }
+
+    fn router_test_frame_flags(payload: Vec<u8>, flags: u32) -> SessionFrame {
         SessionFrame {
             header: SessionHeader {
                 connection_id: 1,
                 sequence: 1,
-                flags: 0,
+                flags,
             },
             payload: payload.into(),
         }
@@ -3708,6 +3818,190 @@ mod tests {
             "a PING must not move the flow off its hash pin"
         );
         assert_eq!(rx2.try_recv().is_ok(), expected == 2);
+    }
+
+    /// A flow whose uplink data carried FLAG_REDUNDANT is fanned
+    /// out on every live transport (4.54): the SAME frame — same
+    /// sequence, same payload — arrives on both transports, not
+    /// just the last-used one.
+    #[tokio::test]
+    async fn deliver_duplicates_redundant_flow_on_all_transports() {
+        let (router, _tx) = SessionOutboundRouter::new();
+        let (tx1, mut rx1) = mpsc::unbounded_channel::<SessionFrame>();
+        let (tx2, mut rx2) = mpsc::unbounded_channel::<SessionFrame>();
+        router.add_transport(1, tx1);
+        router.add_transport(2, tx2);
+        router.note_frame_flags(bonded_core::session::FLAG_MULTIPATH_RECV);
+        let client = Ipv4Addr::new(10, 8, 0, 2);
+        let server = Ipv4Addr::new(93, 184, 216, 34);
+        let uplink = router_test_packet(client, server, 51000, 443);
+        let downlink = router_test_packet(server, client, 443, 51000);
+
+        // Uplink on transport 1 with the redundant flag: the reply
+        // goes to BOTH transports.
+        let flagged = router_test_frame_flags(
+            uplink.clone(),
+            bonded_core::session::FLAG_REDUNDANT,
+        );
+        router.note_frame(1, &flagged);
+        router.deliver(router_test_frame(downlink.clone()));
+        let got1 = rx1.try_recv().expect("redundant reply must reach 1");
+        let got2 = rx2.try_recv().expect("redundant reply must reach 2");
+        assert_eq!(got1.header.sequence, got2.header.sequence);
+        assert_eq!(got1.payload, got2.payload);
+        assert_eq!(got1.payload.as_ref(), downlink.as_slice());
+        assert!(rx1.try_recv().is_err(), "exactly one copy per transport");
+        assert!(rx2.try_recv().is_err(), "exactly one copy per transport");
+    }
+
+    /// A redundant flow on a single-transport session gets exactly
+    /// one copy: the degenerate case is the default behavior, not
+    /// a doubled delivery to the same transport.
+    #[tokio::test]
+    async fn deliver_redundant_single_transport_gets_exactly_one_copy() {
+        let (router, _tx) = SessionOutboundRouter::new();
+        let (tx1, mut rx1) = mpsc::unbounded_channel::<SessionFrame>();
+        router.add_transport(1, tx1);
+        router.note_frame_flags(bonded_core::session::FLAG_MULTIPATH_RECV);
+        let client = Ipv4Addr::new(10, 8, 0, 2);
+        let server = Ipv4Addr::new(93, 184, 216, 34);
+        let uplink = router_test_packet(client, server, 51000, 443);
+        let downlink = router_test_packet(server, client, 443, 51000);
+
+        let flagged = router_test_frame_flags(
+            uplink,
+            bonded_core::session::FLAG_REDUNDANT,
+        );
+        router.note_frame(1, &flagged);
+        router.deliver(router_test_frame(downlink));
+        assert!(rx1.try_recv().is_ok(), "single transport must get the reply");
+        assert!(rx1.try_recv().is_err(), "single transport must get exactly one copy");
+    }
+
+    /// Redundancy is refreshed on every uplink data frame: a later
+    /// uplink WITHOUT the flag clears the flow back to
+    /// single-transport return (the client changed the rule, or the
+    /// mode changed) — the server does not keep duplicating a flow
+    /// the client stopped marking redundant.
+    #[tokio::test]
+    async fn deliver_redundant_cleared_when_uplink_unflagged() {
+        let (router, _tx) = SessionOutboundRouter::new();
+        let (tx1, mut rx1) = mpsc::unbounded_channel::<SessionFrame>();
+        let (tx2, mut rx2) = mpsc::unbounded_channel::<SessionFrame>();
+        router.add_transport(1, tx1);
+        router.add_transport(2, tx2);
+        router.note_frame_flags(bonded_core::session::FLAG_MULTIPATH_RECV);
+        let client = Ipv4Addr::new(10, 8, 0, 2);
+        let server = Ipv4Addr::new(93, 184, 216, 34);
+        let uplink = router_test_packet(client, server, 51000, 443);
+        let downlink = router_test_packet(server, client, 443, 51000);
+
+        let flagged = router_test_frame_flags(
+            uplink.clone(),
+            bonded_core::session::FLAG_REDUNDANT,
+        );
+        router.note_frame(2, &flagged);
+        router.deliver(router_test_frame(downlink.clone()));
+        assert!(rx1.try_recv().is_ok(), "flagged flow must fan out to 1");
+        assert!(rx2.try_recv().is_ok(), "flagged flow must fan out to 2");
+
+        // Same flow, next uplink without the flag, on transport 1:
+        // the reply now goes to exactly one transport (the last-used
+        // one, 1) and no longer fans out.
+        router.note_frame(1, &router_test_frame(uplink));
+        router.deliver(router_test_frame(downlink));
+        assert!(rx1.try_recv().is_ok(), "unflagged reply must return on 1");
+        assert!(rx2.try_recv().is_err(), "unflagged reply must not fan out to 2");
+    }
+
+    /// No fan-out without multipath capability: a flagged uplink
+    /// from a client that never advertised FLAG_MULTIPATH_RECV only
+    /// reads its active transport, so the reply stays
+    /// single-transport even though the flow is marked redundant.
+    #[tokio::test]
+    async fn deliver_no_fan_out_without_multipath_capable() {
+        let (router, _tx) = SessionOutboundRouter::new();
+        let (tx1, mut rx1) = mpsc::unbounded_channel::<SessionFrame>();
+        let (tx2, mut rx2) = mpsc::unbounded_channel::<SessionFrame>();
+        router.add_transport(1, tx1);
+        router.add_transport(2, tx2);
+        // Deliberately no note_frame_flags(FLAG_MULTIPATH_RECV).
+        let client = Ipv4Addr::new(10, 8, 0, 2);
+        let server = Ipv4Addr::new(93, 184, 216, 34);
+        let uplink = router_test_packet(client, server, 51000, 443);
+        let downlink = router_test_packet(server, client, 443, 51000);
+
+        let flagged = router_test_frame_flags(
+            uplink,
+            bonded_core::session::FLAG_REDUNDANT,
+        );
+        router.note_frame(2, &flagged);
+        router.deliver(router_test_frame(downlink));
+        assert!(rx2.try_recv().is_ok(), "reply must go to the last-active transport");
+        assert!(rx1.try_recv().is_err(), "no fan-out without multipath capability");
+    }
+
+    /// A dead sender during a redundant fan-out is pruned and the
+    /// fan-out continues on the rest: the surviving transport still
+    /// gets its copy, and the dead transport leaves the router.
+    #[tokio::test]
+    async fn deliver_redundant_skips_dead_transport() {
+        let (router, _tx) = SessionOutboundRouter::new();
+        let (tx1, mut rx1) = mpsc::unbounded_channel::<SessionFrame>();
+        let (tx2, mut rx2) = mpsc::unbounded_channel::<SessionFrame>();
+        router.add_transport(1, tx1);
+        router.add_transport(2, tx2);
+        router.note_frame_flags(bonded_core::session::FLAG_MULTIPATH_RECV);
+        let client = Ipv4Addr::new(10, 8, 0, 2);
+        let server = Ipv4Addr::new(93, 184, 216, 34);
+        let uplink = router_test_packet(client, server, 51000, 443);
+        let downlink = router_test_packet(server, client, 443, 51000);
+
+        let flagged = router_test_frame_flags(
+            uplink,
+            bonded_core::session::FLAG_REDUNDANT,
+        );
+        router.note_frame(1, &flagged);
+        // Kill transport 2's receiver: its sender is now closed.
+        drop(rx2);
+        router.deliver(router_test_frame(downlink));
+        assert!(rx1.try_recv().is_ok(), "surviving transport must get its copy");
+        assert_eq!(
+            router.transport_count(),
+            1,
+            "dead transport must be pruned by the fan-out"
+        );
+    }
+
+    /// A PING carrying the redundant flag must not mark a flow: the
+    /// PING/PONG guard in `note_frame` runs before the flow-key
+    /// recording, whatever other bits the frame carries.
+    #[tokio::test]
+    async fn ping_with_redundant_flag_does_not_mark_flow() {
+        let (router, _tx) = SessionOutboundRouter::new();
+        let (tx1, mut rx1) = mpsc::unbounded_channel::<SessionFrame>();
+        let (tx2, mut rx2) = mpsc::unbounded_channel::<SessionFrame>();
+        router.add_transport(1, tx1);
+        router.add_transport(2, tx2);
+        router.note_frame_flags(bonded_core::session::FLAG_MULTIPATH_RECV);
+        let client = Ipv4Addr::new(10, 8, 0, 2);
+        let server = Ipv4Addr::new(93, 184, 216, 34);
+        let downlink = router_test_packet(server, client, 443, 51000);
+
+        let ping = router_test_frame_flags(
+            router_test_packet(client, server, 51000, 443),
+            bonded_core::session::FLAG_PING | bonded_core::session::FLAG_REDUNDANT,
+        );
+        router.note_frame(2, &ping);
+        router.deliver(router_test_frame(downlink.clone()));
+        let got1 = rx1.try_recv().is_ok();
+        let got2 = rx2.try_recv().is_ok();
+        assert_ne!(got1, got2, "a PING must not trigger a fan-out");
+        let expected = [1u64, 2u64][bonded_core::flow::pick_index(
+            bonded_core::flow::flow_hash(&downlink),
+            2,
+        )];
+        assert_eq!(got1, expected == 1, "reply must stay on its hash pin");
     }
 
     #[tokio::test]

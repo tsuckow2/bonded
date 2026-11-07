@@ -126,9 +126,13 @@ void main() {
     expect(find.textContaining('could not resolve'), findsOneWidget);
   });
 
-  testWidgets('an unimplemented default mode shows the fallback note', (
+  testWidgets('no mode shows the fallback note any more (all five implemented)', (
     WidgetTester tester,
   ) async {
+    // 4.54 implemented the last mode, so the fallback note — which
+    // used to appear for `redundant` — must show for no mode now.
+    // `redundant` as the default mode is the sharpest case: it was
+    // the last unimplemented one.
     storedSettings = settingsMap(
       trafficRulesJson: jsonEncode({
         'defaultMode': 'redundant',
@@ -137,7 +141,7 @@ void main() {
     );
     await pumpScreen(tester);
 
-    expect(find.textContaining('falls back to Default until 4.54'), findsWidgets);
+    expect(find.textContaining('falls back to Default until'), findsNothing);
   });
 
   testWidgets('adding an IP rule saves it and pushes it live', (
