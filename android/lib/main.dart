@@ -12,6 +12,7 @@ import 'screens/diagnostics_screen.dart';
 import 'screens/server_config_screen.dart';
 import 'screens/settings_screen.dart';
 import 'screens/excluded_apps_screen.dart';
+import 'screens/traffic_rules_screen.dart';
 import 'screens/network_tests_screen.dart';
 import 'screens/client_logs_screen.dart';
 import 'screens/stress_test_screen.dart';
@@ -111,6 +112,7 @@ class _BondedAppState extends State<BondedApp> {
         '/diagnostics': (context) => const DiagnosticsScreen(),
         '/settings': (context) => const SettingsScreen(),
         '/excluded-apps': (context) => const ExcludedAppsScreen(),
+        '/traffic-rules': (context) => const TrafficRulesScreen(),
         '/network-tests': (context) => const NetworkTestsScreen(),
         '/stress-tests': (context) => const StressTestScreen(),
         '/client-logs': (context) => const ClientLogsScreen(),

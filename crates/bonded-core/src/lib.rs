@@ -3,6 +3,7 @@ pub mod config;
 pub mod diagnostics;
 pub mod flow;
 pub mod heartbeat;
+pub mod traffic_mode;
 pub mod overhead;
 pub mod peer_share;
 pub mod scheduler;

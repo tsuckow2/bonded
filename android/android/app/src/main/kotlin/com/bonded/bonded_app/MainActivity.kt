@@ -718,6 +718,10 @@ class MainActivity : FlutterActivity() {
                                                             this@MainActivity
                                                     )
                                                             .toList(),
+                                            "trafficRulesJson" to
+                                                    AppSettingsStore.trafficRulesJson(
+                                                            this@MainActivity
+                                                    ),
                                     )
                             )
                         }
@@ -749,7 +753,28 @@ class MainActivity : FlutterActivity() {
                                                 .toSet(),
                                 )
                             }
+                            (args?.get("trafficRulesJson") as? String)?.let {
+                                AppSettingsStore.setTrafficRulesJson(this@MainActivity, it)
+                            }
                             result.success(true)
+                        }
+                        // Live traffic-rules push (4.51): hands the
+                        // running Rust session a new rule table without
+                        // restarting it. False when no session is
+                        // running — the stored table applies on next
+                        // connect.
+                        "updateTrafficRules" -> {
+                            val args = call.arguments as? Map<*, *>
+                            val json = args?.get("trafficRulesJson") as? String
+                            if (json == null) {
+                                result.error(
+                                        "bad_args",
+                                        "trafficRulesJson is required",
+                                        null,
+                                )
+                            } else {
+                                result.success(BondedVpnService.updateTrafficRules(json))
+                            }
                         }
                         // Launchable apps for the exclusion picker. Intent
                         // queries need no QUERY_ALL_PACKAGES permission, and

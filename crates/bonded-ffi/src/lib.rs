@@ -76,6 +76,36 @@ static ANDROID_TUN_WRITER: OnceLock<Mutex<Option<File>>> = OnceLock::new();
 #[cfg(target_os = "android")]
 static LAST_NATIVE_ERROR: Mutex<Option<String>> = Mutex::new(None);
 
+/// Traffic-mode engine for the running session (4.51): the rule table
+/// the UI handed over at session start, replaceable live via
+/// `nativeUpdateTrafficRules`. Not `#[cfg(android)]`-gated: the
+/// session tests exercise it on Linux too.
+static TRAFFIC_MODE_ENGINE: std::sync::RwLock<bonded_core::traffic_mode::TrafficModeEngine> =
+    std::sync::RwLock::new(bonded_core::traffic_mode::TrafficModeEngine {
+        default_mode: bonded_core::traffic_mode::TrafficMode::Default,
+        rules: Vec::new(),
+    });
+
+/// Snapshot the session's traffic-mode engine for one packet's pin
+/// decision. Cloned under a read lock so the worker never holds the
+/// lock while ordering; rule updates are rare and the table is small.
+fn traffic_mode_engine_snapshot() -> bonded_core::traffic_mode::TrafficModeEngine {
+    TRAFFIC_MODE_ENGINE
+        .read()
+        .map(|guard| guard.clone())
+        .unwrap_or_default()
+}
+
+/// Replace the session's traffic-mode engine from the JSON the UI
+/// hands over (session start / live update). Malformed JSON falls
+/// back to the default engine instead of breaking the session.
+fn set_traffic_mode_engine(json: &str) {
+    let engine = bonded_core::traffic_mode::TrafficModeEngine::from_json_or_default(json);
+    if let Ok(mut guard) = TRAFFIC_MODE_ENGINE.write() {
+        *guard = engine;
+    }
+}
+
 /// Called by the JVM when the native library is first loaded.  We grab the
 /// JavaVM here so we can attach arbitrary threads later.
 #[cfg(target_os = "android")]
@@ -852,7 +882,7 @@ enum PathControl {
     /// Pause (`paused = true`) or resume a path. A paused path stays
     /// in the transport set — heartbeats, session binding and inbound
     /// traffic are untouched — but outbound flow assignment treats it
-    /// as a last resort (see [`order_candidates_for_send`]), so it
+    /// as a last resort (see [`demote_paused_paths`]), so it
     /// carries ~no traffic while a healthy path exists.
     Pause { path_index: usize, paused: bool },
     /// Tear a path's transport down and let the path supervisor
@@ -879,32 +909,22 @@ enum PathControl {
     },
 }
 
-/// Order direct-transport candidates for one outbound packet's
-/// try-list. Healthy paths keep today's hash rotation; paused paths
-/// move to the end, tried only after every healthy path failed to
-/// send. When every candidate is paused the rotation covers all of
-/// them, so pausing everything degrades to today's behavior instead
-/// of blackholing the session.
+/// Demote paused paths to the end of an already mode-ordered
+/// candidate list (4.51), preserving the mode's order within each
+/// group. The traffic-mode engine owns the ordering now (hash
+/// rotation for the default mode, per-mode orders in 4.52–4.54); this
+/// only applies the pause discipline on top. When every candidate is
+/// paused the mode order covers all of them, so pausing everything
+/// degrades to the mode's behavior instead of blackholing the session.
 #[cfg(any(target_os = "android", test))]
-fn order_candidates_for_send(
+fn demote_paused_paths(
     candidates: Vec<usize>,
     is_paused: impl Fn(usize) -> bool,
-    flow_hash: u64,
 ) -> Vec<usize> {
     let (mut healthy, mut paused): (Vec<usize>, Vec<usize>) =
         candidates.into_iter().partition(|&index| !is_paused(index));
-    if healthy.is_empty() {
-        if !paused.is_empty() {
-            let rot = (flow_hash % paused.len() as u64) as usize;
-            paused.rotate_left(rot);
-        }
-        paused
-    } else {
-        let rot = (flow_hash % healthy.len() as u64) as usize;
-        healthy.rotate_left(rot);
-        healthy.extend(paused);
-        healthy
-    }
+    healthy.append(&mut paused);
+    healthy
 }
 
 /// Move WireGuard to the front of the transport preference list for
@@ -1230,6 +1250,7 @@ fn start_android_session(
     storage_dir: &str,
     battery_saver: bool,
     cellular_bind_addresses_json: &str,
+    traffic_rules_json: &str,
 ) -> anyhow::Result<()> {
     #[cfg(target_os = "android")]
     if diagnostics_upload_enabled {
@@ -1245,6 +1266,11 @@ fn start_android_session(
     );
 
     stop_android_session();
+
+    // Traffic modes (4.51): install the rule table the UI handed over
+    // before the worker starts pinning flows, so no packet is ever
+    // pinned under a stale or empty engine.
+    set_traffic_mode_engine(traffic_rules_json);
 
     let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
     let inbound_queue = Arc::new(Mutex::new(VecDeque::new()));
@@ -1724,7 +1750,7 @@ fn start_android_session(
             // Debug-paused direct paths, by durable path index (not
             // vec index, which shifts on insert/remove). Paused paths
             // stay connected; only outbound assignment deprioritizes
-            // them (see order_candidates_for_send).
+            // them (see demote_paused_paths).
             let mut paused_paths: std::collections::HashSet<usize> =
                 std::collections::HashSet::new();
             // Battery-saver auto-pause (see compute_auto_paused): a
@@ -2272,13 +2298,28 @@ fn start_android_session(
                                 // peer-relay alike — so future load
                                 // balancing and failover changes inherit
                                 // that equality instead of re-adding a
-                                // direct-only filter. Candidates are the
-                                // hashed pick first, then the other
+                                // direct-only filter.
+                                //
+                                // Traffic modes (4.51): the engine
+                                // resolves the mode for this packet's
+                                // destination IP and orders the try-list;
+                                // with the default engine that order is
+                                // exactly the hash rotation above, so a
+                                // session with no rules behaves as
+                                // before. Candidates are the mode-ordered
                                 // transports, then the active transport
                                 // as a last resort. With a single
                                 // transport this reduces to exactly the
-                                // pre-multipath behavior.
-                                let flow = bonded_core::flow::flow_hash(&packet);
+                                // pre-multipath behavior. (Ordered before
+                                // the frame is built: building the frame
+                                // moves the packet.)
+                                let engine = traffic_mode_engine_snapshot();
+                                let ordered = engine.order_for_packet(
+                                    &packet,
+                                    transports.len(),
+                                    active_index,
+                                    &[],
+                                );
                                 let frame = session.create_outbound_frame(Bytes::from(packet), 0);
                                 // Paused paths go last in the try-list:
                                 // they stay connected, but a healthy path
@@ -2286,9 +2327,10 @@ fn start_android_session(
                                 // report paused: pause is per path index
                                 // and relays have none.) Battery-saver
                                 // auto-pause counts exactly like a debug
-                                // pause here.
-                                let mut candidates = order_candidates_for_send(
-                                    (0..transports.len()).collect(),
+                                // pause here. Demotion preserves the
+                                // mode's order within each group.
+                                let mut candidates = demote_paused_paths(
+                                    ordered,
                                     |vec_index| {
                                         path_index_map
                                             .path_of(vec_index)
@@ -2298,7 +2340,6 @@ fn start_android_session(
                                             })
                                             .unwrap_or(false)
                                     },
-                                    flow,
                                 );
                                 if candidates.is_empty() {
                                     candidates.push(active_index);
@@ -3222,6 +3263,7 @@ pub extern "system" fn Java_com_bonded_bonded_1app_BondedVpnService_nativeStartS
     app_version_code: jni::sys::jlong,
     battery_saver: jni::sys::jboolean,
     cellular_bind_addresses_json: jni::objects::JString,
+    traffic_rules_json: jni::objects::JString,
 ) -> jni::sys::jboolean {
     // Store global ref to the service so protect_fd can call back into Java.
     if let Ok(global_ref) = env.new_global_ref(&obj) {
@@ -3267,6 +3309,10 @@ pub extern "system" fn Java_com_bonded_bonded_1app_BondedVpnService_nativeStartS
             Ok(value) => value.into(),
             Err(_) => return 0,
         };
+    let traffic_rules_json: String = match env.get_string(&traffic_rules_json) {
+        Ok(value) => value.into(),
+        Err(_) => return 0,
+    };
 
     if start_android_session(
         &server_address,
@@ -3286,6 +3332,7 @@ pub extern "system" fn Java_com_bonded_bonded_1app_BondedVpnService_nativeStartS
         &storage_dir,
         battery_saver != 0,
         &cellular_bind_addresses_json,
+        &traffic_rules_json,
     )
     .is_ok()
     {
@@ -3474,6 +3521,27 @@ pub extern "system" fn Java_com_bonded_bonded_1app_BondedVpnService_nativeUpdate
         .unwrap_or(false) as jni::sys::jboolean
 }
 
+/// Live traffic-rules update (4.51): hands the running worker a new
+/// rule table (JSON) without restarting the session. The worker picks
+/// the snapshot up on its next packet. Always returns true — a
+/// malformed table falls back to the default engine inside
+/// `set_traffic_mode_engine`, so there is no failure to report; the
+/// rules take effect on the next connect at the latest.
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_bonded_bonded_1app_BondedVpnService_nativeUpdateTrafficRules(
+    mut env: jni::JNIEnv,
+    _obj: jni::objects::JObject,
+    traffic_rules_json: jni::objects::JString,
+) -> jni::sys::jboolean {
+    let traffic_rules_json: String = match env.get_string(&traffic_rules_json) {
+        Ok(value) => value.into(),
+        Err(_) => return 0,
+    };
+    set_traffic_mode_engine(&traffic_rules_json);
+    1
+}
+
 /// In-app QUIC handshake probe (diagnostics): dials one production-shaped
 /// QUIC session connection using the same protect / network-bind
 /// callbacks as a live session, from a dedicated thread + runtime (the
@@ -3582,8 +3650,8 @@ pub unsafe extern "C" fn bonded_ffi_decode_frame_metadata(
 mod tests {
     use super::cellular_path_indexes;
     use super::compute_auto_paused;
+    use super::demote_paused_paths;
     use super::diff_path_addresses;
-    use super::order_candidates_for_send;
     use super::prefer_wireguard_first;
 
     #[test]
@@ -3768,25 +3836,41 @@ mod tests {
         assert_eq!(added, vec![(1, "10.0.0.2".to_owned())]);
     }
 
+    /// The default engine's order for `count` transports under `flow`
+    /// (hash rotation), the input `demote_paused_paths` works on.
+    fn default_engine_order(flow: u64, count: usize) -> Vec<usize> {
+        bonded_core::traffic_mode::TrafficModeEngine::default().order_candidates(
+            bonded_core::traffic_mode::TrafficMode::Default,
+            flow,
+            count,
+            0,
+            &[],
+        )
+    }
+
     #[test]
     fn paused_paths_go_last_regardless_of_hash_pick() {
-        // Candidates [0, 1, 2] with 2 paused: no hash pick may put 2
-        // first; healthy rotation is preserved among [0, 1].
+        // Mode order [rotated 0, 1, 2] with 2 paused: no hash pick may
+        // put 2 first, and the healthy pair keeps the mode's order.
         for flow in 0..64u64 {
-            let ordered = order_candidates_for_send(vec![0, 1, 2], |i| i == 2, flow);
-            let first = flow as usize % 2;
+            let ordered = demote_paused_paths(default_engine_order(flow, 3), |i| i == 2);
             assert_eq!(
-                ordered,
-                vec![first, 1 - first, 2],
+                *ordered.last().unwrap(),
+                2,
                 "paused path must be last for flow {flow}"
             );
+            let healthy: Vec<usize> = default_engine_order(flow, 3)
+                .into_iter()
+                .filter(|&i| i != 2)
+                .collect();
+            assert_eq!(&ordered[..2], &healthy, "healthy order kept for flow {flow}");
         }
     }
 
     #[test]
     fn all_paused_keeps_todays_rotation() {
         for flow in 0..16u64 {
-            let ordered = order_candidates_for_send(vec![0, 1, 2], |_| true, flow);
+            let ordered = demote_paused_paths(default_engine_order(flow, 3), |_| true);
             let mut expected = vec![0, 1, 2];
             expected.rotate_left(flow as usize % 3);
             assert_eq!(ordered, expected, "all-paused must rotate like today");
@@ -3796,12 +3880,12 @@ mod tests {
     #[test]
     fn no_paused_is_identity_rotation() {
         for flow in 0..16u64 {
-            let ordered = order_candidates_for_send(vec![0, 1], |_| false, flow);
+            let ordered = demote_paused_paths(default_engine_order(flow, 2), |_| false);
             let mut expected = vec![0, 1];
             expected.rotate_left(flow as usize % 2);
             assert_eq!(ordered, expected);
         }
-        assert!(order_candidates_for_send(vec![], |_| false, 7).is_empty());
+        assert!(demote_paused_paths(vec![], |_| false).is_empty());
     }
 
     use super::{
@@ -4048,6 +4132,7 @@ mod tests {
             storage_dir.to_string_lossy().as_ref(),
             false,
             "[]",
+            "{}",
         )
         .expect("android session should start");
 
@@ -4268,6 +4353,7 @@ mod tests {
             storage_dir.to_string_lossy().as_ref(),
             false,
             "[]",
+            "{}",
         )
         .expect("android session should start");
 
@@ -4623,6 +4709,7 @@ mod tests {
             storage_dir.to_string_lossy().as_ref(),
             false,
             "[]",
+            "{}",
         )
         .expect("android session should start");
 

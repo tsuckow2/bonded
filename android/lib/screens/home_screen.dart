@@ -9,6 +9,7 @@ import '../models/transport_grade.dart';
 import '../services/app_settings_service.dart';
 import '../services/background_service.dart';
 import '../services/pairing_service.dart';
+import '../services/traffic_rules_service.dart';
 import '../widgets/app_update_checker.dart';
 import '../widgets/focusable_row.dart';
 import '../widgets/session_charts.dart';
@@ -279,6 +280,17 @@ class _HomeScreenState extends State<HomeScreen> {
       } else {
         final target = _selectedId;
         if (target == null) return;
+        // Traffic modes (4.51): re-resolve domain rules with the
+        // device's own resolver before the VPN starts, so the rule
+        // table the session gets carries this network's IPs (domains
+        // are resolver-dependent — the same name yields different IPs
+        // on different networks). Best-effort: a failed re-resolution
+        // keeps the stored IPs and never blocks connect.
+        final table = await TrafficRulesService.load();
+        final refreshed = await TrafficRulesService.reResolveAll(table);
+        if (refreshed != table) {
+          await TrafficRulesService.save(refreshed);
+        }
         await BackgroundService.startBackgroundService(deviceId: target);
       }
       await _refreshStatus();

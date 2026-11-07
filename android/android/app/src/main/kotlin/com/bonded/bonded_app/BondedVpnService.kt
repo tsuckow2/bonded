@@ -1134,7 +1134,10 @@ class BondedVpnService : VpnService() {
             appVersionCode: Long,
             batterySaver: Boolean,
             cellularBindAddressesJson: String,
+            trafficRulesJson: String,
     ): Boolean
+
+    private external fun nativeUpdateTrafficRules(trafficRulesJson: String): Boolean
 
     private external fun nativeStopSession()
 
@@ -1313,6 +1316,7 @@ class BondedVpnService : VpnService() {
                                     networkPathManager?.cellularBindAddresses()
                                             .orEmpty()
                             ).toString(),
+                            AppSettingsStore.trafficRulesJson(this),
                     )
             android.util.Log.i("BondedVPN", "nativeStartSession returned: $started")
             if (started) {
@@ -1622,6 +1626,19 @@ class BondedVpnService : VpnService() {
                                         .orEmpty()
                         ).toString(),
                 )
+            } catch (_: Exception) {
+                false
+            }
+        }
+
+        /** Live traffic-rules update (4.51): hands the running Rust
+         * session a new rule table without restarting it. False when
+         * no service instance is running — the stored table applies
+         * on next connect. */
+        fun updateTrafficRules(trafficRulesJson: String): Boolean {
+            val service = activeInstance ?: return false
+            return try {
+                service.nativeUpdateTrafficRules(trafficRulesJson)
             } catch (_: Exception) {
                 false
             }

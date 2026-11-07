@@ -18,6 +18,7 @@ object AppSettingsStore {
     private const val KEY_ALLOW_LOCAL_TRAFFIC = "allow_local_traffic"
     private const val KEY_EXCLUDED_APP_PACKAGES = "excluded_app_packages"
     private const val KEY_BATTERY_SAVER = "battery_saver"
+    private const val KEY_TRAFFIC_RULES_JSON = "traffic_rules_json"
 
     private fun prefs(context: Context) =
             context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -78,6 +79,20 @@ object AppSettingsStore {
                 .edit()
                 .putStringSet(KEY_EXCLUDED_APP_PACKAGES, value.toSet())
                 .apply()
+    }
+
+    /**
+     * Traffic-mode rule table (4.51) as one JSON blob:
+     * `{"defaultMode": "default", "rules": [...]}`. Stored opaquely —
+     * Kotlin never parses it; the Dart UI owns the shape and the Rust
+     * engine owns matching. The default `"{}"` parses to the empty
+     * default engine on the Rust side.
+     */
+    fun trafficRulesJson(context: Context): String =
+            prefs(context).getString(KEY_TRAFFIC_RULES_JSON, "{}") ?: "{}"
+
+    fun setTrafficRulesJson(context: Context, value: String) {
+        prefs(context).edit().putString(KEY_TRAFFIC_RULES_JSON, value).apply()
     }
 
     /** The record the main screen's dropdown has selected, falling back to

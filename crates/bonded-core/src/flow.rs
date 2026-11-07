@@ -45,6 +45,25 @@ pub fn pick_index(hash: u64, count: usize) -> usize {
     (hash % count as u64) as usize
 }
 
+/// The destination IP of an inner IP packet (IPv4 or IPv6), or
+/// `None` for non-IP / truncated packets. Used by the traffic-mode
+/// engine (4.51) to resolve a mode per flow; the flow hash still pins
+/// the flow itself.
+pub fn dst_ip(packet: &[u8]) -> Option<std::net::IpAddr> {
+    let (_src, dst, _protocol, _ports) = parse_flow_tuple(packet)?;
+    match dst.len() {
+        4 => Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+            dst[0], dst[1], dst[2], dst[3],
+        ))),
+        16 => {
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&dst);
+            Some(std::net::IpAddr::V6(std::net::Ipv6Addr::from(octets)))
+        }
+        _ => None,
+    }
+}
+
 /// Returns (src, dst, protocol, Option<(src_port, dst_port)>).
 fn parse_flow_tuple(packet: &[u8]) -> Option<(Vec<u8>, Vec<u8>, u8, Option<(u16, u16)>)> {
     let first = *packet.first()?;

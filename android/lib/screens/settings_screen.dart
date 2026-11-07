@@ -3,6 +3,22 @@ import 'package:package_info_plus/package_info_plus.dart';
 
 import '../services/app_settings_service.dart';
 
+/// One-line summary for the Settings row: default mode + rule count,
+/// with the fallback called out when the default is not implemented yet.
+String _trafficModeSummary(AppSettings settings) {
+  final table = settings.trafficModeSettings;
+  final mode = table.defaultMode.label;
+  final rules = table.rules.isEmpty
+      ? 'no rules'
+      : table.rules.length == 1
+      ? '1 rule'
+      : '${table.rules.length} rules';
+  final fallback = table.defaultMode.isImplemented
+      ? ''
+      : ' (falls back to Default)';
+  return '$mode$fallback · $rules';
+}
+
 class SettingsScreen extends StatefulWidget {
   const SettingsScreen({super.key});
 
@@ -133,6 +149,19 @@ class _SettingsScreenState extends State<SettingsScreen> {
             onTap: _settingsLoaded
                 ? () async {
                     await Navigator.of(context).pushNamed('/excluded-apps');
+                    if (mounted) _loadSettings();
+                  }
+                : null,
+          ),
+          ListTile(
+            title: const Text('Traffic modes & rules'),
+            subtitle: Text(
+              _trafficModeSummary(_settings),
+            ),
+            trailing: const Icon(Icons.arrow_forward),
+            onTap: _settingsLoaded
+                ? () async {
+                    await Navigator.of(context).pushNamed('/traffic-rules');
                     if (mounted) _loadSettings();
                   }
                 : null,

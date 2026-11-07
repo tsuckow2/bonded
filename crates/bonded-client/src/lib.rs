@@ -2769,6 +2769,10 @@ async fn run_linux_packet_loop(
     let mut last_traffic = Instant::now();
     let mut last_transport_change = Instant::now();
     let mut heartbeat_idle = false;
+    // Traffic modes (4.51): the Linux CLI has no rule input in this
+    // slice, so the loop below runs the default engine — today's
+    // flow-hash spreading, unchanged.
+    let traffic_engine = bonded_core::traffic_mode::TrafficModeEngine::default();
     // Skip the immediate first tick; we just completed binding.
     heartbeat.tick().await;
 
@@ -2786,26 +2790,22 @@ async fn run_linux_packet_loop(
 
                 let packet = Bytes::copy_from_slice(&tun_buf[..read]);
                 let frame = state.create_outbound_frame(packet.clone(), 0);
-                // Multipath spreading: pin the flow to a transport
-                // by hash (see the Android worker in bonded-ffi for
-                // the full rationale). Transports are treated equally
-                // here — direct and peer-relay alike. Candidates are
-                // the hashed pick first, then the other transports,
-                // then the active transport as a last resort. A failed
-                // candidate is removed and the next one is tried with
-                // the same frame; failing the last remaining transport
-                // ends the session, as before.
-                let flow = bonded_core::flow::flow_hash(&packet);
-                let mut candidates: Vec<usize> = (0..transports.len()).collect();
-                if candidates.is_empty() {
-                    candidates.push(active_index);
-                } else {
-                    let pick = bonded_core::flow::pick_index(flow, candidates.len());
-                    candidates.rotate_left(pick);
-                    if !candidates.contains(&active_index) {
-                        candidates.push(active_index);
-                    }
-                }
+                // Traffic modes (4.51): the engine resolves the mode
+                // for this packet's destination IP and orders the
+                // try-list. The Linux CLI has no rule input in this
+                // slice, so it runs the default engine — today's
+                // flow-hash spreading, unchanged. Candidates are the
+                // mode-ordered transports, then the active transport
+                // as a last resort. A failed candidate is removed and
+                // the next one is tried with the same frame; failing
+                // the last remaining transport ends the session, as
+                // before.
+                let candidates: Vec<usize> = traffic_engine.order_for_packet(
+                    &packet,
+                    transports.len(),
+                    active_index,
+                    &[],
+                );
                 let mut send_queue: std::collections::VecDeque<usize> = candidates.into();
                 let mut sent = false;
                 while let Some(index) = send_queue.pop_front() {
