@@ -5,6 +5,7 @@ import 'package:flutter/services.dart';
 import '../models/pairing_model.dart';
 import '../models/session_grade.dart';
 import '../models/session_status.dart';
+import '../models/transport_grade.dart';
 import '../services/app_settings_service.dart';
 import '../services/background_service.dart';
 import '../services/pairing_service.dart';
@@ -12,6 +13,7 @@ import '../widgets/app_update_checker.dart';
 import '../widgets/focusable_row.dart';
 import '../widgets/session_charts.dart';
 import '../widgets/session_grade_card.dart';
+import '../widgets/transport_grade_detail.dart';
 
 /// The connect-first main screen (redesign, build 183): a server dropdown
 /// and one big connect button up top, live per-path stats and rolling
@@ -64,6 +66,12 @@ class _HomeScreenState extends State<HomeScreen> {
   // session starts.
   final SessionGradeTracker _gradeTracker = SessionGradeTracker();
   SessionGrade? _lastSessionGrade;
+
+  // Per-transport grades (4.50): one grade per path, accumulated
+  // from the same snapshot samples as the session grade. No
+  // last-session retention — grades belong to the live paths.
+  final TransportGradeTracker _transportGradeTracker =
+      TransportGradeTracker();
 
   @override
   void initState() {
@@ -179,12 +187,14 @@ class _HomeScreenState extends State<HomeScreen> {
       _relayedUpRate = 0;
       _relayedDownRate = 0;
       // New session: the previous session's grade (if any) becomes
-      // the last-session grade; the tracker resets.
+      // the last-session grade; both trackers reset.
       final prevGrade = _gradeTracker.beginSession(status.connectedAtMs);
       if (prevGrade != null) _lastSessionGrade = prevGrade;
+      _transportGradeTracker.beginSession(status.connectedAtMs);
     }
     final now = DateTime.now();
     _gradeTracker.record(status, now);
+    _transportGradeTracker.record(status, now);
     if (_lastInBytes != null && _lastSampleAt != null) {
       final dt = now.difference(_lastSampleAt!).inMilliseconds / 1000.0;
       if (dt > 0) {
@@ -756,7 +766,12 @@ class _HomeScreenState extends State<HomeScreen> {
                 'No direct paths',
                 style: TextStyle(color: Colors.grey[600]),
               ),
-            for (final path in paths) _PathRow(status: _status, path: path),
+            for (final path in paths)
+              _PathRow(
+                status: _status,
+                path: path,
+                grade: _transportGradeTracker.gradeFor(path.gradeKey),
+              ),
           ],
         ),
       ),
@@ -879,6 +894,7 @@ class _HomeScreenState extends State<HomeScreen> {
                 path: path,
                 leg: (legNumber[path.peerId ?? ''] =
                     (legNumber[path.peerId ?? ''] ?? 0) + 1),
+                grade: _transportGradeTracker.gradeFor(path.gradeKey),
               ),
           ],
         ),
@@ -997,7 +1013,11 @@ class _PathRow extends StatelessWidget {
   static const _channel = MethodChannel('bonded/native');
   final SessionStatus status;
   final PathStat path;
-  const _PathRow({required this.status, required this.path});
+
+  /// This path's grade (4.50), null until it has data. No chip
+  /// and no detail tap while null.
+  final TransportGrade? grade;
+  const _PathRow({required this.status, required this.path, this.grade});
 
   @override
   Widget build(BuildContext context) {
@@ -1020,6 +1040,11 @@ class _PathRow extends StatelessWidget {
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 6),
       child: InkWell(
+        // Tap opens the per-transport grade detail (4.50), when
+        // the path has a grade yet.
+        onTap: grade == null
+            ? null
+            : () => showTransportGradeSheet(context, networkLabel, grade!),
         // Long-press is the path debug menu (pause/resume, reset).
         // Relay transports have no supervisor path index, so they
         // get no menu.
@@ -1065,6 +1090,10 @@ class _PathRow extends StatelessWidget {
               ],
             ),
           ),
+          if (grade != null) ...[
+            TransportGradeChip(grade: grade!),
+            const SizedBox(width: 8),
+          ],
           if (path.active)
             const Chip(
               label: Text('Active', style: TextStyle(fontSize: 11)),
@@ -1158,7 +1187,11 @@ class _PathRow extends StatelessWidget {
 class _PeerRow extends StatelessWidget {
   final PathStat path;
   final int leg;
-  const _PeerRow({required this.path, required this.leg});
+
+  /// This leg's grade (4.50), null until it has data. No chip
+  /// and no detail tap while null.
+  final TransportGrade? grade;
+  const _PeerRow({required this.path, required this.leg, this.grade});
 
   static String _shortId(String? peerId) {
     if (peerId == null || peerId.isEmpty) return 'Unknown peer';
@@ -1175,7 +1208,17 @@ class _PeerRow extends StatelessWidget {
       // to the peers below the fold. Each peer row is now its own focus
       // stop with a ring that scrolls into view on focus.
       child: FocusableRow(
-        child: Row(
+        // Tap opens the per-transport grade detail (4.50), when
+        // the leg has a grade yet.
+        child: InkWell(
+          onTap: grade == null
+              ? null
+              : () => showTransportGradeSheet(
+                  context,
+                  'Peer ${_shortId(path.peerId)} · leg $leg',
+                  grade!,
+                ),
+          child: Row(
           crossAxisAlignment: CrossAxisAlignment.center,
           children: [
             Icon(
@@ -1209,6 +1252,10 @@ class _PeerRow extends StatelessWidget {
                 ],
               ),
             ),
+            if (grade != null) ...[
+              TransportGradeChip(grade: grade!),
+              const SizedBox(width: 8),
+            ],
             if (path.active)
               const Chip(
                 label: Text('Active', style: TextStyle(fontSize: 11)),
@@ -1216,6 +1263,7 @@ class _PeerRow extends StatelessWidget {
                 padding: EdgeInsets.zero,
               ),
           ],
+        ),
         ),
       ),
     );

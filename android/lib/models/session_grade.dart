@@ -145,7 +145,10 @@ double _clamp01(double value) => value.clamp(0.0, 1.0).toDouble();
 /// the exact value, so the card shows the band ("median 50–100
 /// ms"), never a fake-precise number. Scores interpolate from
 /// the bucket midpoint (a documented convention).
-int _medianBucketIndex(List<int> counts) {
+///
+/// Public so the per-transport grader (4.50) shares the same
+/// buckets and median convention instead of duplicating them.
+int medianBucketIndex(List<int> counts) {
   final total = counts.fold(0, (a, b) => a + b);
   if (total == 0) return 0;
   var seen = 0;
@@ -159,14 +162,15 @@ int _medianBucketIndex(List<int> counts) {
 
 /// RTT histogram buckets (ms). Upper bounds [50, 100, 200, 350,
 /// 500, ∞]; midpoints used for the score interpolation (the open
-/// top bucket counts as 750 ms).
-const _rttBounds = [50, 100, 200, 350, 500];
-const _rttMidpoints = [25.0, 75.0, 150.0, 275.0, 425.0, 750.0];
+/// top bucket counts as 750 ms). Shared with the per-transport
+/// grader (4.50).
+const rttBounds = [50, 100, 200, 350, 500];
+const rttMidpoints = [25.0, 75.0, 150.0, 275.0, 425.0, 750.0];
 
-String _rttBandLabel(int bucket) {
+String rttBandLabel(int bucket) {
   if (bucket == 0) return 'median ≤ 50 ms';
-  if (bucket >= _rttBounds.length) return 'median > 500 ms';
-  return 'median ${_rttBounds[bucket - 1]}–${_rttBounds[bucket]} ms';
+  if (bucket >= rttBounds.length) return 'median > 500 ms';
+  return 'median ${rttBounds[bucket - 1]}–${rttBounds[bucket]} ms';
 }
 
 /// Throughput histogram buckets (bytes/s). Upper bounds at 0.1,
@@ -182,7 +186,10 @@ String _bwBandLabel(int bucket) {
   return 'median ${_bwBoundsMbps[bucket - 1]}–${_bwBoundsMbps[bucket]} Mbps';
 }
 
-int _bucketIndex(int value, List<int> bounds) {
+/// Bucket index for [value] against ascending [bounds]; the
+/// open top bucket is `bounds.length`. Shared with the
+/// per-transport grader (4.50).
+int bucketIndex(int value, List<int> bounds) {
   for (var i = 0; i < bounds.length; i++) {
     if (value <= bounds[i]) return i;
   }
@@ -255,9 +262,9 @@ class SessionGradeTracker {
     double? latencyScore;
     String? latencyDetail;
     if (_rttSamples > 0) {
-      final bucket = _medianBucketIndex(_rttBuckets);
-      latencyScore = latencyScoreFromMedianRtt(_rttMidpoints[bucket]);
-      latencyDetail = _rttBandLabel(bucket);
+      final bucket = medianBucketIndex(_rttBuckets);
+      latencyScore = latencyScoreFromMedianRtt(rttMidpoints[bucket]);
+      latencyDetail = rttBandLabel(bucket);
     }
 
     double? stabilityScore;
@@ -282,7 +289,7 @@ class SessionGradeTracker {
     double? bandwidthScore;
     String? bandwidthDetail;
     if (_bwSamples > 0) {
-      final bucket = _medianBucketIndex(_bwBuckets);
+      final bucket = medianBucketIndex(_bwBuckets);
       bandwidthScore = bandwidthScoreFromMbps(_bwMidpoints[bucket]);
       bandwidthDetail = '${_bwBandLabel(bucket)} (active windows)';
     }
@@ -343,7 +350,7 @@ class SessionGradeTracker {
 
     final rtt = status.activePath?.lastRttMs ?? 0;
     if (rtt > 0) {
-      _rttBuckets[_bucketIndex(rtt, _rttBounds)]++;
+      _rttBuckets[bucketIndex(rtt, rttBounds)]++;
       _rttSamples++;
     }
 
@@ -370,7 +377,7 @@ class SessionGradeTracker {
     final moved = (inDelta < 0 ? 0 : inDelta) + (outDelta < 0 ? 0 : outDelta);
     if (moved > 0) {
       final rateBps = moved / (dtMs / 1000);
-      _bwBuckets[_bucketIndex(rateBps.round(), _bwBounds)]++;
+      _bwBuckets[bucketIndex(rateBps.round(), _bwBounds)]++;
       _bwSamples++;
     }
 
@@ -386,11 +393,7 @@ class SessionGradeTracker {
     final keys = <String>{};
     for (final path in status.paths) {
       if (!path.active) continue;
-      if (path.isDirect) {
-        keys.add('d${path.pathIndex}');
-      } else {
-        keys.add('r${path.peerId ?? '?'}:${path.kind}');
-      }
+      keys.add(path.gradeKey);
     }
     return keys;
   }
@@ -398,10 +401,7 @@ class SessionGradeTracker {
   Map<String, int?> _pingFrames(SessionStatus status) {
     final out = <String, int?>{};
     for (final path in status.paths) {
-      final key = path.isDirect
-          ? 'd${path.pathIndex}'
-          : 'r${path.peerId ?? '?'}:${path.kind}';
-      out[key] = path.quicPingFrames;
+      out[path.gradeKey] = path.quicPingFrames;
     }
     return out;
   }

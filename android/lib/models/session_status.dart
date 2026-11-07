@@ -110,6 +110,12 @@ class PathStat {
     return '${(rate * 100).toStringAsFixed(1)}%';
   }
 
+  /// Stable key for one transport across snapshots, shared with
+  /// the per-transport grader: direct paths by supervisor index,
+  /// peer-relay legs by peer id + kind.
+  String get gradeKey =>
+      isDirect ? 'd$pathIndex' : 'r${peerId ?? '?'}:$kind';
+
   /// True for peer-relay transports. Relays are full transports for
   /// spreading and failover; they are only listed separately in the
   /// UI, not ranked below direct paths.
