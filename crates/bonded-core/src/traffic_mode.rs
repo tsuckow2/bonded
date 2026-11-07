@@ -3,8 +3,8 @@
 //! A mode picks how a flow's packets are spread over the session's
 //! transports. The default mode is today's behavior: pin each flow to
 //! one transport by flow hash. `best_transport` and `lowest_latency`
-//! landed in 4.52; `bandwidth_boost` lands in 4.53 and `redundant`
-//! in 4.54. Until a mode's slice lands, selecting it falls back to
+//! landed in 4.52, `bandwidth_boost` in 4.53, and `redundant` in
+//! 4.54. Until a mode's slice lands, selecting it falls back to
 //! default behavior — never silently pretending the mode is live.
 //!
 //! Rules resolve a mode per flow from the destination IP only. A rule
@@ -17,7 +17,8 @@
 //! The engine is deliberately data-only: it knows nothing about
 //! transports, sessions, or the UI. Both flow-pin points (the Linux
 //! client loop and the Android worker) consult it the same way, so
-//! 4.53–4.54 only add ordering arms in [`TrafficModeEngine::order_candidates`].
+//! 4.54 only adds one more ordering arm in
+//! [`TrafficModeEngine::order_candidates`].
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -67,14 +68,18 @@ impl TrafficMode {
         }
     }
 
-    /// `default`, `best_transport`, and `lowest_latency` have behavior
-    /// (4.51–4.52). The rest are selectable in the UI but fall back to
-    /// default until their slice lands (4.53–4.54) — the UI says so,
-    /// and so does this function.
+    /// `default`, `best_transport`, `lowest_latency`, and
+    /// `bandwidth_boost` have behavior (4.51–4.53). The rest are
+    /// selectable in the UI but fall back to default until their
+    /// slice lands (4.54) — the UI says so, and so does this
+    /// function.
     pub fn is_implemented(self) -> bool {
         matches!(
             self,
-            TrafficMode::Default | TrafficMode::BestTransport | TrafficMode::LowestLatency
+            TrafficMode::Default
+                | TrafficMode::BestTransport
+                | TrafficMode::LowestLatency
+                | TrafficMode::BandwidthBoost
         )
     }
 
@@ -264,10 +269,17 @@ impl TrafficModeEngine {
     /// the signals, so a flow stays pinned to its first candidate
     /// while the transport set and the signals are stable (the same
     /// pinning discipline as the hash rotation, without per-packet
-    /// re-pinning). The catch-all arm is the same default order —
-    /// that is the honest fallback for modes whose slices have not
-    /// landed yet, and it is what makes 4.53–4.54 pure additions:
-    /// each adds one arm here and flips its `is_implemented`.
+    /// re-pinning). `bandwidth_boost` (4.53) is the loss-weighted
+    /// refinement of the default spreading: each transport gets a
+    /// weight from its grade and loss rate (see [`bandwidth_weight`]),
+    /// and the flow hash picks one transport with probability
+    /// proportional to its weight — flows still stay pinned to one
+    /// transport, there is no per-packet striping, and the remaining
+    /// transports follow in weight order as the failover try-list.
+    /// The catch-all arm is the same default order — that is the
+    /// honest fallback for modes whose slices have not landed yet,
+    /// and it is what makes 4.54 a pure addition: one arm here plus
+    /// flipping its `is_implemented`.
     pub fn order_candidates(
         &self,
         mode: TrafficMode,
@@ -284,8 +296,10 @@ impl TrafficModeEngine {
             TrafficMode::LowestLatency => {
                 ranked_order(count, active_index, signals, lowest_latency_cmp)
             }
-            // 4.53: BandwidthBoost. 4.54: Redundant. Until then, fall
-            // back to default order.
+            TrafficMode::BandwidthBoost => {
+                bandwidth_boost_order(flow_hash, count, active_index, signals)
+            }
+            // 4.54: Redundant. Until then, fall back to default order.
             _ => default_order(flow_hash, count, active_index),
         }
     }
@@ -382,6 +396,129 @@ fn best_transport_cmp(a: &PathSignal, b: &PathSignal) -> std::cmp::Ordering {
 /// measured RTT; with nothing measured the order is index order.
 fn lowest_latency_cmp(a: &PathSignal, b: &PathSignal) -> std::cmp::Ordering {
     cmp_measured(a.rtt_ms, b.rtt_ms, false)
+}
+
+/// Neutral grade for a transport with no grade yet (4.53): the
+/// midpoint of the 0–100 scale. Unknown is neither perfect (100) nor
+/// worthless (0) — an ungraded path gets a middling share of new
+/// flows until its first grade push arrives.
+const UNKNOWN_GRADE: f64 = 50.0;
+
+/// Neutral loss rate for a transport with no loss observation yet
+/// (4.53): 5%. Unknown loss is neither perfect (0 — a path that has
+/// never been measured must not look lossless) nor dead (100%).
+/// A non-finite rate (which the signal builders never produce) is
+/// treated as unknown too.
+const UNKNOWN_LOSS_RATE: f64 = 0.05;
+
+/// Bandwidth-boost weight (4.53) for one transport:
+///
+/// `weight = (grade / 100) * (1 - loss_rate)`
+///
+/// Grade is the 4.50 per-transport total (higher = healthier);
+/// loss is the 4.49 QUIC loss rate (lower = healthier), clamped to
+/// [0, 1]. A fully lossy transport (loss >= 1) or a zero-grade one
+/// weighs exactly 0: it never leads a new flow, but it stays in the
+/// try-list last as a failover candidate — a dead-looking path is
+/// still better than dropping the flow when every other send fails.
+/// Unknown signals take the neutral values above, so with nothing
+/// measured anywhere every transport weighs 0.5 * 0.95 = 0.475 and
+/// the spread is uniform — bandwidth boost with no data IS the
+/// default spreading, and it sharpens into a weighted spread only
+/// as grades and loss observations arrive. RTT deliberately does
+/// not enter the weight: latency is what `lowest_latency` is for;
+/// boost is about how much traffic a path can carry, not how fast
+/// it answers.
+fn bandwidth_weight(signal: &PathSignal) -> f64 {
+    let grade = signal.grade.map(|g| (g.min(100) as f64) / 100.0).unwrap_or(UNKNOWN_GRADE / 100.0);
+    let loss = match signal.loss_rate {
+        Some(rate) if rate.is_finite() => rate.clamp(0.0, 1.0),
+        _ => UNKNOWN_LOSS_RATE,
+    };
+    grade * (1.0 - loss)
+}
+
+/// Bandwidth-boost ordering (4.53): the flow hash picks one
+/// transport with probability proportional to its weight, and the
+/// rest follow in weight order (ties by index) as the failover
+/// try-list. The pick is a deterministic function of
+/// (flow_hash, weights) — a flow stays pinned to its first
+/// candidate while the transport set and the signals are stable,
+/// with no per-packet re-pinning and no per-flow state in the
+/// engine, the same pinning discipline as 4.52's ranked modes.
+///
+/// The hash is reduced modulo 1_000_000 and scaled into
+/// [0, total_weight): integer arithmetic keeps the bucket
+/// boundaries exact, and a well-distributed flow hash (FNV-1a over
+/// the 5-tuple) lands uniformly in the buckets, so over many flows
+/// each transport carries a share of new flows equal to its weight
+/// fraction. When every weight is 0 (all paths fully lossy or
+/// zero-graded) there is nothing to weight on, so the order falls
+/// back to the default hash spread — traffic still flows. With no
+/// transports the active transport is the only candidate, the same
+/// empty-set shape as [`default_order`]. Signals are looked up by
+/// transport index; a short slice pads with the default
+/// (all-unknown) signal.
+fn bandwidth_boost_order(
+    flow_hash: u64,
+    count: usize,
+    active_index: usize,
+    signals: &[PathSignal],
+) -> Vec<usize> {
+    if count == 0 {
+        return vec![active_index];
+    }
+    let weights: Vec<f64> = (0..count)
+        .map(|i| bandwidth_weight(&signals.get(i).copied().unwrap_or_default()))
+        .collect();
+    let total: f64 = weights.iter().sum();
+    if !(total > 0.0) {
+        // Nothing to weight on (all weights 0, or all NaN somehow):
+        // spread by hash like the default mode.
+        return default_order(flow_hash, count, active_index);
+    }
+    // Weighted pick: the hash lands uniformly in [0, total) and the
+    // first transport whose cumulative weight passes it wins. The
+    // final `unwrap_or` is float-safety only — the slot is strictly
+    // below the total, so the walk always finds a positive-weight
+    // transport.
+    const WEIGHT_SCALE: u64 = 1_000_000;
+    let slot = (flow_hash % WEIGHT_SCALE) as f64 / WEIGHT_SCALE as f64 * total;
+    let mut cumulative = 0.0;
+    let mut pick = weights
+        .iter()
+        .position(|w| {
+            cumulative += *w;
+            slot < cumulative
+        })
+        .unwrap_or_else(|| {
+            weights
+                .iter()
+                .rposition(|w| *w > 0.0)
+                .unwrap_or(0)
+        });
+    // A zero-weight transport has a zero-width bucket and can never
+    // be picked by the walk above; guard anyway so a float edge
+    // cannot hand a flow to a fully-lossy path first.
+    if weights[pick] <= 0.0 {
+        pick = weights
+            .iter()
+            .position(|w| *w > 0.0)
+            .unwrap_or(0);
+    }
+    let mut rest: Vec<usize> = (0..count).filter(|&i| i != pick).collect();
+    rest.sort_by(|&a, &b| {
+        weights[b]
+            .partial_cmp(&weights[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.cmp(&b))
+    });
+    let mut ordered = vec![pick];
+    ordered.extend(rest);
+    if !ordered.contains(&active_index) {
+        ordered.push(active_index);
+    }
+    ordered
 }
 
 /// Order `0..count` by a signal comparator. The transport index
@@ -508,11 +645,11 @@ mod tests {
     }
 
     #[test]
-    fn default_best_and_lowest_latency_are_implemented() {
+    fn default_best_lowest_and_boost_are_implemented() {
         assert!(TrafficMode::Default.is_implemented());
         assert!(TrafficMode::BestTransport.is_implemented());
         assert!(TrafficMode::LowestLatency.is_implemented());
-        assert!(!TrafficMode::BandwidthBoost.is_implemented());
+        assert!(TrafficMode::BandwidthBoost.is_implemented());
         assert!(!TrafficMode::Redundant.is_implemented());
         assert_eq!(
             TrafficMode::BestTransport.effective(),
@@ -521,6 +658,10 @@ mod tests {
         assert_eq!(
             TrafficMode::LowestLatency.effective(),
             TrafficMode::LowestLatency
+        );
+        assert_eq!(
+            TrafficMode::BandwidthBoost.effective(),
+            TrafficMode::BandwidthBoost
         );
         assert_eq!(
             TrafficMode::Redundant.effective(),
@@ -717,7 +858,7 @@ mod tests {
             vec![3]
         );
         // Unimplemented modes fall back to exactly the default order.
-        for mode in [TrafficMode::BandwidthBoost, TrafficMode::Redundant] {
+        for mode in [TrafficMode::Redundant] {
             assert_eq!(
                 engine.order_candidates(mode, 5, 3, 1, &[]),
                 engine.order_candidates(TrafficMode::Default, 5, 3, 1, &[]),
@@ -886,6 +1027,219 @@ mod tests {
     }
 
     #[test]
+    fn bandwidth_boost_weight_formula() {
+        // weight = (grade / 100) * (1 - loss): grade 90, lossless.
+        assert!((bandwidth_weight(&signal(Some(90), None, Some(0.0))) - 0.9).abs() < 1e-9);
+        // Loss discounts the weight: grade 90 at 50% loss -> 0.45,
+        // below a clean grade-50 path (0.5) — loss can demote a
+        // high-grade path, which is the point of the mode.
+        assert!((bandwidth_weight(&signal(Some(90), None, Some(0.5))) - 0.45).abs() < 1e-9);
+        // Fully lossy weighs 0, whatever the grade.
+        assert_eq!(bandwidth_weight(&signal(Some(100), None, Some(1.0))), 0.0);
+        // Zero grade weighs 0, whatever the loss.
+        assert_eq!(bandwidth_weight(&signal(Some(0), None, Some(0.0))), 0.0);
+        // A loss rate above 1 clamps: still just fully lossy.
+        assert_eq!(bandwidth_weight(&signal(Some(100), None, Some(2.0))), 0.0);
+        // Unknown grade -> neutral 50, unknown loss -> neutral 5%:
+        // 0.5 * 0.95 = 0.475 — neither perfect nor zero.
+        assert!((bandwidth_weight(&signal(None, None, None)) - 0.475).abs() < 1e-9);
+        // Unknown grade with a measured loss still uses that loss.
+        assert!((bandwidth_weight(&signal(None, None, Some(0.0))) - 0.5).abs() < 1e-9);
+        // A NaN loss rate is treated as unknown, not as 0 or 1.
+        assert!((bandwidth_weight(&signal(Some(80), None, Some(f64::NAN))) - 0.76).abs() < 1e-9);
+        // RTT never enters the weight: latency is lowest_latency's
+        // job, boost is about how much traffic a path can carry.
+        assert_eq!(
+            bandwidth_weight(&signal(Some(80), Some(5), Some(0.0))),
+            bandwidth_weight(&signal(Some(80), Some(5000), Some(0.0)))
+        );
+    }
+
+    /// Count first-picks over 1000 spread-out flow hashes. The step
+    /// 9973 is coprime to the 1_000_000 weight scale, so the residues
+    /// cover the buckets near-uniformly (verified by hand: 2:1
+    /// weights give 669/331, equal weights 502/498).
+    fn boost_first_pick_counts(signals: &[PathSignal], count: usize) -> Vec<usize> {
+        let engine = TrafficModeEngine::default();
+        let mut counts = vec![0usize; count];
+        for i in 0..1000u64 {
+            let ordered = engine.order_candidates(
+                TrafficMode::BandwidthBoost,
+                i.wrapping_mul(9973),
+                count,
+                0,
+                signals,
+            );
+            counts[ordered[0]] += 1;
+        }
+        counts
+    }
+
+    #[test]
+    fn bandwidth_boost_spreads_flows_by_weight() {
+        let engine = TrafficModeEngine::default();
+        // Grades 90 vs 45, both lossless: weights 0.9 vs 0.45, a 2:1
+        // spread — about two thirds of new flows on transport 0.
+        let signals = [signal(Some(90), None, Some(0.0)), signal(Some(45), None, Some(0.0))];
+        let counts = boost_first_pick_counts(&signals, 2);
+        assert!(
+            (630..=710).contains(&counts[0]),
+            "2:1 weights must give transport 0 ~2/3 of flows, got {counts:?}"
+        );
+        assert_eq!(counts[0] + counts[1], 1000);
+        // Three-way: weights 0.9 / 0.45 / 0.225 (4:2:1) — the best
+        // path carries just over half the new flows.
+        let signals = [
+            signal(Some(90), None, Some(0.0)),
+            signal(Some(45), None, Some(0.0)),
+            signal(Some(90), None, Some(0.75)),
+        ];
+        let counts = boost_first_pick_counts(&signals, 3);
+        assert!(
+            (530..=615).contains(&counts[0]),
+            "4:2:1 weights must give transport 0 ~4/7 of flows, got {counts:?}"
+        );
+        assert!(
+            (250..=325).contains(&counts[1]),
+            "transport 1 must get ~2/7 of flows, got {counts:?}"
+        );
+        // The pick is deterministic in (flow, signals): the same
+        // flow always lands on the same transport while the signals
+        // are stable — that determinism IS the pinning.
+        for flow in [0u64, 1, 42, 700_000, 999_999] {
+            let a = engine.order_candidates(TrafficMode::BandwidthBoost, flow, 3, 0, &signals);
+            let b = engine.order_candidates(TrafficMode::BandwidthBoost, flow, 3, 0, &signals);
+            assert_eq!(a, b, "flow {flow} must pin deterministically");
+        }
+    }
+
+    #[test]
+    fn bandwidth_boost_failover_follows_weight_order() {
+        let engine = TrafficModeEngine::default();
+        // Weights 0.3 / 0.9 / 0.6 (grades 30 / 90 / 60, lossless):
+        // cumulative buckets in index order are [0, 0.3), [0.3, 1.2),
+        // [1.2, 1.8) of total 1.8, i.e. hash%1_000_000 below 166667
+        // picks transport 0, 166667..666666 picks 1, above picks 2.
+        let signals = [
+            signal(Some(30), None, Some(0.0)),
+            signal(Some(90), None, Some(0.0)),
+            signal(Some(60), None, Some(0.0)),
+        ];
+        assert_eq!(
+            engine.order_candidates(TrafficMode::BandwidthBoost, 0, 3, 0, &signals),
+            vec![0, 1, 2],
+            "flow 0 lands in transport 0's bucket; the rest follow by weight"
+        );
+        assert_eq!(
+            engine.order_candidates(TrafficMode::BandwidthBoost, 300_000, 3, 0, &signals),
+            vec![1, 2, 0],
+            "flow 300000 lands in transport 1's bucket"
+        );
+        assert_eq!(
+            engine.order_candidates(TrafficMode::BandwidthBoost, 700_000, 3, 0, &signals),
+            vec![2, 1, 0],
+            "flow 700000 lands in transport 2's bucket"
+        );
+    }
+
+    #[test]
+    fn bandwidth_boost_loss_discounts_a_high_grade_path() {
+        let engine = TrafficModeEngine::default();
+        // Grade 90 at 50% loss (weight 0.45) vs grade 50 lossless
+        // (weight 0.5): the lossy high-grade path carries slightly
+        // FEWER new flows than the clean mid-grade one.
+        let signals = [signal(Some(90), None, Some(0.5)), signal(Some(50), None, Some(0.0))];
+        let counts = boost_first_pick_counts(&signals, 2);
+        assert!(
+            (430..=520).contains(&counts[0]),
+            "lossy grade-90 must get ~47% of flows, got {counts:?}"
+        );
+        assert_eq!(counts[0] + counts[1], 1000);
+        let _ = engine;
+    }
+
+    #[test]
+    fn bandwidth_boost_unknown_signals_are_neutral() {
+        // Nothing measured anywhere: every weight is 0.475, so the
+        // spread is uniform — boost with no data IS the default
+        // spreading, and it sharpens only as signals arrive.
+        let counts = boost_first_pick_counts(&[], 2);
+        assert!(
+            (450..=550).contains(&counts[0]) && (450..=550).contains(&counts[1]),
+            "all-unknown signals must spread flows ~evenly, got {counts:?}"
+        );
+        // One known-good path vs one unknown: the known path leads
+        // (~65%), but the unknown path still gets a real share
+        // (~35%) — unknown is neither zero nor perfect.
+        let signals = [signal(Some(90), None, Some(0.0)), signal(None, None, None)];
+        let counts = boost_first_pick_counts(&signals, 2);
+        assert!(
+            (615..=695).contains(&counts[0]),
+            "known-good must lead the unknown path, got {counts:?}"
+        );
+        assert!(
+            (305..=385).contains(&counts[1]),
+            "unknown path must still carry a real share, got {counts:?}"
+        );
+        // A short signals slice pads with unknown: the missing path
+        // is neutral, not dead and not preferred.
+        let signals = [signal(Some(90), None, Some(0.0))];
+        let counts = boost_first_pick_counts(&signals, 3);
+        assert_eq!(counts[0] + counts[1] + counts[2], 1000);
+        assert!(
+            counts[1] > 0 && counts[2] > 0,
+            "padded-unknown paths must still receive flows, got {counts:?}"
+        );
+    }
+
+    #[test]
+    fn bandwidth_boost_fully_lossy_never_leads_but_stays_in_try_list() {
+        let engine = TrafficModeEngine::default();
+        // Transport 0 is fully lossy (weight 0) despite a perfect
+        // grade; transport 1 is mid-grade and clean.
+        let signals = [signal(Some(100), None, Some(1.0)), signal(Some(60), None, Some(0.0))];
+        for flow in 0..1000u64 {
+            let ordered =
+                engine.order_candidates(TrafficMode::BandwidthBoost, flow.wrapping_mul(9973), 2, 0, &signals);
+            assert_eq!(ordered[0], 1, "flow {flow} must never lead on a fully-lossy path");
+            assert_eq!(ordered, vec![1, 0], "the lossy path stays last as failover");
+        }
+        // Same for a zero-grade path: never first, still listed.
+        let signals = [signal(Some(0), None, Some(0.0)), signal(Some(60), None, Some(0.0))];
+        let ordered = engine.order_candidates(TrafficMode::BandwidthBoost, 0, 2, 0, &signals);
+        assert_eq!(ordered, vec![1, 0]);
+    }
+
+    #[test]
+    fn bandwidth_boost_all_zero_weights_fall_back_to_hash_spread() {
+        let engine = TrafficModeEngine::default();
+        // Every weight is 0 (zero grade + fully lossy): nothing to
+        // weight on, so the order is exactly the default hash spread
+        // and traffic still flows.
+        let signals = [signal(Some(0), None, Some(0.0)), signal(Some(100), None, Some(1.0))];
+        for flow in 0..64u64 {
+            assert_eq!(
+                engine.order_candidates(TrafficMode::BandwidthBoost, flow, 2, 0, &signals),
+                engine.order_candidates(TrafficMode::Default, flow, 2, 0, &signals),
+                "flow {flow}: all-zero weights must equal the default order"
+            );
+        }
+    }
+
+    #[test]
+    fn bandwidth_boost_empty_set_and_single_transport() {
+        let engine = TrafficModeEngine::default();
+        assert_eq!(
+            engine.order_candidates(TrafficMode::BandwidthBoost, 7, 0, 3, &[]),
+            vec![3]
+        );
+        assert_eq!(
+            engine.order_candidates(TrafficMode::BandwidthBoost, 7, 1, 0, &[]),
+            vec![0]
+        );
+    }
+
+    #[test]
     fn order_for_packet_modes_use_signals() {
         // IPv4 UDP packet to 10.1.2.3 with a best-transport rule for
         // 10.0.0.0/8: the best-graded transport leads the try-list.
@@ -911,6 +1265,28 @@ mod tests {
         };
         let ordered = engine.order_for_packet(&packet, 2, 0, &signals);
         assert_eq!(ordered, vec![0, 1]);
+    }
+
+    #[test]
+    fn order_for_packet_bandwidth_boost_rule_uses_weights() {
+        // IPv4 UDP packet to 10.1.2.3 with a bandwidth-boost rule for
+        // 10.0.0.0/8: transport 0 is fully lossy (weight 0), so the
+        // packet must lead on transport 1 whatever its flow hash is
+        // — the rule's mode, not the hash, decides the pick.
+        let engine = TrafficModeEngine {
+            default_mode: TrafficMode::Default,
+            rules: vec![subnet_rule("s", "10.0.0.0/8", TrafficMode::BandwidthBoost)],
+        };
+        let mut packet = vec![0x45u8, 0, 0, 28, 0, 0, 0, 0, 64, 17, 0, 0];
+        packet.extend_from_slice(&[192, 0, 2, 1]); // src
+        packet.extend_from_slice(&[10, 1, 2, 3]); // dst
+        packet.extend_from_slice(&[1234u16.to_be_bytes(), 53u16.to_be_bytes()].concat());
+        let signals = [
+            signal(Some(100), Some(10), Some(1.0)),
+            signal(Some(10), Some(500), Some(0.0)),
+        ];
+        let ordered = engine.order_for_packet(&packet, 2, 0, &signals);
+        assert_eq!(ordered, vec![1, 0]);
     }
 
     #[test]

@@ -12,11 +12,11 @@ void main() {
       expect(TrafficMode.fromWireName(null), TrafficMode.defaultMode);
     });
 
-    test('default, best transport, and lowest latency are implemented in 4.52', () {
+    test('default, best transport, lowest latency, and bandwidth boost are implemented in 4.53', () {
       expect(TrafficMode.defaultMode.isImplemented, isTrue);
       expect(TrafficMode.bestTransport.isImplemented, isTrue);
       expect(TrafficMode.lowestLatency.isImplemented, isTrue);
-      expect(TrafficMode.bandwidthBoost.isImplemented, isFalse);
+      expect(TrafficMode.bandwidthBoost.isImplemented, isTrue);
       expect(TrafficMode.redundant.isImplemented, isFalse);
       expect(TrafficMode.bestTransport.implementedIn, '4.52');
       expect(TrafficMode.lowestLatency.implementedIn, '4.52');
