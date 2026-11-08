@@ -5,6 +5,7 @@ mod acme;
 mod auth_handshake;
 mod authorized_keys;
 mod bootstrap;
+mod dial_back;
 mod dns_proxy;
 mod health;
 mod invite_tokens;
@@ -293,6 +294,10 @@ async fn main() -> anyhow::Result<()> {
         wireguard_public_addr: cfg.server.wireguard_public_addr(),
         wireguard_peer_lease_secs: cfg.server.wireguard_peer_lease_secs,
         authorized_keys: authorized_keys.clone(),
+        dial_back_push: Some(Arc::new(dial_back::DialBackPush::new(
+            sessions.clone(),
+            forwarders.clone(),
+        ))),
         diagnostics_dir: std::path::Path::new(&cfg.server.authorized_keys_file)
             .parent()
             .map(|parent| parent.join("diagnostics"))

@@ -56,6 +56,29 @@ pub const FLAG_PATH_RETIRE: u32 = 0x0020;
 /// traffic against them; PING/PONG frames never carry it (the
 /// router skips control frames when recording flows).
 pub const FLAG_REDUNDANT: u32 = 0x0040;
+/// Frame flag: set on a server-to-provider dial-back notification
+/// (4.56, [`crate::peer_share::PeerShareDialBackNotification`]).
+/// The server pushes it on the provider's live session when it mints
+/// a reversed introduction for a consumer that asked to be dialed
+/// back; the provider (4.57) intercepts it before the data path and
+/// dials the named consumer. The push is addressed with the
+/// session's own connection id and sequence `u64::MAX`, so a client
+/// that feeds it to the session reorder buffer instead (an old
+/// client, which knows neither this flag nor the notification)
+/// buffers it past the reorder gap: it is never delivered to TUN
+/// and never consumes a data sequence. Old-client behavior was
+/// VERIFIED, not assumed, by reading both inbound loops — the
+/// task's "old clients ignore unknown frame types" is FALSE: the
+/// Android worker delivers every non-PONG frame's payload straight
+/// to TUN (the JSON is dropped by the kernel as a non-IP packet and
+/// counts one inbound packet), and the Linux loop feeds it to
+/// `ingest_inbound`. Neither errors nor kills the session, and the
+/// notification is rare (one per dial-back introduction request),
+/// but it is a wart, not a clean no-op. The PONG bit was considered
+/// as an invisibility cloak and REJECTED: both loops skip PONG
+/// payloads, but a PONG-flagged frame would also write a bogus
+/// `last_rtt_ms` into path stats and corrupt transport grading.
+pub const FLAG_PEER_DIAL_BACK: u32 = 0x0080;
 
 /// Parse a session-epoch binding PING's epoch, if present: the flag
 /// must be set and the payload must be exactly 8 bytes.

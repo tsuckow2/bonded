@@ -4,7 +4,9 @@ use std::net::{IpAddr, SocketAddr};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
-use crate::session::{SessionFrame, SessionHeader, FLAG_PEER_RELAY_REGISTRATION};
+use crate::session::{
+    SessionFrame, SessionHeader, FLAG_PEER_DIAL_BACK, FLAG_PEER_RELAY_REGISTRATION,
+};
 
 const TXT_VERSION_KEY: &str = "version";
 const TXT_DEVICE_KEY: &str = "device_key";
@@ -24,6 +26,29 @@ pub struct PeerShareIntroductionRequest {
     pub listener_transport: String,
     pub listener_cert_fingerprint: String,
     pub consumer_signature: String,
+    /// Reverse dial (4.56): when true, the consumer asks the server to
+    /// mint a reversed introduction and push a dial-back notification
+    /// to the provider's live session. Defaults off, so old requests
+    /// (and old servers, which ignore unknown JSON fields) behave
+    /// exactly as before.
+    #[serde(default)]
+    pub dial_back: bool,
+    /// Endpoints the provider should dial the consumer on, in order:
+    /// the consumer's own advertised addresses (4.55 list, same port
+    /// as its peer listener). Only meaningful with `dial_back`.
+    #[serde(default)]
+    pub consumer_endpoints: Vec<String>,
+    /// Cert fingerprint of the consumer's own peer listener, which the
+    /// reversed introduction carries as `listener_cert_fingerprint`
+    /// (the consumer is the listener on a reversed leg). Only
+    /// meaningful with `dial_back`; the server rejects a dial-back
+    /// request without it.
+    #[serde(default)]
+    pub consumer_listener_cert_fingerprint: String,
+}
+
+fn default_claims_direction() -> String {
+    "forward".to_owned()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -35,6 +60,33 @@ pub struct PeerShareIntroductionClaims {
     pub listener_transport: String,
     pub listener_cert_fingerprint: String,
     pub expires_at: u64,
+    /// Which leg this introduction authorizes (4.56): `"forward"` —
+    /// the consumer dials the provider's listener (all introductions
+    /// minted before 4.56, which carry no such field, parse as
+    /// forward); `"reverse"` — the provider dials the consumer's
+    /// listener. The direction is part of the server-signed claims,
+    /// so a reversed introduction cannot be replayed as a forward
+    /// one: both verifiers check it. On a reversed introduction
+    /// `listener_cert_fingerprint` is the CONSUMER's listener cert
+    /// (the consumer is the listener) and `consumer_endpoints` holds
+    /// the addresses the provider should dial, in order;
+    /// `provider_endpoint` still names the provider's listener
+    /// endpoint and identifies the pair.
+    #[serde(default = "default_claims_direction")]
+    pub direction: String,
+    /// Dialable addresses for the listener on a reversed leg; empty
+    /// on a forward introduction (the consumer dials the provider's
+    /// `provider_endpoint` there).
+    #[serde(default)]
+    pub consumer_endpoints: Vec<String>,
+}
+
+impl PeerShareIntroductionClaims {
+    /// Whether this introduction authorizes a provider-initiated
+    /// (reversed) leg rather than a consumer-initiated one.
+    pub fn is_reverse(&self) -> bool {
+        self.direction == "reverse"
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -69,6 +121,17 @@ pub struct PeerShareAdvertisement {
 }
 
 impl PeerShareIntroductionRequest {
+    /// The bytes the consumer signs. Covers ONLY the original six
+    /// fields, deliberately NOT the dial-back fields (4.56): an old
+    /// server verifies with its own six-field payload, so a new
+    /// client signing an extended payload would fail verification
+    /// against it. The dial-back fields ride inside the TLS-protected
+    /// bootstrap request and the server only acts on them after the
+    /// signature over the core fields verifies; a flipped flag or
+    /// endpoint list cannot yield a usable leg, because the
+    /// provider's dial (4.57) verifies the server-signed reversed
+    /// introduction's listener cert fingerprint before sending
+    /// anything sensitive.
     pub fn signed_payload(&self) -> anyhow::Result<Vec<u8>> {
         Ok(serde_json::to_vec(&serde_json::json!({
             "consumer_device_public_key": self.consumer_device_public_key,
@@ -195,6 +258,40 @@ impl PeerRelayRegistration {
     }
 }
 
+/// Server-to-provider dial-back notification (4.56): pushed on the
+/// provider's live session when the server mints a reversed
+/// introduction for a consumer that asked to be dialed back. The
+/// notification is self-contained — the provider needs nothing else
+/// to dial the consumer (4.57): the consumer's key and endpoints,
+/// plus the server-signed reversed introduction it presents to the
+/// consumer on dial and to the server as its relay registration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PeerShareDialBackNotification {
+    pub consumer_device_public_key: String,
+    pub consumer_endpoints: Vec<String>,
+    pub introduction: SignedPeerShareIntroduction,
+}
+
+impl PeerShareDialBackNotification {
+    pub fn into_control_frame(self) -> anyhow::Result<SessionFrame> {
+        Ok(SessionFrame {
+            header: SessionHeader {
+                connection_id: 0,
+                sequence: 0,
+                flags: FLAG_PEER_DIAL_BACK,
+            },
+            payload: Bytes::from(serde_json::to_vec(&self)?),
+        })
+    }
+
+    pub fn from_control_frame(frame: &SessionFrame) -> anyhow::Result<Self> {
+        if frame.header.flags & FLAG_PEER_DIAL_BACK == 0 {
+            anyhow::bail!("session frame did not contain a peer dial-back notification");
+        }
+        Ok(serde_json::from_slice(&frame.payload)?)
+    }
+}
+
 fn required_txt_record(records: &BTreeMap<String, String>, key: &str) -> anyhow::Result<String> {
     records
         .get(key)
@@ -207,8 +304,8 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        PeerRelayRegistration, PeerShareAdvertisement, PeerShareIntroductionClaims,
-        PeerShareIntroductionRequest, SignedPeerShareIntroduction,
+        PeerRelayRegistration, PeerShareAdvertisement, PeerShareDialBackNotification,
+        PeerShareIntroductionClaims, PeerShareIntroductionRequest, SignedPeerShareIntroduction,
     };
 
     #[test]
@@ -221,6 +318,9 @@ mod tests {
             listener_transport: "quic".to_owned(),
             listener_cert_fingerprint: "sha256:abcd".to_owned(),
             consumer_signature: "sig".to_owned(),
+            dial_back: false,
+            consumer_endpoints: Vec::new(),
+            consumer_listener_cert_fingerprint: String::new(),
         };
 
         let payload =
@@ -228,6 +328,55 @@ mod tests {
                 .expect("payload should be utf8");
         assert!(payload.contains("consumer_device_public_key"));
         assert!(!payload.contains("consumer_signature"));
+    }
+
+    #[test]
+    fn introduction_request_signature_payload_excludes_dial_back_fields() {
+        // The dial-back fields must stay out of the signed payload so
+        // a new client still verifies against an old server (4.56):
+        // the old server signs/ verifies the six-field payload.
+        let request = PeerShareIntroductionRequest {
+            consumer_device_public_key: "consumer".to_owned(),
+            provider_device_public_key: "provider".to_owned(),
+            provider_instance_nonce: "nonce-1".to_owned(),
+            provider_endpoint: "192.168.1.20:54443".to_owned(),
+            listener_transport: "quic".to_owned(),
+            listener_cert_fingerprint: "sha256:abcd".to_owned(),
+            consumer_signature: "sig".to_owned(),
+            dial_back: true,
+            consumer_endpoints: vec!["192.168.43.10:54443".to_owned()],
+            consumer_listener_cert_fingerprint: "sha256:consumer-listener".to_owned(),
+        };
+
+        let payload =
+            String::from_utf8(request.signed_payload().expect("payload should serialize"))
+                .expect("payload should be utf8");
+        assert!(!payload.contains("dial_back"));
+        assert!(!payload.contains("consumer_endpoints"));
+        assert!(!payload.contains("consumer_listener_cert_fingerprint"));
+
+        // ...but the fields themselves round-trip through JSON, so the
+        // server sees the flag and the endpoints.
+        let parsed: PeerShareIntroductionRequest = serde_json::from_str(
+            &serde_json::to_string(&request).expect("request should serialize"),
+        )
+        .expect("request should parse");
+        assert_eq!(parsed, request);
+        assert!(parsed.dial_back);
+    }
+
+    #[test]
+    fn introduction_request_without_dial_back_fields_parses_as_forward_only() {
+        // Old clients / old servers send no dial-back fields: they
+        // parse as dial-back off with no endpoints, i.e. exactly the
+        // pre-4.56 behaviour.
+        let parsed: PeerShareIntroductionRequest = serde_json::from_str(
+            r#"{"consumer_device_public_key":"consumer","provider_device_public_key":"provider","provider_instance_nonce":"nonce-1","provider_endpoint":"192.168.1.20:54443","listener_transport":"quic","listener_cert_fingerprint":"sha256:abcd","consumer_signature":"sig"}"#,
+        )
+        .expect("old request should parse");
+        assert!(!parsed.dial_back);
+        assert!(parsed.consumer_endpoints.is_empty());
+        assert!(parsed.consumer_listener_cert_fingerprint.is_empty());
     }
 
     #[test]
@@ -240,12 +389,56 @@ mod tests {
             listener_transport: "quic".to_owned(),
             listener_cert_fingerprint: "sha256:abcd".to_owned(),
             expires_at: 12345,
+            direction: "forward".to_owned(),
+            consumer_endpoints: Vec::new(),
         };
 
         let payload =
             String::from_utf8(claims.signing_payload().expect("payload should serialize"))
                 .expect("payload should be utf8");
         assert!(payload.contains("expires_at"));
+    }
+
+    #[test]
+    fn introduction_claims_without_direction_parse_as_forward() {
+        // Claims minted by an old server carry no direction: they
+        // parse as forward, so old introductions keep verifying.
+        let parsed: PeerShareIntroductionClaims = serde_json::from_str(
+            r#"{"consumer_device_public_key":"consumer","provider_device_public_key":"provider","provider_instance_nonce":"nonce-1","provider_endpoint":"192.168.1.20:54443","listener_transport":"quic","listener_cert_fingerprint":"sha256:abcd","expires_at":12345}"#,
+        )
+        .expect("old claims should parse");
+        assert_eq!(parsed.direction, "forward");
+        assert!(!parsed.is_reverse());
+        assert!(parsed.consumer_endpoints.is_empty());
+    }
+
+    #[test]
+    fn reversed_introduction_claims_name_roles_and_endpoints() {
+        let claims = PeerShareIntroductionClaims {
+            consumer_device_public_key: "consumer".to_owned(),
+            provider_device_public_key: "provider".to_owned(),
+            provider_instance_nonce: "nonce-1".to_owned(),
+            provider_endpoint: "192.168.1.20:54443".to_owned(),
+            listener_transport: "quic".to_owned(),
+            listener_cert_fingerprint: "sha256:consumer-listener".to_owned(),
+            expires_at: 12345,
+            direction: "reverse".to_owned(),
+            consumer_endpoints: vec!["192.168.43.10:54443".to_owned()],
+        };
+        assert!(claims.is_reverse());
+        let parsed: PeerShareIntroductionClaims = serde_json::from_str(
+            &serde_json::to_string(&claims).expect("claims should serialize"),
+        )
+        .expect("claims should parse");
+        assert_eq!(parsed, claims);
+        assert!(parsed.is_reverse());
+        // The reversed listener cert is the consumer's, not the
+        // provider's: the roles are named by the claims, not by
+        // position alone.
+        assert_eq!(
+            parsed.listener_cert_fingerprint,
+            "sha256:consumer-listener"
+        );
     }
 
     #[test]
@@ -345,6 +538,8 @@ mod tests {
                     listener_transport: "quic".to_owned(),
                     listener_cert_fingerprint: "sha256:abcd".to_owned(),
                     expires_at: 12345,
+                    direction: "forward".to_owned(),
+                    consumer_endpoints: Vec::new(),
                 },
                 server_signature: "sig".to_owned(),
             },
@@ -357,5 +552,48 @@ mod tests {
         let parsed =
             PeerRelayRegistration::from_control_frame(&frame).expect("control frame should parse");
         assert_eq!(parsed, registration);
+    }
+
+    #[test]
+    fn dial_back_notification_round_trips_through_control_frame() {
+        use crate::session::FLAG_PEER_DIAL_BACK;
+
+        let notification = PeerShareDialBackNotification {
+            consumer_device_public_key: "consumer".to_owned(),
+            consumer_endpoints: vec!["192.168.43.10:54443".to_owned()],
+            introduction: SignedPeerShareIntroduction {
+                introduction: PeerShareIntroductionClaims {
+                    consumer_device_public_key: "consumer".to_owned(),
+                    provider_device_public_key: "provider".to_owned(),
+                    provider_instance_nonce: "nonce-1".to_owned(),
+                    provider_endpoint: "192.168.1.20:54443".to_owned(),
+                    listener_transport: "quic".to_owned(),
+                    listener_cert_fingerprint: "sha256:consumer-listener".to_owned(),
+                    expires_at: 12345,
+                    direction: "reverse".to_owned(),
+                    consumer_endpoints: vec!["192.168.43.10:54443".to_owned()],
+                },
+                server_signature: "sig".to_owned(),
+            },
+        };
+
+        let frame = notification
+            .clone()
+            .into_control_frame()
+            .expect("control frame should serialize");
+        assert_ne!(frame.header.flags & FLAG_PEER_DIAL_BACK, 0);
+        let parsed = PeerShareDialBackNotification::from_control_frame(&frame)
+            .expect("control frame should parse");
+        assert_eq!(parsed, notification);
+        assert!(parsed.introduction.introduction.is_reverse());
+
+        // A relay-registration frame is not a dial-back frame.
+        let registration = PeerRelayRegistration {
+            introduction: notification.introduction.clone(),
+        };
+        let relay_frame = registration
+            .into_control_frame()
+            .expect("registration frame should serialize");
+        assert!(PeerShareDialBackNotification::from_control_frame(&relay_frame).is_err());
     }
 }

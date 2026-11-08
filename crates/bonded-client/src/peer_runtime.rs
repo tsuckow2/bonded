@@ -919,6 +919,27 @@ pub async fn start_peer_share_runtime(
         let browse_self_key = device_keypair.public_key_b64.clone();
         let browse_bind_ip = peer_relay_bind_ip(config)?;
         let browse_logger = event_logger.clone();
+        // Reverse dial (4.56): this device can be dialed back only
+        // when it runs a peer listener, i.e. in provider mode — then
+        // its own advertised endpoints and listener cert fingerprint
+        // ride on every introduction request, and the server mints a
+        // reversed introduction and pushes a dial-back notification
+        // to the provider. A consumer-only runtime requests no
+        // dial-back: it has no listener, so nothing could dial it.
+        // The endpoints are the STARTUP list; the advertise watcher
+        // may re-register a changed list later, and the provider
+        // dials the endpoints named in the minted introduction, so a
+        // list change between request and dial is a known staleness
+        // window (the next introduction cycle refreshes it).
+        let browse_dial_back = match (advertisement.as_ref(), listener_identity.as_ref()) {
+            (Some(adv), Some(identity)) => Some(DialBackParams {
+                consumer_endpoints: adv.endpoints.clone(),
+                consumer_listener_cert_fingerprint: identity
+                    .listener_cert_fingerprint
+                    .clone(),
+            }),
+            _ => None,
+        };
         let (closed_peer_tx, mut closed_peer_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let (renewal_tx, mut renewal_rx) =
             tokio::sync::mpsc::unbounded_channel::<(String, u64)>();
@@ -1029,6 +1050,7 @@ pub async fn start_peer_share_runtime(
                 &browse_config,
                 &browse_device_keypair,
                 &advertisement,
+                browse_dial_back.as_ref(),
             )
             .await
             {
@@ -1438,13 +1460,14 @@ async fn request_peer_share_introduction(
     config: &ClientConfig,
     consumer_keypair: &DeviceKeypair,
     advertisement: &PeerShareAdvertisement,
+    dial_back: Option<&DialBackParams>,
 ) -> anyhow::Result<SignedPeerShareIntroduction> {
     let bootstrap_address = config.client.server_public_address.trim();
     if bootstrap_address.is_empty() {
         anyhow::bail!("server_public_address is required for peer-share introduction bootstrap");
     }
 
-    let request = build_peer_introduction_request(consumer_keypair, advertisement)?;
+    let request = build_peer_introduction_request(consumer_keypair, advertisement, dial_back)?;
     let request_body = serde_json::to_string(&request)?;
     let mut errors = Vec::new();
     for scheme in bootstrap_scheme_candidates(config) {
@@ -1475,9 +1498,23 @@ async fn request_peer_share_introduction(
     )
 }
 
+/// What a consumer that can itself be dialed back asks the server
+/// to put in a reversed introduction (4.56): its own advertised
+/// endpoints, and the cert fingerprint of its own peer listener
+/// (the consumer is the listener on a reversed leg). Only built
+/// when this device runs a peer listener (provider mode); a
+/// consumer-only runtime has no listener to dial back to, so it
+/// requests no dial-back and behaves exactly as before.
+#[derive(Debug, Clone)]
+pub struct DialBackParams {
+    pub consumer_endpoints: Vec<String>,
+    pub consumer_listener_cert_fingerprint: String,
+}
+
 fn build_peer_introduction_request(
     consumer_keypair: &DeviceKeypair,
     advertisement: &PeerShareAdvertisement,
+    dial_back: Option<&DialBackParams>,
 ) -> anyhow::Result<PeerShareIntroductionRequest> {
     let listener_transport = advertised_listener_transport(advertisement)?;
     let mut request = PeerShareIntroductionRequest {
@@ -1488,6 +1525,13 @@ fn build_peer_introduction_request(
         listener_transport,
         listener_cert_fingerprint: advertisement.listener_cert_fingerprint.clone(),
         consumer_signature: String::new(),
+        dial_back: dial_back.is_some(),
+        consumer_endpoints: dial_back
+            .map(|params| params.consumer_endpoints.clone())
+            .unwrap_or_default(),
+        consumer_listener_cert_fingerprint: dial_back
+            .map(|params| params.consumer_listener_cert_fingerprint.clone())
+            .unwrap_or_default(),
     };
     request.consumer_signature = sign_bytes(consumer_keypair, &request.signed_payload()?)?;
     Ok(request)
@@ -1788,12 +1832,15 @@ mod tests {
         is_cellular_interface_name, is_tunnel_interface, peer_share_peer_id,
         prefer_path_subnet_candidate, renewal_delay, resolve_advertise_ips,
         select_advertise_ip, select_advertise_ip_for_binds, should_accept_discovered_peer,
-        PeerLegTracker, RedialQueue, RelayPathClaims, PEER_REDISCOVERY_MAX_ATTEMPTS,
-        PEER_RELAY_RENEWAL_LEAD_SECS, PEER_RELAY_RENEWAL_MIN_DELAY,
+        DialBackParams, PeerLegTracker, RedialQueue, RelayPathClaims,
+        PEER_REDISCOVERY_MAX_ATTEMPTS, PEER_RELAY_RENEWAL_LEAD_SECS,
+        PEER_RELAY_RENEWAL_MIN_DELAY,
     };
     use bonded_core::auth::DeviceKeypair;
     use bonded_core::config::{ClientConfig, PeerShareMode};
-    use bonded_core::peer_share::{PeerShareAdvertisement, SignedPeerShareIntroduction};
+    use bonded_core::peer_share::{
+        PeerShareAdvertisement, PeerShareIntroductionRequest, SignedPeerShareIntroduction,
+    };
     use pnet_datalink::NetworkInterface;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
@@ -1991,6 +2038,8 @@ mod tests {
             listener_transport: "quic".to_owned(),
             listener_cert_fingerprint: "sha256:abcd".to_owned(),
             expires_at: 0,
+            direction: "forward".to_owned(),
+            consumer_endpoints: Vec::new(),
         };
         let mut introduction = SignedPeerShareIntroduction {
             introduction: claims,
@@ -2023,8 +2072,69 @@ mod tests {
             capabilities: vec!["relay".to_owned(), "quic".to_owned()],
         };
 
-        let request = build_peer_introduction_request(&consumer, &advertisement)
+        // No dial-back: the request is exactly the pre-4.56 shape —
+        // flag off, no endpoints, no listener fingerprint — and the
+        // signature still verifies over the unchanged six-field
+        // payload, so an old server accepts it.
+        let request = build_peer_introduction_request(&consumer, &advertisement, None)
             .expect("request should build");
+        assert!(!request.dial_back);
+        assert!(request.consumer_endpoints.is_empty());
+        assert!(request.consumer_listener_cert_fingerprint.is_empty());
+        verify_signature(
+            &consumer.public_key_b64,
+            &request
+                .signed_payload()
+                .expect("request payload should serialize"),
+            &request.consumer_signature,
+        )
+        .expect("request signature should verify");
+    }
+
+    #[test]
+    fn introduction_request_carries_dial_back_flag_and_endpoints() {
+        let consumer = DeviceKeypair::generate();
+        let advertisement = PeerShareAdvertisement {
+            version: 1,
+            device_public_key: "provider".to_owned(),
+            server_public_key: "server-a".to_owned(),
+            instance_nonce: "nonce-1".to_owned(),
+            endpoint: "192.168.1.20:54443".to_owned(),
+            endpoints: vec!["192.168.1.20:54443".to_owned()],
+            listener_cert_fingerprint: "sha256:abcd".to_owned(),
+            capabilities: vec!["relay".to_owned(), "quic".to_owned()],
+        };
+        let dial_back = DialBackParams {
+            consumer_endpoints: vec![
+                "192.168.43.10:54443".to_owned(),
+                "10.0.0.5:54443".to_owned(),
+            ],
+            consumer_listener_cert_fingerprint: "sha256:consumer-listener".to_owned(),
+        };
+
+        let request =
+            build_peer_introduction_request(&consumer, &advertisement, Some(&dial_back))
+                .expect("request should build");
+        assert!(request.dial_back);
+        assert_eq!(
+            request.consumer_endpoints,
+            vec![
+                "192.168.43.10:54443".to_owned(),
+                "10.0.0.5:54443".to_owned(),
+            ]
+        );
+        assert_eq!(
+            request.consumer_listener_cert_fingerprint,
+            "sha256:consumer-listener"
+        );
+        // The dial-back fields round-trip through JSON (the server
+        // reads them from the request body) while the signature
+        // still covers only the six core fields.
+        let parsed: PeerShareIntroductionRequest = serde_json::from_str(
+            &serde_json::to_string(&request).expect("request should serialize"),
+        )
+        .expect("request should parse");
+        assert_eq!(parsed, request);
         verify_signature(
             &consumer.public_key_b64,
             &request

@@ -63,6 +63,20 @@ fn verify_relay_registration(
     )
     .context("peer relay introduction signature verification failed")?;
 
+    // The direction names the peer leg (forward: consumer dialed the
+    // provider; reverse: provider dialed the consumer, 4.56). It
+    // does NOT change the server-side binding: either way the
+    // provider authenticated to the server and the session belongs to
+    // the consumer, so `relayed_via_provider` accounting is identical
+    // for reverse legs. Only a direction the server never mints is
+    // rejected (claims minted before 4.56 parse as "forward").
+    if claims.direction != "forward" && claims.direction != "reverse" {
+        anyhow::bail!(
+            "peer relay introduction has unknown direction: {}",
+            claims.direction
+        );
+    }
+
     if claims.provider_device_public_key != authenticated_provider_key {
         anyhow::bail!(
             "peer relay introduction provider key mismatch: expected {}, got {}",
@@ -104,6 +118,8 @@ mod tests {
             listener_transport: "quic".to_owned(),
             listener_cert_fingerprint: "sha256:abcd".to_owned(),
             expires_at: now_plus(300),
+            direction: "forward".to_owned(),
+            consumer_endpoints: Vec::new(),
         };
         let registration = PeerRelayRegistration {
             introduction: SignedPeerShareIntroduction {
@@ -127,6 +143,92 @@ mod tests {
         assert_eq!(binding.client_public_key, "consumer");
         assert!(binding.initial_frame.is_none());
         assert!(binding.relayed_via_provider);
+    }
+
+    #[tokio::test]
+    async fn reversed_relay_registration_binds_with_same_relayed_accounting() {
+        // Reverse leg (4.56): the provider dialed the consumer and
+        // presents the reversed introduction as its registration.
+        // The direction governs the peer leg, not the server binding:
+        // the session is authenticated via the provider either way,
+        // so relayed_via_provider accounting is identical to the
+        // forward case — the consumer's traffic is still marked as
+        // relayed via the provider.
+        let server_identity = DeviceKeypair::generate();
+        let claims = PeerShareIntroductionClaims {
+            consumer_device_public_key: "consumer".to_owned(),
+            provider_device_public_key: "provider".to_owned(),
+            provider_instance_nonce: "nonce-1".to_owned(),
+            provider_endpoint: "192.168.1.20:54443".to_owned(),
+            listener_transport: "quic".to_owned(),
+            listener_cert_fingerprint: "sha256:consumer-listener".to_owned(),
+            expires_at: now_plus(300),
+            direction: "reverse".to_owned(),
+            consumer_endpoints: vec!["192.168.43.10:54443".to_owned()],
+        };
+        let registration = PeerRelayRegistration {
+            introduction: SignedPeerShareIntroduction {
+                introduction: claims.clone(),
+                server_signature: sign_bytes(
+                    &server_identity,
+                    &claims.signing_payload().expect("claims should serialize"),
+                )
+                .expect("server should sign claims"),
+            },
+        };
+        let mut transport = MockTransport::with_frames(vec![registration
+            .into_control_frame()
+            .expect("control frame should serialize")]);
+
+        let binding =
+            resolve_session_binding(&mut transport, "provider".to_owned(), &server_identity)
+                .await
+                .expect("reversed relay registration should bind to the consumer session");
+
+        assert_eq!(binding.client_public_key, "consumer");
+        assert!(binding.initial_frame.is_none());
+        assert!(binding.relayed_via_provider);
+    }
+
+    #[tokio::test]
+    async fn relay_registration_rejects_unknown_direction() {
+        let server_identity = DeviceKeypair::generate();
+        let claims = PeerShareIntroductionClaims {
+            consumer_device_public_key: "consumer".to_owned(),
+            provider_device_public_key: "provider".to_owned(),
+            provider_instance_nonce: "nonce-1".to_owned(),
+            provider_endpoint: "192.168.1.20:54443".to_owned(),
+            listener_transport: "quic".to_owned(),
+            listener_cert_fingerprint: "sha256:abcd".to_owned(),
+            expires_at: now_plus(300),
+            direction: "sideways".to_owned(),
+            consumer_endpoints: Vec::new(),
+        };
+        let registration = PeerRelayRegistration {
+            introduction: SignedPeerShareIntroduction {
+                introduction: claims.clone(),
+                server_signature: sign_bytes(
+                    &server_identity,
+                    &claims.signing_payload().expect("claims should serialize"),
+                )
+                .expect("server should sign claims"),
+            },
+        };
+        let mut transport = MockTransport::with_frames(vec![registration
+            .into_control_frame()
+            .expect("control frame should serialize")]);
+
+        let error = match resolve_session_binding(
+            &mut transport,
+            "provider".to_owned(),
+            &server_identity,
+        )
+        .await
+        {
+            Ok(_) => panic!("unknown direction should fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("unknown direction"));
     }
 
     #[tokio::test]

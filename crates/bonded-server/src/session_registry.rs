@@ -57,6 +57,19 @@ impl SessionRegistry {
             .contains_key(client_key)
     }
 
+    /// The session id a live session registered under this client key,
+    /// if any (4.56: the dial-back push addresses the provider's
+    /// session by its registered id). `None` means the device has no
+    /// live session and a push to it must be dropped, not queued.
+    pub fn session_id_for(&self, client_key: &str) -> Option<u64> {
+        self.inner
+            .read()
+            .expect("session registry read lock should not be poisoned")
+            .sessions_by_client
+            .get(client_key)
+            .map(|handle| handle.session_id)
+    }
+
     pub fn active_sessions(&self) -> usize {
         self.inner
             .read()

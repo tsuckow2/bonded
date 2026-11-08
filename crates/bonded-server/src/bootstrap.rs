@@ -25,7 +25,8 @@ use bonded_core::diagnostics::{
     MAX_DIAGNOSTICS_LOG_BYTES,
 };
 use bonded_core::peer_share::{
-    PeerShareIntroductionClaims, PeerShareIntroductionRequest, SignedPeerShareIntroduction,
+    PeerShareDialBackNotification, PeerShareIntroductionClaims, PeerShareIntroductionRequest,
+    SignedPeerShareIntroduction,
 };
 use bonded_core::session::{
     decode_observed_address, encode_observed_address, parse_session_epoch, SessionFrame,
@@ -42,6 +43,7 @@ use tracing::{error, info, warn};
 
 use crate::auth_handshake::perform_websocket_auth_handshake;
 use crate::authorized_keys::AuthorizedKeysStore;
+use crate::dial_back::DialBackPush;
 use crate::peer_relay::resolve_session_binding;
 use crate::session_registry::SessionRegistry;
 use crate::smoltcp_forwarder::{SessionContext, SessionOutboundRouter, SmoltcpForwarder};
@@ -99,6 +101,14 @@ pub struct BootstrapContext {
     /// Authorized device store used when the server vouches for peer-sharing
     /// introductions.
     pub authorized_keys: AuthorizedKeysStore,
+
+    /// Dial-back push handle (4.56): when set, a dial-back introduction
+    /// request also pushes a dial-back notification to the provider's
+    /// live session. `None` in tests and in any deployment without a
+    /// live session registry — the introduction is still minted and
+    /// the push is simply skipped (same as a provider with no live
+    /// session: dropped, not queued).
+    pub dial_back_push: Option<Arc<DialBackPush>>,
 
     /// Root directory for uploaded client diagnostics, one subdirectory
     /// per device key. Created on first upload.
@@ -882,6 +892,22 @@ fn peer_share_introduction_response(ctx: &BootstrapContext, body: &str) -> (Stat
         );
     }
 
+    // Reverse dial (4.56): a dial-back request is useless without
+    // the consumer's endpoints and its listener cert fingerprint —
+    // the reversed introduction carries both, and the provider has
+    // nothing to dial or verify without them. Reject before any
+    // minting, so a malformed dial-back request never yields even
+    // the forward introduction.
+    if request.dial_back
+        && (request.consumer_endpoints.is_empty()
+            || request.consumer_listener_cert_fingerprint.is_empty())
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            r#"{"error":"dial_back requires consumer_endpoints and consumer_listener_cert_fingerprint"}"#.to_owned(),
+        );
+    }
+
     if !ctx
         .authorized_keys
         .is_authorized(&request.consumer_device_public_key)
@@ -917,40 +943,80 @@ fn peer_share_introduction_response(ctx: &BootstrapContext, body: &str) -> (Stat
         );
     }
 
+    let expires_at = unix_timestamp_after(Duration::from_secs(300)).unwrap_or(0);
     let claims = PeerShareIntroductionClaims {
-        consumer_device_public_key: request.consumer_device_public_key,
-        provider_device_public_key: request.provider_device_public_key,
-        provider_instance_nonce: request.provider_instance_nonce,
-        provider_endpoint: request.provider_endpoint,
-        listener_transport: request.listener_transport,
-        listener_cert_fingerprint: request.listener_cert_fingerprint,
-        expires_at: unix_timestamp_after(Duration::from_secs(300)).unwrap_or(0),
+        consumer_device_public_key: request.consumer_device_public_key.clone(),
+        provider_device_public_key: request.provider_device_public_key.clone(),
+        provider_instance_nonce: request.provider_instance_nonce.clone(),
+        provider_endpoint: request.provider_endpoint.clone(),
+        listener_transport: request.listener_transport.clone(),
+        listener_cert_fingerprint: request.listener_cert_fingerprint.clone(),
+        expires_at,
+        direction: "forward".to_owned(),
+        consumer_endpoints: Vec::new(),
     };
-    let claims_payload = match claims.signing_payload() {
-        Ok(payload) => payload,
-        Err(err) => {
-            error!(error = %err, "failed to serialize peer introduction claims");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                r#"{"error":"failed to serialize peer introduction claims"}"#.to_owned(),
-            );
-        }
-    };
-    let server_signature = match sign_bytes(&ctx.server_identity, &claims_payload) {
-        Ok(signature) => signature,
-        Err(err) => {
-            error!(error = %err, "failed to sign peer introduction claims");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                r#"{"error":"failed to sign peer introduction"}"#.to_owned(),
-            );
-        }
+    let response = match sign_introduction_claims(ctx, claims) {
+        Ok(response) => response,
+        Err((status, body)) => return (status, body),
     };
 
-    let response = SignedPeerShareIntroduction {
-        introduction: claims,
-        server_signature,
-    };
+    // Reverse dial (4.56): mint the reversed introduction from the
+    // same request and push it to the provider's live session. The
+    // HTTP response still carries only the forward introduction —
+    // the consumer never needs the reversed one (the provider
+    // presents it on dial and as its relay registration), so the
+    // response shape is unchanged for old clients. The push is best
+    // effort and never fails the introduction: no live provider
+    // session means the notification is dropped (no queueing) and
+    // the consumer's next introduction request re-pushes. Same 300 s
+    // expiry as the forward introduction — the separate peer-relay
+    // renewal defect (relays die at expiry with no renewal) is NOT
+    // fixed here; the reversed leg respects the same expiry.
+    if request.dial_back {
+        let reversed_claims = PeerShareIntroductionClaims {
+            consumer_device_public_key: request.consumer_device_public_key.clone(),
+            provider_device_public_key: request.provider_device_public_key.clone(),
+            provider_instance_nonce: request.provider_instance_nonce.clone(),
+            provider_endpoint: request.provider_endpoint.clone(),
+            listener_transport: request.listener_transport.clone(),
+            // The consumer is the listener on a reversed leg, so the
+            // reversed introduction carries the CONSUMER's listener
+            // cert fingerprint, not the provider's.
+            listener_cert_fingerprint: request.consumer_listener_cert_fingerprint.clone(),
+            expires_at,
+            direction: "reverse".to_owned(),
+            consumer_endpoints: request.consumer_endpoints.clone(),
+        };
+        match sign_introduction_claims(ctx, reversed_claims) {
+            Ok(reversed) => {
+                let notification = PeerShareDialBackNotification {
+                    consumer_device_public_key: request.consumer_device_public_key.clone(),
+                    consumer_endpoints: request.consumer_endpoints.clone(),
+                    introduction: reversed,
+                };
+                let pushed = ctx
+                    .dial_back_push
+                    .as_ref()
+                    .map(|push| push.push(&request.provider_device_public_key, &notification))
+                    .unwrap_or(false);
+                if pushed {
+                    info!(
+                        consumer = %notification.consumer_device_public_key,
+                        provider = %request.provider_device_public_key,
+                        "pushed dial-back notification to provider session"
+                    );
+                } else {
+                    info!(
+                        consumer = %notification.consumer_device_public_key,
+                        provider = %request.provider_device_public_key,
+                        "dial-back notification dropped: provider has no live session"
+                    );
+                }
+            }
+            Err((status, body)) => return (status, body),
+        }
+    }
+
     match serde_json::to_string(&response) {
         Ok(body) => (StatusCode::OK, body),
         Err(err) => {
@@ -961,6 +1027,34 @@ fn peer_share_introduction_response(ctx: &BootstrapContext, body: &str) -> (Stat
             )
         }
     }
+}
+
+/// Sign introduction claims with the server identity key. Shared by
+/// the forward and reversed (4.56) minting paths so both
+/// introductions carry the same 300 s expiry and the same signature
+/// discipline.
+fn sign_introduction_claims(
+    ctx: &BootstrapContext,
+    claims: PeerShareIntroductionClaims,
+) -> Result<SignedPeerShareIntroduction, (StatusCode, String)> {
+    let claims_payload = claims.signing_payload().map_err(|err| {
+        error!(error = %err, "failed to serialize peer introduction claims");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            r#"{"error":"failed to serialize peer introduction claims"}"#.to_owned(),
+        )
+    })?;
+    let server_signature = sign_bytes(&ctx.server_identity, &claims_payload).map_err(|err| {
+        error!(error = %err, "failed to sign peer introduction claims");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            r#"{"error":"failed to sign peer introduction"}"#.to_owned(),
+        )
+    })?;
+    Ok(SignedPeerShareIntroduction {
+        introduction: claims,
+        server_signature,
+    })
 }
 
 fn unix_timestamp_after(duration: Duration) -> anyhow::Result<u64> {
@@ -1304,6 +1398,7 @@ mod tests {
             wireguard_peer_lease_secs: 3600,
             dns_server: std::net::SocketAddr::from(([192, 0, 2, 53], 53)),
             authorized_keys: AuthorizedKeysStore::default(),
+            dial_back_push: None,
             diagnostics_dir: std::env::temp_dir().join("bonded-diagnostics-test"),
             invite_tokens_file: std::env::temp_dir().join("bonded-invites-test.toml"),
         })
@@ -1445,6 +1540,7 @@ mod tests {
             wireguard_peer_lease_secs: 3600,
             dns_server: std::net::SocketAddr::from(([192, 0, 2, 53], 53)),
             authorized_keys: AuthorizedKeysStore::default(),
+            dial_back_push: None,
             diagnostics_dir: std::env::temp_dir().join("bonded-diagnostics-test"),
             invite_tokens_file: std::env::temp_dir().join("bonded-invites-test.toml"),
         });
@@ -1517,6 +1613,9 @@ mod tests {
                 .expect("request payload should serialize"),
             )
             .expect("request should sign"),
+            dial_back: false,
+            consumer_endpoints: Vec::new(),
+            consumer_listener_cert_fingerprint: String::new(),
         };
 
         let (status, _) = route_bootstrap_request(
@@ -1556,6 +1655,7 @@ mod tests {
             wireguard_peer_lease_secs: 3600,
             dns_server: std::net::SocketAddr::from(([192, 0, 2, 53], 53)),
             authorized_keys,
+            dial_back_push: None,
             diagnostics_dir: diagnostics_dir.clone(),
             invite_tokens_file: std::env::temp_dir().join(format!("bonded-invites-{name}-{stamp}.toml")),
         });
@@ -1800,6 +1900,7 @@ mod tests {
             wireguard_peer_lease_secs: 3600,
             dns_server: std::net::SocketAddr::from(([192, 0, 2, 53], 53)),
             authorized_keys,
+            dial_back_push: None,
             diagnostics_dir: std::env::temp_dir().join("bonded-diagnostics-test"),
             invite_tokens_file: std::env::temp_dir().join("bonded-invites-test.toml"),
         });
@@ -1830,6 +1931,9 @@ mod tests {
                 &serde_json::to_vec(&unsigned).expect("request payload should serialize"),
             )
             .expect("request should sign"),
+            dial_back: false,
+            consumer_endpoints: Vec::new(),
+            consumer_listener_cert_fingerprint: String::new(),
         };
 
         let (status, body) = route_bootstrap_request(
@@ -1853,6 +1957,10 @@ mod tests {
             "sha256:listener-fingerprint"
         );
         assert!(response.introduction.expires_at > 0);
+        // No dial-back was requested: the minted introduction is
+        // forward, exactly as before 4.56.
+        assert_eq!(response.introduction.direction, "forward");
+        assert!(!response.introduction.is_reverse());
         verify_signature(
             &server_identity.public_key_b64,
             &response
@@ -1863,6 +1971,246 @@ mod tests {
         )
         .expect("server signature should verify");
         let _ = fs::remove_file(auth_path);
+    }
+
+    /// Build a signed introduction request, optionally asking the
+    /// server to dial the consumer back (4.56). The signature covers
+    /// only the six core fields, so dial-back fields can be changed
+    /// after signing without invalidating it — the same property
+    /// that lets a new client verify against an old server.
+    fn signed_introduction_request(
+        consumer: &DeviceKeypair,
+        provider_key: &str,
+        dial_back: bool,
+    ) -> PeerShareIntroductionRequest {
+        let mut request = PeerShareIntroductionRequest {
+            consumer_device_public_key: consumer.public_key_b64.clone(),
+            provider_device_public_key: provider_key.to_owned(),
+            provider_instance_nonce: "nonce-1".to_owned(),
+            provider_endpoint: "192.168.1.20:54443".to_owned(),
+            listener_transport: "quic".to_owned(),
+            listener_cert_fingerprint: "sha256:provider-listener".to_owned(),
+            consumer_signature: String::new(),
+            dial_back,
+            consumer_endpoints: if dial_back {
+                vec!["192.168.43.10:54443".to_owned()]
+            } else {
+                Vec::new()
+            },
+            consumer_listener_cert_fingerprint: if dial_back {
+                "sha256:consumer-listener".to_owned()
+            } else {
+                String::new()
+            },
+        };
+        request.consumer_signature = sign_bytes(
+            consumer,
+            &request
+                .signed_payload()
+                .expect("request payload should serialize"),
+        )
+        .expect("request should sign");
+        request
+    }
+
+    /// Authorize both devices and build a context carrying the given
+    /// dial-back push handle (`None` behaves like a provider with no
+    /// live session: the push is skipped).
+    fn dial_back_test_ctx(
+        consumer: &DeviceKeypair,
+        provider: &DeviceKeypair,
+        dial_back_push: Option<Arc<crate::dial_back::DialBackPush>>,
+    ) -> Arc<BootstrapContext> {
+        let auth_path = temp_auth_file("peer-dial-back");
+        authorize_device_key(&auth_path, &consumer.public_key_b64)
+            .expect("consumer key should authorize");
+        authorize_device_key(&auth_path, &provider.public_key_b64)
+            .expect("provider key should authorize");
+        let authorized_keys =
+            AuthorizedKeysStore::load(&auth_path).expect("authorized keys store should load");
+        let _ = fs::remove_file(&auth_path);
+        Arc::new(BootstrapContext {
+            server_identity: Arc::new(DeviceKeypair::generate()),
+            tls_cert_der: None,
+            server_public_address: "127.0.0.1:8443".to_owned(),
+            wireguard_keypair: None,
+            wireguard_peers: None,
+            wireguard_public_addr: None,
+            wireguard_peer_lease_secs: 3600,
+            dns_server: std::net::SocketAddr::from(([192, 0, 2, 53], 53)),
+            authorized_keys,
+            dial_back_push,
+            diagnostics_dir: std::env::temp_dir().join("bonded-diagnostics-test"),
+            invite_tokens_file: std::env::temp_dir().join("bonded-invites-test.toml"),
+        })
+    }
+
+    #[tokio::test]
+    async fn peer_share_introduction_with_dial_back_pushes_reversed_introduction() {
+        use bonded_core::peer_share::PeerShareDialBackNotification;
+
+        let consumer = DeviceKeypair::generate();
+        let provider = DeviceKeypair::generate();
+
+        // Provider live session: registered in the session registry
+        // with a forwarding context whose router has one transport.
+        let sessions = SessionRegistry::default();
+        let handle = sessions.register_client(provider.public_key_b64.clone());
+        let (router, fwd_tx) = SessionOutboundRouter::new();
+        let (transport_tx, mut transport_rx) = mpsc::unbounded_channel::<SessionFrame>();
+        router.add_transport(1, transport_tx);
+        let forwarder = Arc::new(SmoltcpForwarder::new(
+            handle.session_id,
+            fwd_tx,
+            Arc::new(AtomicU64::new(0)),
+            std::net::SocketAddr::from(([192, 0, 2, 53], 53)),
+        ));
+        let forwarders: Arc<RwLock<HashMap<u64, Arc<SessionContext>>>> =
+            Arc::new(RwLock::new(HashMap::from([(
+                handle.session_id,
+                Arc::new(SessionContext { forwarder, router }),
+            )])));
+        let push = Arc::new(crate::dial_back::DialBackPush::new(
+            sessions,
+            forwarders,
+        ));
+        let ctx = dial_back_test_ctx(&consumer, &provider, Some(push));
+        let server_key = ctx.server_identity.public_key_b64.clone();
+
+        let request =
+            signed_introduction_request(&consumer, &provider.public_key_b64, true);
+        let (status, body) = route_bootstrap_request(
+            "POST",
+            "/v1/bootstrap/peer-share/introduction",
+            &serde_json::to_string(&request).expect("request should serialize"),
+            ctx.as_ref(),
+            None,
+        );
+
+        // The HTTP response still carries only the forward
+        // introduction: the consumer dials on it as before.
+        assert_eq!(status, StatusCode::OK);
+        let response: SignedPeerShareIntroduction =
+            serde_json::from_str(&body).expect("response should parse");
+        assert_eq!(response.introduction.direction, "forward");
+        assert_eq!(
+            response.introduction.listener_cert_fingerprint,
+            "sha256:provider-listener"
+        );
+
+        // ...and the provider's live session receives the dial-back
+        // notification carrying the reversed introduction.
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(2), transport_rx.recv())
+            .await
+            .expect("push should deliver promptly")
+            .expect("transport should receive the notification");
+        let notification = PeerShareDialBackNotification::from_control_frame(&frame)
+            .expect("pushed frame should parse as a dial-back notification");
+        assert_eq!(
+            notification.consumer_device_public_key,
+            consumer.public_key_b64
+        );
+        assert_eq!(
+            notification.consumer_endpoints,
+            vec!["192.168.43.10:54443".to_owned()]
+        );
+        let reversed = &notification.introduction.introduction;
+        assert!(reversed.is_reverse());
+        assert_eq!(
+            reversed.consumer_device_public_key,
+            consumer.public_key_b64
+        );
+        assert_eq!(
+            reversed.provider_device_public_key,
+            provider.public_key_b64
+        );
+        // The reversed listener cert is the consumer's: the consumer
+        // is the listener on this leg.
+        assert_eq!(
+            reversed.listener_cert_fingerprint,
+            "sha256:consumer-listener"
+        );
+        assert_eq!(
+            reversed.consumer_endpoints,
+            vec!["192.168.43.10:54443".to_owned()]
+        );
+        // Same 300 s expiry as the forward introduction.
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_secs();
+        assert!(reversed.expires_at > now);
+        assert!(reversed.expires_at <= now + 300);
+        verify_signature(
+            &server_key,
+            &reversed
+                .signing_payload()
+                .expect("claims should serialize"),
+            &notification.introduction.server_signature,
+        )
+        .expect("reversed introduction signature should verify");
+    }
+
+    #[test]
+    fn peer_share_introduction_with_dial_back_drops_push_without_provider_session() {
+        let consumer = DeviceKeypair::generate();
+        let provider = DeviceKeypair::generate();
+        // Push handle over empty registries: the provider has no
+        // live session, so the notification is dropped — but the
+        // introduction itself still mints fine.
+        let push = Arc::new(crate::dial_back::DialBackPush::new(
+            SessionRegistry::default(),
+            Arc::new(RwLock::new(HashMap::new())),
+        ));
+        let ctx = dial_back_test_ctx(&consumer, &provider, Some(push));
+
+        let request =
+            signed_introduction_request(&consumer, &provider.public_key_b64, true);
+        let (status, body) = route_bootstrap_request(
+            "POST",
+            "/v1/bootstrap/peer-share/introduction",
+            &serde_json::to_string(&request).expect("request should serialize"),
+            ctx.as_ref(),
+            None,
+        );
+
+        assert_eq!(status, StatusCode::OK);
+        let response: SignedPeerShareIntroduction =
+            serde_json::from_str(&body).expect("response should parse");
+        assert_eq!(response.introduction.direction, "forward");
+    }
+
+    #[test]
+    fn peer_share_introduction_dial_back_requires_endpoints_and_fingerprint() {
+        let consumer = DeviceKeypair::generate();
+        let provider = DeviceKeypair::generate();
+        let ctx = dial_back_test_ctx(&consumer, &provider, None);
+
+        // No consumer endpoints: rejected before any minting.
+        let mut request =
+            signed_introduction_request(&consumer, &provider.public_key_b64, true);
+        request.consumer_endpoints.clear();
+        let (status, _) = route_bootstrap_request(
+            "POST",
+            "/v1/bootstrap/peer-share/introduction",
+            &serde_json::to_string(&request).expect("request should serialize"),
+            ctx.as_ref(),
+            None,
+        );
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // No consumer listener fingerprint: likewise rejected.
+        let mut request =
+            signed_introduction_request(&consumer, &provider.public_key_b64, true);
+        request.consumer_listener_cert_fingerprint.clear();
+        let (status, _) = route_bootstrap_request(
+            "POST",
+            "/v1/bootstrap/peer-share/introduction",
+            &serde_json::to_string(&request).expect("request should serialize"),
+            ctx.as_ref(),
+            None,
+        );
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     #[test]

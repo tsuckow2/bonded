@@ -57,6 +57,12 @@ pub fn verify_consumer_introduction(
     verify_server_signature(server_public_key, introduction)?;
 
     let claims = &introduction.introduction;
+    // A reversed introduction must never verify as a forward one:
+    // the provider presenting it is not being dialed by this
+    // consumer, so it cannot authorize a consumer-initiated leg.
+    if claims.is_reverse() {
+        anyhow::bail!("peer introduction is reversed, not forward");
+    }
     if claims.provider_device_public_key != expected_provider_device_public_key {
         anyhow::bail!("peer introduction provider key mismatch");
     }
@@ -72,6 +78,12 @@ pub fn verify_provider_introduction(
     verify_server_signature(server_public_key, introduction)?;
 
     let claims = &introduction.introduction;
+    // Same replay guard as the consumer side: a reversed
+    // introduction names the consumer as listener, so it must never
+    // authorize a leg dialed to this provider.
+    if claims.is_reverse() {
+        anyhow::bail!("peer introduction is reversed, not forward");
+    }
     if claims.provider_device_public_key != listener.provider_device_public_key {
         anyhow::bail!("peer introduction was not issued for this provider device");
     }
@@ -80,6 +92,70 @@ pub fn verify_provider_introduction(
     }
     if claims.listener_transport != listener.listener_transport {
         anyhow::bail!("peer introduction listener transport mismatch");
+    }
+    if claims.listener_cert_fingerprint != listener.listener_cert_fingerprint {
+        anyhow::bail!("peer introduction listener cert fingerprint mismatch");
+    }
+    ensure_not_expired(claims.expires_at)?;
+    Ok(())
+}
+
+/// Verify a reversed introduction on the PROVIDER side, before
+/// dialing back (4.56; the dial itself is 4.57). The provider is
+/// the dialer here, so it checks the introduction names it as the
+/// provider, names a consumer, carries at least one consumer
+/// endpoint to dial, and is a genuine reversed introduction — a
+/// forward introduction must never authorize a dial-back.
+pub fn verify_reversed_introduction_for_dialer(
+    server_public_key: &str,
+    expected_provider_device_public_key: &str,
+    introduction: &SignedPeerShareIntroduction,
+) -> anyhow::Result<()> {
+    verify_server_signature(server_public_key, introduction)?;
+
+    let claims = &introduction.introduction;
+    if !claims.is_reverse() {
+        anyhow::bail!("peer introduction is not reversed");
+    }
+    if claims.provider_device_public_key != expected_provider_device_public_key {
+        anyhow::bail!("peer introduction provider key mismatch");
+    }
+    if claims.consumer_device_public_key.is_empty() {
+        anyhow::bail!("reversed peer introduction names no consumer");
+    }
+    if claims.consumer_endpoints.is_empty() {
+        anyhow::bail!("reversed peer introduction names no consumer endpoint");
+    }
+    if claims.listener_cert_fingerprint.is_empty() {
+        anyhow::bail!("reversed peer introduction names no listener cert fingerprint");
+    }
+    ensure_not_expired(claims.expires_at)?;
+    Ok(())
+}
+
+/// Verify a reversed introduction on the CONSUMER side, when the
+/// provider presents it while dialing back (4.56; the accept path
+/// is 4.57). The consumer is the listener here, so `listener` is
+/// the consumer's OWN listener identity: the introduction must name
+/// this device as the consumer, the expected provider as the
+/// provider, and this listener's cert fingerprint.
+pub fn verify_reversed_introduction_for_listener(
+    server_public_key: &str,
+    listener: &PeerListenerIdentity,
+    expected_provider_device_public_key: &str,
+    introduction: &SignedPeerShareIntroduction,
+) -> anyhow::Result<()> {
+    verify_server_signature(server_public_key, introduction)?;
+
+    let claims = &introduction.introduction;
+    if !claims.is_reverse() {
+        anyhow::bail!("peer introduction is not reversed");
+    }
+    if claims.consumer_device_public_key != listener.provider_device_public_key {
+        anyhow::bail!("peer introduction was not issued for this consumer device");
+    }
+    if claims.provider_device_public_key != expected_provider_device_public_key {
+        anyhow::bail!("peer introduction provider key mismatch");
     }
     if claims.listener_cert_fingerprint != listener.listener_cert_fingerprint {
         anyhow::bail!("peer introduction listener cert fingerprint mismatch");
@@ -425,9 +501,10 @@ mod tests {
     use super::{
         accept_peer_relay, connect_peer_relay, parse_relay_accept_response,
         register_peer_relay_upstream, relay_peer_frames, relay_peer_frames_rate_limited,
-        verify_consumer_introduction, verify_provider_introduction, AcceptedPeerRelay,
-        PeerListenerIdentity, PeerRelayDial, PeerRelayRateLimiter, PeerShareRelayStats,
-        RelayAcceptVerdict,
+        verify_consumer_introduction, verify_provider_introduction,
+        verify_reversed_introduction_for_dialer, verify_reversed_introduction_for_listener,
+        AcceptedPeerRelay, PeerListenerIdentity, PeerRelayDial, PeerRelayRateLimiter,
+        PeerShareRelayStats, RelayAcceptVerdict,
     };
     use bonded_core::auth::{sign_bytes, DeviceKeypair};
     use bonded_core::peer_share::{
@@ -461,6 +538,8 @@ mod tests {
             listener_transport: "quic".to_owned(),
             listener_cert_fingerprint: "sha256:listener-fingerprint".to_owned(),
             expires_at: now_plus(300),
+            direction: "forward".to_owned(),
+            consumer_endpoints: Vec::new(),
         };
         let introduction = sign_introduction(&server, claims.clone());
         let listener = PeerListenerIdentity {
@@ -514,6 +593,8 @@ mod tests {
             listener_transport: "quic".to_owned(),
             listener_cert_fingerprint: "sha256:listener-fingerprint".to_owned(),
             expires_at: now_plus(0).saturating_sub(1),
+            direction: "forward".to_owned(),
+            consumer_endpoints: Vec::new(),
         };
         let introduction = sign_introduction(&server, claims.clone());
         let listener = PeerListenerIdentity {
@@ -540,6 +621,8 @@ mod tests {
             listener_transport: "quic".to_owned(),
             listener_cert_fingerprint: "sha256:listener-fingerprint".to_owned(),
             expires_at: now_plus(300),
+            direction: "forward".to_owned(),
+            consumer_endpoints: Vec::new(),
         };
         let introduction = sign_introduction(&server, claims);
 
@@ -550,6 +633,170 @@ mod tests {
         )
         .expect_err("wrong provider should fail");
         assert!(error.to_string().contains("provider key mismatch"));
+    }
+
+    /// Build a signed reversed introduction: the provider dials the
+    /// consumer's listener, so the listener cert is the consumer's.
+    fn reversed_introduction(
+        server: &DeviceKeypair,
+        consumer_key: &str,
+        provider_key: &str,
+    ) -> SignedPeerShareIntroduction {
+        sign_introduction(
+            server,
+            PeerShareIntroductionClaims {
+                consumer_device_public_key: consumer_key.to_owned(),
+                provider_device_public_key: provider_key.to_owned(),
+                provider_instance_nonce: "nonce-1".to_owned(),
+                provider_endpoint: "192.168.1.20:54443".to_owned(),
+                listener_transport: "quic".to_owned(),
+                listener_cert_fingerprint: "sha256:consumer-listener".to_owned(),
+                expires_at: now_plus(300),
+                direction: "reverse".to_owned(),
+                consumer_endpoints: vec!["192.168.43.10:54443".to_owned()],
+            },
+        )
+    }
+
+    #[test]
+    fn forward_verifiers_reject_reversed_introduction() {
+        // Replay guard (4.56): a reversed introduction must never
+        // authorize a consumer-initiated leg in either direction.
+        let server = DeviceKeypair::generate();
+        let provider = DeviceKeypair::generate();
+        let introduction = reversed_introduction(&server, "consumer", &provider.public_key_b64);
+        let listener = PeerListenerIdentity {
+            provider_device_public_key: provider.public_key_b64.clone(),
+            instance_nonce: "nonce-1".to_owned(),
+            listener_transport: "quic".to_owned(),
+            listener_cert_fingerprint: "sha256:listener-fingerprint".to_owned(),
+        };
+
+        let error = verify_provider_introduction(&server.public_key_b64, &listener, &introduction)
+            .expect_err("reversed introduction should fail provider verification");
+        assert!(error.to_string().contains("reversed"));
+        let error = verify_consumer_introduction(
+            &server.public_key_b64,
+            &provider.public_key_b64,
+            &introduction,
+        )
+        .expect_err("reversed introduction should fail consumer verification");
+        assert!(error.to_string().contains("reversed"));
+    }
+
+    #[test]
+    fn reversed_verifiers_accept_matching_reversed_introduction() {
+        let server = DeviceKeypair::generate();
+        let provider = DeviceKeypair::generate();
+        let consumer = DeviceKeypair::generate();
+        let introduction =
+            reversed_introduction(&server, &consumer.public_key_b64, &provider.public_key_b64);
+
+        verify_reversed_introduction_for_dialer(
+            &server.public_key_b64,
+            &provider.public_key_b64,
+            &introduction,
+        )
+        .expect("dialer should accept a matching reversed introduction");
+
+        // The consumer-as-listener verifies against its OWN listener
+        // identity: its device key is the consumer key, and the
+        // listener cert is its own listener's fingerprint.
+        let consumer_listener = PeerListenerIdentity {
+            provider_device_public_key: consumer.public_key_b64.clone(),
+            instance_nonce: "nonce-1".to_owned(),
+            listener_transport: "quic".to_owned(),
+            listener_cert_fingerprint: "sha256:consumer-listener".to_owned(),
+        };
+        verify_reversed_introduction_for_listener(
+            &server.public_key_b64,
+            &consumer_listener,
+            &provider.public_key_b64,
+            &introduction,
+        )
+        .expect("listener should accept a matching reversed introduction");
+    }
+
+    #[test]
+    fn reversed_verifiers_reject_forward_introduction() {
+        // The mirror replay guard: a forward introduction must never
+        // authorize a provider-initiated dial-back.
+        let server = DeviceKeypair::generate();
+        let provider = DeviceKeypair::generate();
+        let introduction = sign_introduction(
+            &server,
+            PeerShareIntroductionClaims {
+                consumer_device_public_key: "consumer".to_owned(),
+                provider_device_public_key: provider.public_key_b64.clone(),
+                provider_instance_nonce: "nonce-1".to_owned(),
+                provider_endpoint: "192.168.1.20:54443".to_owned(),
+                listener_transport: "quic".to_owned(),
+                listener_cert_fingerprint: "sha256:listener-fingerprint".to_owned(),
+                expires_at: now_plus(300),
+                direction: "forward".to_owned(),
+                consumer_endpoints: Vec::new(),
+            },
+        );
+
+        let error = verify_reversed_introduction_for_dialer(
+            &server.public_key_b64,
+            &provider.public_key_b64,
+            &introduction,
+        )
+        .expect_err("forward introduction should fail dialer verification");
+        assert!(error.to_string().contains("not reversed"));
+    }
+
+    #[test]
+    fn reversed_listener_verification_rejects_wrong_listener_fingerprint() {
+        let server = DeviceKeypair::generate();
+        let provider = DeviceKeypair::generate();
+        let consumer = DeviceKeypair::generate();
+        let introduction =
+            reversed_introduction(&server, &consumer.public_key_b64, &provider.public_key_b64);
+        let wrong_listener = PeerListenerIdentity {
+            provider_device_public_key: consumer.public_key_b64.clone(),
+            instance_nonce: "nonce-1".to_owned(),
+            listener_transport: "quic".to_owned(),
+            listener_cert_fingerprint: "sha256:someone-else".to_owned(),
+        };
+
+        let error = verify_reversed_introduction_for_listener(
+            &server.public_key_b64,
+            &wrong_listener,
+            &provider.public_key_b64,
+            &introduction,
+        )
+        .expect_err("wrong listener fingerprint should fail");
+        assert!(error.to_string().contains("fingerprint mismatch"));
+    }
+
+    #[test]
+    fn reversed_dialer_verification_rejects_empty_endpoints() {
+        let server = DeviceKeypair::generate();
+        let provider = DeviceKeypair::generate();
+        let introduction = sign_introduction(
+            &server,
+            PeerShareIntroductionClaims {
+                consumer_device_public_key: "consumer".to_owned(),
+                provider_device_public_key: provider.public_key_b64.clone(),
+                provider_instance_nonce: "nonce-1".to_owned(),
+                provider_endpoint: "192.168.1.20:54443".to_owned(),
+                listener_transport: "quic".to_owned(),
+                listener_cert_fingerprint: "sha256:consumer-listener".to_owned(),
+                expires_at: now_plus(300),
+                direction: "reverse".to_owned(),
+                consumer_endpoints: Vec::new(),
+            },
+        );
+
+        let error = verify_reversed_introduction_for_dialer(
+            &server.public_key_b64,
+            &provider.public_key_b64,
+            &introduction,
+        )
+        .expect_err("reversed introduction without endpoints should fail");
+        assert!(error.to_string().contains("no consumer endpoint"));
     }
 
     #[tokio::test]
@@ -585,6 +832,8 @@ mod tests {
             listener_transport: listener_identity.listener_transport.clone(),
             listener_cert_fingerprint: listener_identity.listener_cert_fingerprint.clone(),
             expires_at: now_plus(300),
+            direction: "forward".to_owned(),
+            consumer_endpoints: Vec::new(),
         };
         let introduction = sign_introduction(&server_identity, claims);
 
@@ -705,6 +954,8 @@ mod tests {
             listener_transport: listener_identity.listener_transport.clone(),
             listener_cert_fingerprint: listener_identity.listener_cert_fingerprint.clone(),
             expires_at: now_plus(300),
+            direction: "forward".to_owned(),
+            consumer_endpoints: Vec::new(),
         };
         let introduction = sign_introduction(&server_identity, claims);
 
@@ -788,6 +1039,8 @@ mod tests {
                 listener_transport: listener_identity.listener_transport.clone(),
                 listener_cert_fingerprint: listener_identity.listener_cert_fingerprint.clone(),
                 expires_at: now_plus(300),
+                direction: "forward".to_owned(),
+                consumer_endpoints: Vec::new(),
             },
         );
 
@@ -973,6 +1226,8 @@ mod tests {
                 listener_transport: "quic".to_owned(),
                 listener_cert_fingerprint: "sha256:listener-fingerprint".to_owned(),
                 expires_at: now_plus(300),
+                direction: "forward".to_owned(),
+                consumer_endpoints: Vec::new(),
             },
             server_signature: "sig".to_owned(),
         };
