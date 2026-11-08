@@ -291,6 +291,7 @@ dependencies = [
  "h3",
  "h3-quinn",
  "http",
+ "ipnetwork",
  "mdns-sd",
  "pnet_datalink",
  "quinn",

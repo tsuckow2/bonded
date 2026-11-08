@@ -30,3 +30,8 @@ tokio-tungstenite.workspace = true
 tokio-rustls.workspace = true
 tracing.workspace = true
 tun.workspace = true
+
+[dev-dependencies]
+# Test-only: build NetworkInterface values for the advertise-list
+# tests. Already in Cargo.lock via pnet_datalink; no new download.
+ipnetwork = "0.20"

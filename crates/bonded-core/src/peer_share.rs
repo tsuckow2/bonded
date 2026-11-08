@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::net::{IpAddr, SocketAddr};
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -10,6 +11,7 @@ const TXT_DEVICE_KEY: &str = "device_key";
 const TXT_SERVER_KEY: &str = "server_key";
 const TXT_INSTANCE_NONCE_KEY: &str = "instance_nonce";
 const TXT_ENDPOINT_KEY: &str = "endpoint";
+const TXT_ENDPOINTS_KEY: &str = "endpoints";
 const TXT_CAPABILITIES_KEY: &str = "capabilities";
 const TXT_CERT_FINGERPRINT_KEY: &str = "cert_fingerprint";
 
@@ -52,7 +54,16 @@ pub struct PeerShareAdvertisement {
     pub device_public_key: String,
     pub server_public_key: String,
     pub instance_nonce: String,
+    /// Primary endpoint (the first of `endpoints`): the single address
+    /// old single-endpoint readers use, and the address the mDNS
+    /// service record itself carries.
     pub endpoint: String,
+    /// Every dialable address this provider listens on (same port),
+    /// primary first. A consumer tries them in order until one
+    /// connects. Old advertisements have no such record and parse as
+    /// a one-element list holding `endpoint`.
+    #[serde(default)]
+    pub endpoints: Vec<String>,
     pub listener_cert_fingerprint: String,
     pub capabilities: Vec<String>,
 }
@@ -77,6 +88,35 @@ impl PeerShareIntroductionClaims {
 }
 
 impl PeerShareAdvertisement {
+    /// (Re)build the endpoint fields from an IP list and port: `endpoint`
+    /// is the primary (first) address for old single-endpoint readers,
+    /// `endpoints` is the full list in dial order.
+    pub fn set_endpoints(&mut self, ips: &[IpAddr], port: u16) {
+        let endpoints: Vec<String> = ips
+            .iter()
+            .map(|ip| SocketAddr::new(*ip, port).to_string())
+            .collect();
+        self.endpoint = endpoints.first().cloned().unwrap_or_default();
+        self.endpoints = endpoints;
+    }
+
+    /// Dialable addresses in order: the full advertised list, or the
+    /// single primary endpoint for old advertisements without a list.
+    /// Unparseable entries are skipped; an empty result means the
+    /// advertisement carries no usable address at all.
+    pub fn endpoint_addrs(&self) -> Vec<SocketAddr> {
+        let addrs: Vec<SocketAddr> = self
+            .endpoints
+            .iter()
+            .filter_map(|endpoint| endpoint.parse().ok())
+            .collect();
+        if addrs.is_empty() {
+            self.endpoint.parse().ok().into_iter().collect()
+        } else {
+            addrs
+        }
+    }
+
     pub fn txt_records(&self) -> Vec<(String, String)> {
         vec![
             (TXT_VERSION_KEY.to_owned(), self.version.to_string()),
@@ -88,6 +128,10 @@ impl PeerShareAdvertisement {
             ),
             (TXT_ENDPOINT_KEY.to_owned(), self.endpoint.clone()),
             (
+                TXT_ENDPOINTS_KEY.to_owned(),
+                self.endpoints.join(","),
+            ),
+            (
                 TXT_CERT_FINGERPRINT_KEY.to_owned(),
                 self.listener_cert_fingerprint.clone(),
             ),
@@ -96,12 +140,31 @@ impl PeerShareAdvertisement {
     }
 
     pub fn from_txt_record_map(records: &BTreeMap<String, String>) -> anyhow::Result<Self> {
+        let endpoint = required_txt_record(records, TXT_ENDPOINT_KEY)?;
+        // New advertisements carry the full list; old ones have no
+        // `endpoints` record and parse as a one-element list holding
+        // the single endpoint.
+        let endpoints: Vec<String> = match records.get(TXT_ENDPOINTS_KEY) {
+            Some(list) => list
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .collect(),
+            None => Vec::new(),
+        };
+        let endpoints = if endpoints.is_empty() {
+            vec![endpoint.clone()]
+        } else {
+            endpoints
+        };
         Ok(Self {
             version: required_txt_record(records, TXT_VERSION_KEY)?.parse()?,
             device_public_key: required_txt_record(records, TXT_DEVICE_KEY)?,
             server_public_key: required_txt_record(records, TXT_SERVER_KEY)?,
             instance_nonce: required_txt_record(records, TXT_INSTANCE_NONCE_KEY)?,
-            endpoint: required_txt_record(records, TXT_ENDPOINT_KEY)?,
+            endpoint,
+            endpoints,
             listener_cert_fingerprint: required_txt_record(records, TXT_CERT_FINGERPRINT_KEY)?,
             capabilities: required_txt_record(records, TXT_CAPABILITIES_KEY)?
                 .split(',')
@@ -193,6 +256,10 @@ mod tests {
             server_public_key: "server".to_owned(),
             instance_nonce: "nonce-1".to_owned(),
             endpoint: "192.168.1.20:54443".to_owned(),
+            endpoints: vec![
+                "192.168.1.20:54443".to_owned(),
+                "10.0.0.5:54443".to_owned(),
+            ],
             listener_cert_fingerprint: "sha256:abcd".to_owned(),
             capabilities: vec!["relay".to_owned(), "quic".to_owned()],
         };
@@ -205,6 +272,65 @@ mod tests {
             .expect("advertisement should parse from txt records");
 
         assert_eq!(parsed, advertisement);
+        assert_eq!(
+            parsed.endpoint_addrs(),
+            vec![
+                "192.168.1.20:54443".parse().unwrap(),
+                "10.0.0.5:54443".parse().unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn peer_share_advertisement_without_endpoints_record_parses_as_single() {
+        // Old single-endpoint advertisements carry no `endpoints`
+        // record: they parse as a one-element list holding `endpoint`,
+        // so an old provider is still dialable by a new consumer.
+        let mut records = BTreeMap::new();
+        records.insert("version".to_owned(), "1".to_owned());
+        records.insert("device_key".to_owned(), "consumer".to_owned());
+        records.insert("server_key".to_owned(), "server".to_owned());
+        records.insert("instance_nonce".to_owned(), "nonce-1".to_owned());
+        records.insert("endpoint".to_owned(), "192.168.1.20:54443".to_owned());
+        records.insert("cert_fingerprint".to_owned(), "sha256:abcd".to_owned());
+        records.insert("capabilities".to_owned(), "relay,quic".to_owned());
+
+        let parsed = PeerShareAdvertisement::from_txt_record_map(&records)
+            .expect("old advertisement should parse");
+        assert_eq!(parsed.endpoint, "192.168.1.20:54443");
+        assert_eq!(parsed.endpoints, vec!["192.168.1.20:54443".to_owned()]);
+        assert_eq!(
+            parsed.endpoint_addrs(),
+            vec!["192.168.1.20:54443".parse().unwrap()]
+        );
+    }
+
+    #[test]
+    fn peer_share_advertisement_set_endpoints_keeps_primary_first() {
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let mut advertisement = PeerShareAdvertisement {
+            version: 1,
+            device_public_key: "consumer".to_owned(),
+            server_public_key: "server".to_owned(),
+            instance_nonce: "nonce-1".to_owned(),
+            endpoint: String::new(),
+            endpoints: Vec::new(),
+            listener_cert_fingerprint: "sha256:abcd".to_owned(),
+            capabilities: vec!["relay".to_owned(), "quic".to_owned()],
+        };
+        advertisement.set_endpoints(
+            &[
+                IpAddr::V4(Ipv4Addr::new(192, 168, 1, 20)),
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)),
+            ],
+            54443,
+        );
+        assert_eq!(advertisement.endpoint, "192.168.1.20:54443");
+        assert_eq!(
+            advertisement.endpoints,
+            vec!["192.168.1.20:54443".to_owned(), "10.0.0.5:54443".to_owned()]
+        );
     }
 
     #[test]

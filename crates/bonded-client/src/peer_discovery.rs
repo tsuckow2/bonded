@@ -168,6 +168,7 @@ fn advertisement_from_resolved_service(
         "server_key",
         "instance_nonce",
         "endpoint",
+        "endpoints",
         "cert_fingerprint",
         "capabilities",
     ] {
@@ -207,6 +208,10 @@ mod tests {
             server_public_key: "server".to_owned(),
             instance_nonce: "nonce-1".to_owned(),
             endpoint: "192.168.1.20:54443".to_owned(),
+            endpoints: vec![
+                "192.168.1.20:54443".to_owned(),
+                "10.0.0.5:54443".to_owned(),
+            ],
             listener_cert_fingerprint: "sha256:abcd".to_owned(),
             capabilities: vec!["relay".to_owned(), "quic".to_owned()],
         };

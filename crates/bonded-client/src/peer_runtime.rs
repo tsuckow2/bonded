@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -661,82 +661,44 @@ async fn run_peer_accept_loop(
 /// the consumer's redial/renewal recovery.
 const PEER_ADVERTISE_POLL: Duration = Duration::from_secs(5);
 
-/// One accept loop per bound endpoint, owned by the advertise watcher.
-/// Dropping the set aborts every loop it holds, so aborting the watcher
-/// (e.g. on runtime shutdown) tears down all provider endpoints.
-struct AcceptLoopSet {
-    loops: Vec<(IpAddr, JoinHandle<()>)>,
+/// The single accept loop for the wildcard listener. The listener
+/// binds the wildcard of the advertised address family, so one loop
+/// serves every advertised address and no re-bind is ever needed;
+/// dropping the watcher (e.g. on runtime shutdown) aborts the loop.
+struct AcceptLoop {
+    handle: JoinHandle<()>,
 }
 
-impl AcceptLoopSet {
-    fn new(loops: Vec<(IpAddr, JoinHandle<()>)>) -> Self {
-        Self { loops }
-    }
-
-    fn push(&mut self, ip: IpAddr, handle: JoinHandle<()>) {
-        self.loops.push((ip, handle));
-    }
-
-    /// Abort loops whose IP is neither the newly advertised one nor
-    /// still assigned to an interface. Loops on surviving addresses
-    /// keep serving their existing legs undisturbed.
-    fn prune(&mut self, current_ip: IpAddr, live_ips: &HashSet<IpAddr>) {
-        let mut kept = Vec::new();
-        for (ip, handle) in self.loops.drain(..) {
-            if keep_accept_loop(ip, current_ip, live_ips) {
-                kept.push((ip, handle));
-            } else {
-                handle.abort();
-            }
-        }
-        self.loops = kept;
-    }
-}
-
-impl Drop for AcceptLoopSet {
+impl Drop for AcceptLoop {
     fn drop(&mut self) {
-        for (_, handle) in self.loops.drain(..) {
-            handle.abort();
-        }
+        self.handle.abort();
     }
 }
 
-/// Whether an accept loop survives a re-bind: its IP is the newly
-/// advertised one, or it is still assigned to an interface.
-fn keep_accept_loop(ip: IpAddr, current_ip: IpAddr, live_ips: &HashSet<IpAddr>) -> bool {
-    ip == current_ip || live_ips.contains(&ip)
-}
-
-/// Watch the provider's path set and interfaces; when the advertise IP
-/// changes, bind a new listener on the new address (reusing the original
-/// certificate, so the fingerprint consumers pin never changes) and
-/// re-register the mDNS advertisement under the same instance nonce, so
-/// consumers keep treating this provider as the same peer. The previous
-/// advertisement is shut down before the new one registers (the same
-/// instance name would probe-conflict); if the new registration fails,
-/// the previous advertisement is restored and the next poll retries.
-/// A failed re-bind keeps the old endpoint serving.
-#[allow(clippy::too_many_arguments)]
+/// Watch the provider's interfaces; when the advertised address list
+/// changes (e.g. a hotspot is turned on or off), re-register the mDNS
+/// advertisement under the same instance nonce, so consumers keep
+/// treating this provider as the same peer. The listener binds the
+/// wildcard of the advertised address family, so it already serves
+/// every address in the new list — no re-bind, no accept-loop churn,
+/// and existing legs are never disturbed. The previous advertisement
+/// is shut down before the new one registers (the same instance name
+/// would probe-conflict); if the new registration fails, the previous
+/// advertisement is restored and the next poll retries.
 async fn run_advertise_watcher(
     config: ClientConfig,
     path_source: ProviderPathSource,
-    identity: PeerListenerIdentity,
     logger: Option<PeerShareEventLogger>,
-    max_consumers: usize,
-    bandwidth_kbps: u64,
-    path_claims: Arc<std::sync::Mutex<RelayPathClaims>>,
-    active_relays: Arc<AtomicUsize>,
-    relay_stats: Arc<PeerShareRelayStats>,
-    cert_der: Vec<u8>,
-    key_der: Vec<u8>,
     port: u16,
-    initial_ip: IpAddr,
+    initial_ips: Vec<IpAddr>,
     initial_advertisement: PeerShareAdvertisement,
     initial_advertiser: PeerShareAdvertiser,
-    initial_loops: Vec<(IpAddr, JoinHandle<()>)>,
+    initial_loop: JoinHandle<()>,
 ) {
-    let mut loops = AcceptLoopSet::new(initial_loops);
-    let mut current_ip = initial_ip;
+    let _accept_loop = AcceptLoop {
+        handle: initial_loop,
+    };
+    let mut current_ips = initial_ips;
     let mut current_advertisement = initial_advertisement;
     let mut advertiser: Option<PeerShareAdvertiser> = Some(initial_advertiser);
     let mut last_window_minute = utc_minute(now_unix_secs());
@@ -745,8 +707,8 @@ async fn run_advertise_watcher(
         // Windowed discovery: re-announce at the start of each UTC
         // minute so a consumer whose lock is only held for the 10s
         // window still sees us. This runs every poll iteration,
-        // independent of the IP-change check below, which only acts
-        // when the advertise address actually changes.
+        // independent of the list-change check below, which only acts
+        // when the advertised addresses actually change.
         let minute = utc_minute(now_unix_secs());
         if minute != last_window_minute {
             last_window_minute = minute;
@@ -757,64 +719,33 @@ async fn run_advertise_watcher(
             }
         }
         let interfaces = enumerate_interfaces();
-        let Some(desired) = desired_advertise_ip(&config, &path_source, &interfaces) else {
+        let Some(desired) = desired_advertise_ips(&config, &path_source, &interfaces) else {
             continue;
         };
-        if desired == current_ip {
+        if desired == current_ips {
             continue;
         }
-        // Bind first: if the new address cannot be bound, keep serving
-        // the old one and retry on the next poll.
-        let new_endpoint = match bind_peer_listener_endpoint(
-            cert_der.clone(),
-            key_der.clone(),
-            SocketAddr::new(desired, port),
-            config.socket_protect.as_ref(),
-        ) {
-            Ok(endpoint) => endpoint,
-            Err(err) => {
-                warn!(error = %err, desired = %desired, "peer-share re-bind failed, keeping old endpoint");
-                continue;
-            }
-        };
         let mut new_advertisement = current_advertisement.clone();
-        new_advertisement.endpoint = SocketAddr::new(desired, port).to_string();
+        new_advertisement.set_endpoints(&desired, port);
         if let Some(old) = advertiser.take() {
             let _ = old.shutdown();
         }
         match PeerShareAdvertiser::start(&new_advertisement) {
             Ok(new_adv) => {
                 advertiser = Some(new_adv);
-                let handle = tokio::spawn(run_peer_accept_loop(
-                    new_endpoint,
-                    config.client.server_public_key.clone(),
-                    identity.clone(),
-                    logger.clone(),
-                    max_consumers,
-                    bandwidth_kbps,
-                    path_claims.clone(),
-                    active_relays.clone(),
-                    relay_stats.clone(),
-                    path_source.clone(),
-                    config.clone(),
-                ));
-                loops.push(desired, handle);
-                let live_ips: HashSet<IpAddr> = interfaces
-                    .iter()
-                    .flat_map(|interface| interface.ips.iter())
-                    .map(|network| network.ip())
-                    .collect();
-                loops.prune(desired, &live_ips);
-                current_ip = desired;
+                current_ips = desired;
                 current_advertisement = new_advertisement;
-                info!(endpoint = %current_advertisement.endpoint, "peer-share re-advertised on new path");
+                info!(endpoints = %current_advertisement.endpoints.join(","), "peer-share re-advertised on new addresses");
                 emit_peer_share_event(
                     logger.as_ref(),
-                    format!("re-advertised endpoint={}", current_advertisement.endpoint),
+                    format!(
+                        "re-advertised endpoints={}",
+                        current_advertisement.endpoints.join(",")
+                    ),
                 );
             }
             Err(err) => {
-                warn!(error = %err, desired = %desired, "peer-share re-advertise failed, restoring previous advertisement");
+                warn!(error = %err, desired = ?desired, "peer-share re-advertise failed, restoring previous advertisement");
                 match PeerShareAdvertiser::start(&current_advertisement) {
                     Ok(old_adv) => advertiser = Some(old_adv),
                     Err(err) => warn!(error = %err, "peer-share previous advertisement restore failed; next poll retries"),
@@ -867,21 +798,21 @@ pub async fn start_peer_share_runtime(
     let is_provider = mode == PeerShareMode::Both || mode == PeerShareMode::ProviderOnly;
     let is_consumer = mode == PeerShareMode::Both || mode == PeerShareMode::ConsumerOnly;
 
-    // Provider side: QUIC listener + mDNS advertiser + accept loops.
-    // The listener certificate/key, advertise IP, and port are carried
-    // alongside so the advertise watcher can re-bind the same identity
-    // on a new address when the provider's paths change.
+    // Provider side: QUIC listener + mDNS advertiser + accept loop.
+    // The listener binds the wildcard of the advertised address
+    // family, so one accept loop serves every advertised address and
+    // the advertise watcher only ever re-registers the advertisement
+    // (never re-binds). The certificate is embedded in the endpoint;
+    // the raw DER is not needed past construction.
     let (
         listener_endpoint,
         listener_identity,
         advertisement,
         advertiser,
-        listener_cert_der,
-        listener_key_der,
-        listener_advertise_ip,
+        listener_advertise_ips,
         listener_port,
     ) = if is_provider {
-        let (endpoint, identity, adv, cert_der, key_der, advertise_ip, port) =
+        let (endpoint, identity, adv, advertise_ips, port) =
             build_listener_runtime(config, &device_keypair, provider_paths.as_ref())?;
         let advertiser = PeerShareAdvertiser::start(&adv)?;
         (
@@ -889,13 +820,11 @@ pub async fn start_peer_share_runtime(
             Some(identity),
             Some(adv),
             Some(advertiser),
-            Some(cert_der),
-            Some(key_der),
-            Some(advertise_ip),
+            Some(advertise_ips),
             Some(port),
         )
     } else {
-        (None, None, None, None, None, None, None, None)
+        (None, None, None, None, None, None)
     };
     // Consumer side: mDNS browser
     let browser = if is_consumer {
@@ -906,15 +835,16 @@ pub async fn start_peer_share_runtime(
 
     if let (Some(adv), Some(identity)) = (advertisement.as_ref(), listener_identity.as_ref()) {
         info!(
-            endpoint = %adv.endpoint,
+            endpoints = %adv.endpoints.join(","),
             nonce = %identity.instance_nonce,
             "peer-share runtime started"
         );
         emit_peer_share_event(
             event_logger.as_ref(),
             format!(
-                "runtime started endpoint={} nonce={}",
-                adv.endpoint, identity.instance_nonce
+                "runtime started endpoints={} nonce={}",
+                adv.endpoints.join(","),
+                identity.instance_nonce
             ),
         );
     } else {
@@ -930,12 +860,12 @@ pub async fn start_peer_share_runtime(
     // always carries one; a consumer-only runtime stays at zero.
     let relay_stats = Arc::new(PeerShareRelayStats::default());
 
-    // Provider side: accept loops + advertise watcher. One accept loop
-    // runs per bound endpoint; the watcher spawns a new loop on re-bind
-    // and aborts loops whose IP is no longer assigned, so a path change
-    // never disturbs legs on a surviving endpoint. The initial loop is
-    // handed to the watcher, which owns the loop set; dropping the
-    // runtime aborts the watcher, whose Drop aborts the loops.
+    // Provider side: one accept loop on the wildcard listener, owned
+    // by the advertise watcher. The watcher only re-registers the
+    // advertisement when the address list changes; the loop is never
+    // re-bound, so existing legs are never disturbed by an interface
+    // change. Dropping the runtime aborts the watcher, whose Drop
+    // aborts the loop.
     let watcher_task = if is_provider {
         let accept_server_key = config.client.server_public_key.clone();
         let accept_identity = listener_identity.clone().expect("provider mode requires identity");
@@ -951,7 +881,7 @@ pub async fn start_peer_share_runtime(
         let path_source = provider_paths.unwrap_or_else(|| {
             ProviderPathSource::Config(config.client.path_bind_addresses.clone())
         });
-        let initial_ip = listener_advertise_ip.expect("provider mode requires advertise IP");
+        let initial_ips = listener_advertise_ips.expect("provider mode requires advertise IPs");
         let initial_endpoint = listener_endpoint
             .clone()
             .expect("provider mode requires listener");
@@ -971,20 +901,12 @@ pub async fn start_peer_share_runtime(
         Some(tokio::spawn(run_advertise_watcher(
             config.clone(),
             path_source,
-            accept_identity,
             accept_logger,
-            accept_max_consumers,
-            accept_bandwidth_kbps,
-            path_claims,
-            active_relays,
-            relay_stats.clone(),
-            listener_cert_der.expect("provider mode requires listener cert"),
-            listener_key_der.expect("provider mode requires listener key"),
             listener_port.expect("provider mode requires listener port"),
-            initial_ip,
+            initial_ips,
             advertisement.clone().expect("provider mode requires advertisement"),
             advertiser.expect("provider mode requires advertiser"),
-            vec![(initial_ip, initial_handle)],
+            initial_handle,
         )))
     } else {
         None
@@ -1092,14 +1014,14 @@ pub async fn start_peer_share_runtime(
             last_seen.insert(peer_id.clone(), advertisement.clone());
             info!(
                 peer = %peer_id,
-                endpoint = %advertisement.endpoint,
+                endpoints = %advertisement.endpoints.join(","),
                 "discovered peer-share advertisement"
             );
             emit_peer_share_event(
                 browse_logger.as_ref(),
                 format!(
-                    "discovered peer={peer_id} endpoint={}",
-                    advertisement.endpoint
+                    "discovered peer={peer_id} endpoints={}",
+                    advertisement.endpoints.join(",")
                 ),
             );
 
@@ -1135,7 +1057,9 @@ pub async fn start_peer_share_runtime(
 
             // One leg per provider path: dial legs with the same
             // introduction until the provider answers no_path (every
-            // path has a leg) or a dial fails. A failed first leg
+            // path has a leg) or a dial fails. Each leg dial tries
+            // every advertised address in order until one connects —
+            // a dead address is not a failed peer. A failed first leg
             // keeps the old error path; a failed later leg keeps the
             // legs already won (they converge to the full set at the
             // next renewal, at most one introduction cycle away).
@@ -1144,6 +1068,7 @@ pub async fn start_peer_share_runtime(
             let mut generation = 0u64;
             let mut dial_failed = false;
             let mut transport_channel_closed = false;
+            let dial_endpoints = advertisement.endpoint_addrs();
             loop {
                 match connect_peer_relay(
                     &browse_server_key,
@@ -1151,6 +1076,7 @@ pub async fn start_peer_share_runtime(
                     &introduction,
                     browse_config.socket_protect.as_ref(),
                     browse_bind_ip,
+                    &dial_endpoints,
                 )
                 .await
                 {
@@ -1367,9 +1293,7 @@ fn build_listener_runtime(
     quinn::Endpoint,
     PeerListenerIdentity,
     PeerShareAdvertisement,
-    Vec<u8>,
-    Vec<u8>,
-    IpAddr,
+    Vec<IpAddr>,
     u16,
 )> {
     let cert = generate_simple_self_signed(vec!["127.0.0.1".to_owned()])
@@ -1401,16 +1325,27 @@ fn build_listener_runtime(
         Some(ProviderPathSource::Config(addresses)) => addresses.clone(),
         None => config.client.path_bind_addresses.clone(),
     };
-    let advertise_ip = resolve_advertise_ip(
+    let advertise_ips = resolve_advertise_ips(
         &config.client.peer_share_advertise_ip,
         bind_addr,
         &binds,
         &enumerate_interfaces(),
+        &config.client.tun_name,
     )?;
-    let listener_bind_addr = match bind_addr.ip() {
-        IpAddr::V4(ip) if ip.is_unspecified() => SocketAddr::new(advertise_ip, bind_addr.port()),
-        IpAddr::V6(ip) if ip.is_unspecified() => SocketAddr::new(advertise_ip, bind_addr.port()),
-        _ => bind_addr,
+    // An unspecified bind listens on the wildcard of the primary's
+    // address family, so every advertised address is dialable. A
+    // pinned bind listens on that one address only, and the list is
+    // a single element holding it (see resolve_advertise_ips).
+    let primary_ip = advertise_ips[0];
+    let listener_bind_addr = if bind_addr.ip().is_unspecified() {
+        let wildcard = if primary_ip.is_ipv4() {
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+        } else {
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+        };
+        SocketAddr::new(wildcard, bind_addr.port())
+    } else {
+        bind_addr
     };
     let endpoint = bind_peer_listener_endpoint(
         cert_der.clone(),
@@ -1419,7 +1354,6 @@ fn build_listener_runtime(
         config.socket_protect.as_ref(),
     )?;
     let listen_addr = endpoint.local_addr()?;
-    let endpoint_str = SocketAddr::new(advertise_ip, listen_addr.port()).to_string();
     let instance_nonce = create_auth_challenge();
     let listener_identity = PeerListenerIdentity {
         provider_device_public_key: device_keypair.public_key_b64.clone(),
@@ -1427,22 +1361,22 @@ fn build_listener_runtime(
         listener_transport: "quic".to_owned(),
         listener_cert_fingerprint: fingerprint.clone(),
     };
-    let advertisement = PeerShareAdvertisement {
+    let mut advertisement = PeerShareAdvertisement {
         version: 1,
         device_public_key: device_keypair.public_key_b64.clone(),
         server_public_key: config.client.server_public_key.clone(),
         instance_nonce,
-        endpoint: endpoint_str,
+        endpoint: String::new(),
+        endpoints: Vec::new(),
         listener_cert_fingerprint: fingerprint,
         capabilities: vec!["relay".to_owned(), "quic".to_owned()],
     };
+    advertisement.set_endpoints(&advertise_ips, listen_addr.port());
     Ok((
         endpoint,
         listener_identity,
         advertisement,
-        cert_der,
-        key_der,
-        advertise_ip,
+        advertise_ips,
         listen_addr.port(),
     ))
 }
@@ -1580,32 +1514,125 @@ fn should_accept_discovered_peer(
         && advertisement.device_public_key != self_public_key
 }
 
-fn resolve_advertise_ip(
+/// The client's own tunnel addresses: the VPN builder assigns
+/// 10.8.0.2 (and fd00:10:8::2) to the client; the server is .1. The
+/// address is identical on every client, so a peer dialing it would
+/// reach its own tunnel, not this provider — never advertise it.
+const TUNNEL_CLIENT_IPV4: Ipv4Addr = Ipv4Addr::new(10, 8, 0, 2);
+const TUNNEL_CLIENT_IPV6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0x10, 0x8, 0, 0, 0, 0, 2);
+
+/// Whether an interface with this name carries cellular (metered WWAN)
+/// traffic: Android Qualcomm `rmnet*`, MediaTek `ccmni*`, Linux
+/// `wwan*`, older Android `pdp*`. A LAN peer cannot dial these
+/// addresses (carrier NAT), so they must never be advertised.
+fn is_cellular_interface_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    ["rmnet", "ccmni", "wwan", "pdp"]
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
+}
+
+/// Whether an interface is the VPN tunnel: its name is the configured
+/// tun device (Linux `bonded0`) or a `tun*` device (Android VpnService
+/// creates tun0/tun1/…), or its address is one of the client's own
+/// tunnel addresses.
+fn is_tunnel_interface(name: &str, tun_name: &str, ip: &IpAddr) -> bool {
+    if !tun_name.is_empty() && name == tun_name {
+        return true;
+    }
+    if name.to_ascii_lowercase().starts_with("tun") {
+        return true;
+    }
+    match ip {
+        IpAddr::V4(ip) => *ip == TUNNEL_CLIENT_IPV4,
+        IpAddr::V6(ip) => *ip == TUNNEL_CLIENT_IPV6,
+    }
+}
+
+/// All addresses this provider can be dialed on: every bindable
+/// address on a non-cellular, non-tunnel interface, in a stable
+/// (sorted) order. Cellular addresses are excluded (a LAN peer cannot
+/// dial them — carrier NAT), as are the VPN tunnel addresses
+/// (identical on every client). The caller picks the primary from
+/// this list; the rest are fallbacks for the consumer to try.
+fn advertisable_ips_from_pairs(pairs: &[(&str, IpAddr)], tun_name: &str) -> Vec<IpAddr> {
+    let mut ips = Vec::new();
+    for (name, ip) in pairs {
+        if is_cellular_interface_name(name) {
+            continue;
+        }
+        if is_tunnel_interface(name, tun_name, ip) {
+            continue;
+        }
+        if !is_bindable_advertise_ip(ip) {
+            continue;
+        }
+        ips.push(*ip);
+    }
+    ips.sort();
+    ips.dedup();
+    ips
+}
+
+/// The same filter over enumerated interfaces.
+fn advertisable_interface_ips(
+    interfaces: &[NetworkInterface],
+    tun_name: &str,
+) -> Vec<IpAddr> {
+    let pairs: Vec<(&str, IpAddr)> = interfaces
+        .iter()
+        .flat_map(|interface| {
+            interface
+                .ips
+                .iter()
+                .map(move |network| (interface.name.as_str(), network.ip()))
+        })
+        .collect();
+    advertisable_ips_from_pairs(&pairs, tun_name)
+}
+
+/// Resolve ALL addresses to advertise for the peer-share listener.
+/// An explicit `peer_share_advertise_ip` pins a single address (as
+/// before); a pinned bind address likewise advertises only itself
+/// (the listener only serves that address). Otherwise every
+/// non-cellular, non-tunnel bindable address is advertised, primary
+/// first (the existing path-subnet preference), so a consumer can
+/// fall through to any address it can actually reach. The list is
+/// scoped to the primary's address family: the listener binds the
+/// wildcard of that family, so an address of the other family would
+/// not be dialable.
+fn resolve_advertise_ips(
     explicit_ip: &str,
     listen_addr: SocketAddr,
     binds: &[String],
     interfaces: &[NetworkInterface],
-) -> anyhow::Result<IpAddr> {
+    tun_name: &str,
+) -> anyhow::Result<Vec<IpAddr>> {
     if !explicit_ip.trim().is_empty() {
-        return explicit_ip
+        return Ok(vec![explicit_ip
             .parse()
-            .with_context(|| format!("invalid peer_share_advertise_ip: {explicit_ip}"));
+            .with_context(|| format!("invalid peer_share_advertise_ip: {explicit_ip}"))?]);
     }
 
     match listen_addr.ip() {
-        IpAddr::V4(ip) if !ip.is_unspecified() => return Ok(IpAddr::V4(ip)),
-        IpAddr::V6(ip) if !ip.is_unspecified() => return Ok(IpAddr::V6(ip)),
+        IpAddr::V4(ip) if !ip.is_unspecified() => return Ok(vec![IpAddr::V4(ip)]),
+        IpAddr::V6(ip) if !ip.is_unspecified() => return Ok(vec![IpAddr::V6(ip)]),
         _ => {}
     }
 
-    let candidates: Vec<IpAddr> = interfaces
-        .iter()
-        .flat_map(|interface| interface.ips.iter())
-        .map(|network| network.ip())
-        .collect();
-    select_advertise_ip_for_binds(binds, &candidates).ok_or_else(|| {
+    let all = advertisable_interface_ips(interfaces, tun_name);
+    if all.is_empty() {
+        anyhow::bail!("failed to determine a non-loopback peer-share advertise IP");
+    }
+    let primary = select_advertise_ip_for_binds(binds, &all).ok_or_else(|| {
         anyhow::anyhow!("failed to determine a non-loopback peer-share advertise IP")
-    })
+    })?;
+    let mut list = vec![primary];
+    list.extend(
+        all.into_iter()
+            .filter(|ip| *ip != primary && ip.is_ipv4() == primary.is_ipv4()),
+    );
+    Ok(list)
 }
 
 /// Pick the advertise IP from interface candidates given the provider's
@@ -1617,34 +1644,42 @@ fn resolve_advertise_ip(
 /// advertise the tunnel address and make the provider unreachable. A
 /// candidate sharing a /24 with a path bind address is on the link the
 /// client actually uses.
+///
+/// Callers pass an already-filtered candidate list (cellular and
+/// tunnel addresses removed by `advertisable_interface_ips`); this
+/// helper only picks the primary from that list. Its unit tests keep
+/// the tunnel address in the candidate list to pin the preference
+/// behaviour itself.
 fn select_advertise_ip_for_binds(binds: &[String], candidates: &[IpAddr]) -> Option<IpAddr> {
     prefer_path_subnet_candidate(candidates, binds).or_else(|| select_advertise_ip(candidates))
 }
 
-/// Recompute the provider's advertise IP from the CURRENT path set and
-/// interfaces (the advertise watcher's view). Returns None when no
-/// bindable address exists or a configured value cannot be parsed; the
-/// caller then keeps the current advertisement. Pinned configurations
-/// (explicit advertise IP or explicit bind address) always return the
-/// pinned IP, so the watcher is a no-op for them. The live path set is
-/// used for the subnet preference (not the session-start config), so a
-/// path change that moves the provider to a new subnet re-selects onto
-/// the new link instead of clinging to the old one.
-fn desired_advertise_ip(
+/// Recompute the provider's advertise addresses from the CURRENT path
+/// set and interfaces (the advertise watcher's view). Returns None
+/// when no bindable address exists or a configured value cannot be
+/// parsed; the caller then keeps the current advertisement. Pinned
+/// configurations (explicit advertise IP or explicit bind address)
+/// always return the pinned address, so the watcher is a no-op for
+/// them. The live path set is used for the subnet preference (not the
+/// session-start config), so a path change that moves the provider to
+/// a new subnet re-selects onto the new link instead of clinging to
+/// the old one.
+fn desired_advertise_ips(
     config: &ClientConfig,
     path_source: &ProviderPathSource,
     interfaces: &[NetworkInterface],
-) -> Option<IpAddr> {
+) -> Option<Vec<IpAddr>> {
     let binds: Vec<String> = match path_source {
         ProviderPathSource::Live(map) => map.read().ok()?.values().cloned().collect(),
         ProviderPathSource::Config(addresses) => addresses.clone(),
     };
     let bind_addr = config.client.peer_share_bind_address.parse::<SocketAddr>().ok()?;
-    resolve_advertise_ip(
+    resolve_advertise_ips(
         &config.client.peer_share_advertise_ip,
         bind_addr,
         &binds,
         interfaces,
+        &config.client.tun_name,
     )
     .ok()
 }
@@ -1749,8 +1784,9 @@ mod tests {
     use bonded_core::auth::verify_signature;
 
     use super::{
-        build_peer_introduction_request, introduction_expired, keep_accept_loop,
-        peer_share_peer_id, prefer_path_subnet_candidate, renewal_delay, resolve_advertise_ip,
+        advertisable_ips_from_pairs, build_peer_introduction_request, introduction_expired,
+        is_cellular_interface_name, is_tunnel_interface, peer_share_peer_id,
+        prefer_path_subnet_candidate, renewal_delay, resolve_advertise_ips,
         select_advertise_ip, select_advertise_ip_for_binds, should_accept_discovered_peer,
         PeerLegTracker, RedialQueue, RelayPathClaims, PEER_REDISCOVERY_MAX_ATTEMPTS,
         PEER_RELAY_RENEWAL_LEAD_SECS, PEER_RELAY_RENEWAL_MIN_DELAY,
@@ -1870,6 +1906,7 @@ mod tests {
             server_public_key: "server-a".to_owned(),
             instance_nonce: "nonce-1".to_owned(),
             endpoint: "192.168.1.20:54443".to_owned(),
+            endpoints: vec!["192.168.1.20:54443".to_owned()],
             listener_cert_fingerprint: "sha256:abcd".to_owned(),
             capabilities: vec!["relay".to_owned(), "quic".to_owned()],
         };
@@ -1897,6 +1934,7 @@ mod tests {
             server_public_key: "server-a".to_owned(),
             instance_nonce: nonce.to_owned(),
             endpoint: "192.168.1.20:54443".to_owned(),
+            endpoints: vec!["192.168.1.20:54443".to_owned()],
             listener_cert_fingerprint: "sha256:abcd".to_owned(),
             capabilities: vec!["relay".to_owned(), "quic".to_owned()],
         }
@@ -1980,6 +2018,7 @@ mod tests {
             server_public_key: "server-a".to_owned(),
             instance_nonce: "nonce-1".to_owned(),
             endpoint: "192.168.1.20:54443".to_owned(),
+            endpoints: vec!["192.168.1.20:54443".to_owned()],
             listener_cert_fingerprint: "sha256:abcd".to_owned(),
             capabilities: vec!["relay".to_owned(), "quic".to_owned()],
         };
@@ -1997,15 +2036,159 @@ mod tests {
     }
 
     #[test]
-    fn advertise_ip_uses_explicit_override() {
-        let ip = resolve_advertise_ip(
+    fn advertise_ips_uses_explicit_override() {
+        let ips = resolve_advertise_ips(
             "127.0.0.1",
             SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 54443),
             &[],
             &Vec::<NetworkInterface>::new(),
+            "bonded0",
         )
         .expect("override should parse");
-        assert_eq!(ip, IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]);
+    }
+
+    #[test]
+    fn advertise_ips_pinned_bind_advertises_only_itself() {
+        // A pinned bind address listens on that address only, so the
+        // list is a single element holding it — even when other
+        // interfaces exist.
+        let interfaces = vec![test_interface(
+            "wlan0",
+            Ipv4Addr::new(192, 168, 1, 20),
+        )];
+        let ips = resolve_advertise_ips(
+            "",
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9)), 54443),
+            &[],
+            &interfaces,
+            "bonded0",
+        )
+        .expect("pinned bind should resolve");
+        assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9))]);
+    }
+
+    #[test]
+    fn advertisable_ips_excludes_cellular_and_tunnel() {
+        // The hotspot failure mode: the provider's cellular address
+        // (rmnet) and the VPN tunnel address (10.8.0.2, identical on
+        // every client) must never be advertised — a LAN peer cannot
+        // dial either. Only the Wi-Fi address survives.
+        let pairs: Vec<(&str, IpAddr)> = vec![
+            ("rmnet_data0", IpAddr::V4(Ipv4Addr::new(100, 64, 1, 2))),
+            ("wlan0", IpAddr::V4(Ipv4Addr::new(192, 168, 43, 1))),
+            ("tun0", IpAddr::V4(Ipv4Addr::new(10, 8, 0, 2))),
+            ("bonded0", IpAddr::V4(Ipv4Addr::new(10, 8, 0, 2))),
+            ("lo", IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        ];
+        assert_eq!(
+            advertisable_ips_from_pairs(&pairs, "bonded0"),
+            vec![IpAddr::V4(Ipv4Addr::new(192, 168, 43, 1))]
+        );
+    }
+
+    #[test]
+    fn advertisable_ips_excludes_cellular_by_name_prefix() {
+        assert!(is_cellular_interface_name("rmnet_data0"));
+        assert!(is_cellular_interface_name("rmnet0"));
+        assert!(is_cellular_interface_name("ccmni0"));
+        assert!(is_cellular_interface_name("wwan0"));
+        assert!(is_cellular_interface_name("pdp0"));
+        assert!(!is_cellular_interface_name("wlan0"));
+        assert!(!is_cellular_interface_name("eth0"));
+        assert!(!is_cellular_interface_name("bonded0"));
+    }
+
+    #[test]
+    fn tunnel_interface_matches_name_or_tunnel_address() {
+        // Linux tun device by configured name, Android VpnService
+        // tun0 by prefix, and the known tunnel addresses regardless
+        // of the interface name.
+        assert!(is_tunnel_interface(
+            "bonded0",
+            "bonded0",
+            &IpAddr::V4(Ipv4Addr::new(10, 8, 0, 2))
+        ));
+        assert!(is_tunnel_interface(
+            "tun0",
+            "bonded0",
+            &IpAddr::V4(Ipv4Addr::new(10, 8, 0, 2))
+        ));
+        assert!(is_tunnel_interface(
+            "eth0",
+            "bonded0",
+            &IpAddr::V4(Ipv4Addr::new(10, 8, 0, 2))
+        ));
+        assert!(!is_tunnel_interface(
+            "wlan0",
+            "bonded0",
+            &IpAddr::V4(Ipv4Addr::new(192, 168, 1, 20))
+        ));
+    }
+
+    #[test]
+    fn advertise_ips_returns_all_non_cellular_primary_first() {
+        // A phone with two LAN addresses advertises both, primary
+        // first: the address sharing a /24 with a live path bind
+        // wins the primary slot (the existing preference), and the
+        // other LAN address is still listed as a fallback.
+        let interfaces = vec![
+            test_interface("wlan0", Ipv4Addr::new(192, 168, 1, 20)),
+            test_interface("eth0", Ipv4Addr::new(10, 0, 0, 5)),
+            test_interface("rmnet_data0", Ipv4Addr::new(100, 64, 1, 2)),
+        ];
+        let binds = vec!["10.0.0.5".to_owned()];
+        let ips = resolve_advertise_ips(
+            "",
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 54443),
+            &binds,
+            &interfaces,
+            "bonded0",
+        )
+        .expect("list should resolve");
+        assert_eq!(
+            ips,
+            vec![
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)),
+                IpAddr::V4(Ipv4Addr::new(192, 168, 1, 20)),
+            ]
+        );
+    }
+
+    #[test]
+    fn advertise_ips_errors_when_only_cellular_and_tunnel_exist() {
+        // A hotspot-only phone with no LAN address at all (cellular +
+        // tunnel only) has nothing dialable to advertise: error, so
+        // the watcher keeps the previous advertisement instead of
+        // publishing an unreachable one.
+        let interfaces = vec![
+            test_interface("rmnet_data0", Ipv4Addr::new(100, 64, 1, 2)),
+            test_interface("tun0", Ipv4Addr::new(10, 8, 0, 2)),
+        ];
+        let err = resolve_advertise_ips(
+            "",
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 54443),
+            &[],
+            &interfaces,
+            "bonded0",
+        )
+        .expect_err("no dialable address should fail");
+        assert!(err.to_string().contains("non-loopback"));
+    }
+
+    fn test_interface(name: &str, ip: Ipv4Addr) -> NetworkInterface {
+        use ipnetwork::{IpNetwork, Ipv4Network};
+
+        NetworkInterface {
+            name: name.to_owned(),
+            description: String::new(),
+            index: 1,
+            mac: None,
+            ips: vec![IpNetwork::V4(
+                Ipv4Network::new(ip, 24).expect("test network should build"),
+            )],
+            flags: 0,
+        }
     }
 
     #[test]
@@ -2097,35 +2280,5 @@ mod tests {
             select_advertise_ip_for_binds(&[], &candidates),
             Some(IpAddr::V4(Ipv4Addr::new(10, 8, 0, 2)))
         );
-    }
-
-    #[test]
-    fn accept_loop_prune_keeps_current_and_live_only() {
-        let current = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10));
-        let live: std::collections::HashSet<IpAddr> = [
-            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)),
-            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)),
-        ]
-        .into_iter()
-        .collect();
-        // The newly advertised IP survives even if enumeration has not
-        // caught up with it yet.
-        assert!(keep_accept_loop(
-            IpAddr::V4(Ipv4Addr::new(172, 16, 0, 9)),
-            IpAddr::V4(Ipv4Addr::new(172, 16, 0, 9)),
-            &live
-        ));
-        // A surviving address keeps its loop (existing legs undisturbed).
-        assert!(keep_accept_loop(
-            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)),
-            current,
-            &live
-        ));
-        // A dead address loses its loop.
-        assert!(!keep_accept_loop(
-            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 99)),
-            current,
-            &live
-        ));
     }
 }

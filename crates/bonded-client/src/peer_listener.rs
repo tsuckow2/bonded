@@ -88,12 +88,21 @@ pub fn verify_provider_introduction(
     Ok(())
 }
 
+/// Dial a peer relay. `endpoints` is every address the provider
+/// advertised, in order (primary first); the dial tries each in turn
+/// until one connects. Only a failed QUIC dial falls through to the
+/// next address: a dead address is not a failed peer. Once a leg is
+/// connected, the certificate check, introduction send, and
+/// accept-response verdict are final for that leg (NoPath stops the
+/// leg loop, Rejected is an error). An empty list falls back to the
+/// introduction's single endpoint (old single-endpoint advertisements).
 pub async fn connect_peer_relay(
     server_public_key: &str,
     expected_provider_device_public_key: &str,
     introduction: &SignedPeerShareIntroduction,
     socket_protect: Option<&SocketProtectFn>,
     bind_ip: Option<IpAddr>,
+    endpoints: &[SocketAddr],
 ) -> anyhow::Result<PeerRelayDial> {
     verify_consumer_introduction(
         server_public_key,
@@ -109,20 +118,57 @@ pub async fn connect_peer_relay(
         );
     }
 
-    let endpoint = parse_peer_endpoint(&claims.provider_endpoint)?;
+    let candidates = if endpoints.is_empty() {
+        vec![parse_peer_endpoint(&claims.provider_endpoint)?]
+    } else {
+        endpoints.to_vec()
+    };
+
     let rustls_config =
         (*cert_proof::make_pinned_tls_config(&claims.listener_cert_fingerprint)).clone();
-    let (_endpoint, connection) = connect_quic_client_with_bind(
-        &endpoint.ip().to_string(),
-        endpoint.port(),
-        rustls_config,
-        b"bonded-peer",
-        socket_protect,
-        None,
-        bind_ip,
-        None,
-    )
-    .await?;
+    // The introduction binds the provider (key/nonce/cert), not the
+    // address: the same introduction authorizes a leg on any
+    // advertised address. Try each address until the QUIC handshake
+    // succeeds; each attempt is one dial and its error is only kept if
+    // every address fails.
+    let mut last_error = None;
+    let mut connection = None;
+    for endpoint in &candidates {
+        match connect_quic_client_with_bind(
+            &endpoint.ip().to_string(),
+            endpoint.port(),
+            rustls_config.clone(),
+            b"bonded-peer",
+            socket_protect,
+            None,
+            bind_ip,
+            None,
+        )
+        .await
+        {
+            Ok((_endpoint, conn)) => {
+                connection = Some(conn);
+                break;
+            }
+            Err(err) => {
+                tracing::debug!(
+                    peer_endpoint = %endpoint,
+                    error = %err,
+                    "peer relay dial failed, trying next advertised address"
+                );
+                last_error = Some(err);
+            }
+        }
+    }
+    let connection = match connection {
+        Some(conn) => conn,
+        None => {
+            let err = last_error
+                .expect("at least one dial attempt always runs")
+                .context("peer relay dial failed on every advertised address");
+            return Err(err);
+        }
+    };
 
     let presented_cert = extract_quic_peer_certificate(&connection)?;
     let presented_fingerprint = cert_proof::compute_fingerprint(&presented_cert);
@@ -393,6 +439,7 @@ mod tests {
     use quinn::ServerConfig as QuicServerConfig;
     use rcgen::generate_simple_self_signed;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::atomic::Ordering;
     use std::time::{SystemTime, UNIX_EPOCH};
     use std::{sync::Arc, time::Duration};
@@ -591,6 +638,7 @@ mod tests {
             &introduction,
             None,
             None,
+            &[listen_addr],
         )
         .await
         .expect("consumer should connect peer relay") else {
@@ -612,6 +660,94 @@ mod tests {
             .expect("consumer recv should not time out")
             .expect("consumer should receive reply frame");
         assert_eq!(response.payload, Bytes::from_static(b"hello-consumer"));
+
+        let _ = shutdown_tx.send(());
+        provider_task.await.expect("provider task should join");
+    }
+
+    #[tokio::test]
+    async fn consumer_dial_falls_through_dead_address_to_live_one() {
+        // The multi-address consumer path: the provider's first
+        // advertised address is dead (port 1, connection refused) and
+        // the second is the live listener. The dial must fall through
+        // to the live address and the leg must be accepted — a dead
+        // address is not a failed peer. (Skipped by the sandbox's UDP
+        // block along with the other QUIC relay tests; runs on a host
+        // where UDP sockets can send.)
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server_identity = DeviceKeypair::generate();
+        let provider = DeviceKeypair::generate();
+        let cert = generate_simple_self_signed(vec!["127.0.0.1".to_owned()])
+            .expect("self-signed cert should build");
+        let cert_der = cert.cert.der().to_vec();
+        let key_der = cert.key_pair.serialize_der();
+        let fingerprint = cert_proof::compute_fingerprint(&cert_der);
+
+        let server_config = build_peer_server_config(cert_der.clone(), key_der);
+        let endpoint = quinn::Endpoint::server(
+            server_config,
+            "127.0.0.1:0".parse().expect("bind address should parse"),
+        )
+        .expect("peer server endpoint should bind");
+        let listen_addr = endpoint.local_addr().expect("local addr should resolve");
+        let listener_identity = PeerListenerIdentity {
+            provider_device_public_key: provider.public_key_b64.clone(),
+            instance_nonce: "nonce-fallthrough".to_owned(),
+            listener_transport: "quic".to_owned(),
+            listener_cert_fingerprint: fingerprint.clone(),
+        };
+
+        let claims = PeerShareIntroductionClaims {
+            consumer_device_public_key: "consumer".to_owned(),
+            provider_device_public_key: provider.public_key_b64.clone(),
+            provider_instance_nonce: listener_identity.instance_nonce.clone(),
+            provider_endpoint: listen_addr.to_string(),
+            listener_transport: listener_identity.listener_transport.clone(),
+            listener_cert_fingerprint: listener_identity.listener_cert_fingerprint.clone(),
+            expires_at: now_plus(300),
+        };
+        let introduction = sign_introduction(&server_identity, claims);
+
+        let provider_key = provider.public_key_b64.clone();
+        let server_public_key = server_identity.public_key_b64.clone();
+        let provider_endpoint = endpoint.clone();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let provider_task = tokio::spawn(async move {
+            let incoming = provider_endpoint
+                .accept()
+                .await
+                .expect("incoming peer relay connection");
+            let connection = incoming
+                .await
+                .expect("peer relay connection should complete");
+            let AcceptedPeerRelay { mut transport, .. } =
+                accept_peer_relay(&server_public_key, &listener_identity, connection)
+                    .await
+                    .expect("provider should accept peer relay introduction");
+            transport
+                .send_text(r#"{"status":"ok"}"#)
+                .await
+                .expect("provider should send accept response");
+            let _ = shutdown_rx.await;
+        });
+
+        // The dead address first: 127.0.0.1:1 refuses the handshake,
+        // the live listener second. The dial must reach the live one.
+        let dead = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
+        let endpoints = vec![dead, listen_addr];
+        let PeerRelayDial::Accepted(mut consumer) = connect_peer_relay(
+            &server_identity.public_key_b64,
+            &provider_key,
+            &introduction,
+            None,
+            None,
+            &endpoints,
+        )
+        .await
+        .expect("consumer should connect via the live address") else {
+            panic!("provider should accept the relay leg");
+        };
+        consumer.close().await.expect("consumer should close cleanly");
 
         let _ = shutdown_tx.send(());
         provider_task.await.expect("provider task should join");
@@ -693,6 +829,7 @@ mod tests {
             &introduction,
             None,
             None,
+            &[],
         )
         .await
         .expect("consumer should connect peer relay") else {
