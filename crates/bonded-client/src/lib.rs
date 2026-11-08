@@ -4,6 +4,8 @@ use bonded_core::auth::{sign_auth_challenge, DeviceKeypair};
 use bonded_core::config::ClientConfig;
 use bonded_core::heartbeat::{is_idle, pong_silence_timeout, IDLE_INTERVAL};
 #[cfg(target_os = "linux")]
+use bonded_core::peer_share::PeerShareDialBackNotification;
+#[cfg(target_os = "linux")]
 use bonded_core::session::{
     SessionFrame, SessionHeader, SessionState, SessionStateError, FLAG_MULTIPATH_RECV,
     FLAG_PING, FLAG_PONG, FLAG_REDUNDANT,
@@ -270,8 +272,16 @@ impl ClientRuntime {
             } else {
                 None
             };
-            run_linux_packet_loop(&self.config.client.tun_name, transports, peer_transport_rx)
-                .await?;
+            let dial_back_tx = _peer_share_runtime
+                .as_ref()
+                .and_then(|runtime| runtime.dial_back_tx());
+            run_linux_packet_loop(
+                &self.config.client.tun_name,
+                transports,
+                peer_transport_rx,
+                dial_back_tx,
+            )
+            .await?;
         }
 
         #[cfg(not(target_os = "linux"))]
@@ -2702,6 +2712,7 @@ async fn run_linux_packet_loop(
     tun_name: &str,
     transports: Vec<ClientTransport>,
     mut peer_transport_rx: tokio::sync::mpsc::UnboundedReceiver<ClientTransport>,
+    dial_back_tx: Option<tokio::sync::mpsc::UnboundedSender<PeerShareDialBackNotification>>,
 ) -> anyhow::Result<()> {
     let config = build_tun_config(tun_name);
     let device = tun::create_as_async(&config)?;
@@ -2731,15 +2742,25 @@ async fn run_linux_packet_loop(
             continue;
         }
         match transports[path_index].recv().await {
-            Ok(frame) if frame.header.flags & FLAG_PONG != 0 => {
-                session_id = frame.header.connection_id;
-                info!(path = path_index, session_id, "path bound to session");
-                path_index += 1;
-            }
-            Ok(_) => {
-                anyhow::bail!(
-                    "expected session announcement pong on path {path_index}, got a data frame"
-                );
+            Ok(frame) => {
+                // A dial-back notification can arrive on this path
+                // while binding (the session is registered at auth,
+                // before the binding PONG): forward it to the
+                // dial-back handler and keep waiting for the PONG
+                // instead of failing session start on a non-PONG
+                // frame (4.57).
+                if peer_runtime::forward_dial_back_frame(&frame, &dial_back_tx) {
+                    continue;
+                }
+                if frame.header.flags & FLAG_PONG != 0 {
+                    session_id = frame.header.connection_id;
+                    info!(path = path_index, session_id, "path bound to session");
+                    path_index += 1;
+                } else {
+                    anyhow::bail!(
+                        "expected session announcement pong on path {path_index}, got a data frame"
+                    );
+                }
             }
             Err(err) => {
                 info!(path = path_index, error = %err, "path failed during session discovery, dropping it");
@@ -3001,6 +3022,15 @@ async fn run_linux_packet_loop(
                 for (index, result) in recv_events {
                     match result {
                         Ok(frame) => {
+                            // Dial-back notifications (4.57) are
+                            // control frames for the peer runtime,
+                            // not TUN data: intercept them BEFORE
+                            // the PONG check and the data path so
+                            // they never reach the reorder buffer
+                            // or the TUN device.
+                            if peer_runtime::forward_dial_back_frame(&frame, &dial_back_tx) {
+                                continue;
+                            }
                             // Heartbeat pongs are liveness replies, not TUN data: keep them
                             // out of the session reorder buffer and off the TUN device.
                             if frame.header.flags & FLAG_PONG != 0 {

@@ -187,6 +187,54 @@ pub async fn connect_peer_relay(
     )?;
 
     let claims = &introduction.introduction;
+    let candidates = if endpoints.is_empty() {
+        vec![parse_peer_endpoint(&claims.provider_endpoint)?]
+    } else {
+        endpoints.to_vec()
+    };
+
+    dial_peer_relay(introduction, socket_protect, bind_ip, &candidates).await
+}
+
+/// Dial a peer relay back (4.57): the provider dials the consumer's
+/// listener with a server-signed reversed introduction. `endpoints`
+/// are the consumer's advertised addresses, in order — there is NO
+/// fallback to the introduction's `provider_endpoint`, which names
+/// the provider's own listener and must never be dialed here.
+pub async fn connect_peer_relay_reversed(
+    server_public_key: &str,
+    expected_provider_device_public_key: &str,
+    introduction: &SignedPeerShareIntroduction,
+    socket_protect: Option<&SocketProtectFn>,
+    bind_ip: Option<IpAddr>,
+    endpoints: &[SocketAddr],
+) -> anyhow::Result<PeerRelayDial> {
+    verify_reversed_introduction_for_dialer(
+        server_public_key,
+        expected_provider_device_public_key,
+        introduction,
+    )?;
+    if endpoints.is_empty() {
+        anyhow::bail!("reversed peer introduction names no consumer endpoint to dial");
+    }
+    dial_peer_relay(introduction, socket_protect, bind_ip, endpoints).await
+}
+
+/// Shared dial core for both leg directions (4.57): the introduction
+/// is already verified by the caller. Dials each candidate address in
+/// order until the QUIC handshake succeeds, pins the listener cert
+/// fingerprint from the claims (the provider's cert on a forward leg,
+/// the consumer's on a reversed leg), presents the introduction, and
+/// maps the accept-response verdict. Only a failed QUIC dial falls
+/// through to the next address: once connected, the cert check,
+/// introduction send, and verdict are final for that leg.
+async fn dial_peer_relay(
+    introduction: &SignedPeerShareIntroduction,
+    socket_protect: Option<&SocketProtectFn>,
+    bind_ip: Option<IpAddr>,
+    candidates: &[SocketAddr],
+) -> anyhow::Result<PeerRelayDial> {
+    let claims = &introduction.introduction;
     if !claims.listener_transport.eq_ignore_ascii_case("quic") {
         anyhow::bail!(
             "unsupported peer listener transport: {}",
@@ -194,22 +242,16 @@ pub async fn connect_peer_relay(
         );
     }
 
-    let candidates = if endpoints.is_empty() {
-        vec![parse_peer_endpoint(&claims.provider_endpoint)?]
-    } else {
-        endpoints.to_vec()
-    };
-
     let rustls_config =
         (*cert_proof::make_pinned_tls_config(&claims.listener_cert_fingerprint)).clone();
-    // The introduction binds the provider (key/nonce/cert), not the
+    // The introduction binds the listener (key/nonce/cert), not the
     // address: the same introduction authorizes a leg on any
     // advertised address. Try each address until the QUIC handshake
     // succeeds; each attempt is one dial and its error is only kept if
     // every address fails.
     let mut last_error = None;
     let mut connection = None;
-    for endpoint in &candidates {
+    for endpoint in candidates {
         match connect_quic_client_with_bind(
             &endpoint.ip().to_string(),
             endpoint.port(),
@@ -300,6 +342,21 @@ pub enum PeerRelayDial {
     NoPath,
 }
 
+/// Read the introduction off a newly accepted relay connection
+/// without verifying it, so the accept loop can branch on its
+/// direction first (forward introductions verify as provider,
+/// reversed ones as consumer). The accept-response text is NOT sent
+/// here: the caller sends it only after its own cap/path/dedup
+/// checks, so a rejected leg never looks accepted to the dialer.
+async fn read_peer_relay_introduction(
+    connection: quinn::Connection,
+) -> anyhow::Result<(QuicTransport, SignedPeerShareIntroduction)> {
+    let mut transport = QuicTransport::from_server_connection(connection).await?;
+    let introduction: SignedPeerShareIntroduction =
+        serde_json::from_str(&transport.recv_text().await?)?;
+    Ok((transport, introduction))
+}
+
 /// Verify a dialed leg's introduction against the listener identity.
 /// Unlike the old accept path, this does NOT send the accept response:
 /// the accept task sends it only after the consumer-cap and path-claim
@@ -309,10 +366,69 @@ pub async fn accept_peer_relay(
     listener: &PeerListenerIdentity,
     connection: quinn::Connection,
 ) -> anyhow::Result<AcceptedPeerRelay> {
-    let mut transport = QuicTransport::from_server_connection(connection).await?;
-    let introduction: SignedPeerShareIntroduction =
-        serde_json::from_str(&transport.recv_text().await?)?;
+    let (transport, introduction) = read_peer_relay_introduction(connection).await?;
     verify_provider_introduction(server_public_key, listener, &introduction)?;
+    Ok(AcceptedPeerRelay {
+        transport,
+        introduction,
+    })
+}
+
+/// Verify a reversed introduction on the consumer side, when the
+/// provider presents it while dialing back (4.57). The consumer is
+/// the listener here: the introduction must name this device as the
+/// consumer and this listener's cert fingerprint. The expected
+/// provider is the one the server signed into the claims — the server
+/// signature is the trust root for which provider the consumer asked
+/// to be dialed back by, and the server only mints a reversed
+/// introduction for a provider this consumer requested dial-back for.
+pub async fn accept_peer_relay_reversed(
+    server_public_key: &str,
+    listener: &PeerListenerIdentity,
+    connection: quinn::Connection,
+) -> anyhow::Result<AcceptedPeerRelay> {
+    let (transport, introduction) = read_peer_relay_introduction(connection).await?;
+    let expected_provider = introduction
+        .introduction
+        .provider_device_public_key
+        .clone();
+    verify_reversed_introduction_for_listener(
+        server_public_key,
+        listener,
+        &expected_provider,
+        &introduction,
+    )?;
+    Ok(AcceptedPeerRelay {
+        transport,
+        introduction,
+    })
+}
+
+/// Read a relay introduction of either direction and verify it for
+/// this listener: forward introductions verify as provider (the old
+/// path), reversed ones as consumer (4.57). The caller branches on
+/// `introduction.introduction.is_reverse()` for the different
+/// accept handling each direction needs.
+pub async fn accept_peer_relay_any(
+    server_public_key: &str,
+    listener: &PeerListenerIdentity,
+    connection: quinn::Connection,
+) -> anyhow::Result<AcceptedPeerRelay> {
+    let (transport, introduction) = read_peer_relay_introduction(connection).await?;
+    if introduction.introduction.is_reverse() {
+        let expected_provider = introduction
+            .introduction
+            .provider_device_public_key
+            .clone();
+        verify_reversed_introduction_for_listener(
+            server_public_key,
+            listener,
+            &expected_provider,
+            &introduction,
+        )?;
+    } else {
+        verify_provider_introduction(server_public_key, listener, &introduction)?;
+    }
     Ok(AcceptedPeerRelay {
         transport,
         introduction,
@@ -499,7 +615,8 @@ fn parse_peer_endpoint(endpoint: &str) -> anyhow::Result<SocketAddr> {
 #[cfg(test)]
 mod tests {
     use super::{
-        accept_peer_relay, connect_peer_relay, parse_relay_accept_response,
+        accept_peer_relay, accept_peer_relay_any, connect_peer_relay,
+        connect_peer_relay_reversed, parse_relay_accept_response,
         register_peer_relay_upstream, relay_peer_frames, relay_peer_frames_rate_limited,
         verify_consumer_introduction, verify_provider_introduction,
         verify_reversed_introduction_for_dialer, verify_reversed_introduction_for_listener,
@@ -1002,6 +1119,198 @@ mod tests {
 
         let _ = shutdown_tx.send(());
         provider_task.await.expect("provider task should join");
+    }
+
+    #[tokio::test]
+    async fn reversed_introduction_establishes_consumer_accepted_relay() {
+        // The 4.57 consumer accept path: the provider dials the
+        // consumer's listener with a reversed introduction, the
+        // consumer verifies it as listener (accept_peer_relay_any)
+        // and accepts, and both sides exchange SessionFrames over
+        // the leg. (Skipped by the sandbox's UDP block along with
+        // the other QUIC relay tests; runs on a host where UDP
+        // sockets can send.)
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server_identity = DeviceKeypair::generate();
+        let provider = DeviceKeypair::generate();
+        let consumer = DeviceKeypair::generate();
+        // The CONSUMER is the listener here: the cert is its
+        // listener's, and its device key is the consumer key.
+        let cert = generate_simple_self_signed(vec!["127.0.0.1".to_owned()])
+            .expect("self-signed cert should build");
+        let cert_der = cert.cert.der().to_vec();
+        let key_der = cert.key_pair.serialize_der();
+        let fingerprint = cert_proof::compute_fingerprint(&cert_der);
+
+        let server_config = build_peer_server_config(cert_der.clone(), key_der);
+        let endpoint = quinn::Endpoint::server(
+            server_config,
+            "127.0.0.1:0".parse().expect("bind address should parse"),
+        )
+        .expect("peer server endpoint should bind");
+        let listen_addr = endpoint.local_addr().expect("local addr should resolve");
+        let listener_identity = PeerListenerIdentity {
+            provider_device_public_key: consumer.public_key_b64.clone(),
+            instance_nonce: "nonce-rev".to_owned(),
+            listener_transport: "quic".to_owned(),
+            listener_cert_fingerprint: fingerprint.clone(),
+        };
+
+        let claims = PeerShareIntroductionClaims {
+            consumer_device_public_key: consumer.public_key_b64.clone(),
+            provider_device_public_key: provider.public_key_b64.clone(),
+            provider_instance_nonce: listener_identity.instance_nonce.clone(),
+            provider_endpoint: "192.168.1.20:54443".to_owned(),
+            listener_transport: listener_identity.listener_transport.clone(),
+            listener_cert_fingerprint: listener_identity.listener_cert_fingerprint.clone(),
+            expires_at: now_plus(300),
+            direction: "reverse".to_owned(),
+            consumer_endpoints: vec![listen_addr.to_string()],
+        };
+        let introduction = sign_introduction(&server_identity, claims);
+
+        let provider_key = provider.public_key_b64.clone();
+        let server_public_key = server_identity.public_key_b64.clone();
+        let consumer_endpoint = endpoint.clone();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let consumer_task = tokio::spawn(async move {
+            let incoming = consumer_endpoint
+                .accept()
+                .await
+                .expect("incoming reversed relay connection");
+            let connection = incoming
+                .await
+                .expect("reversed relay connection should complete");
+            let AcceptedPeerRelay {
+                mut transport,
+                introduction,
+            } = accept_peer_relay_any(&server_public_key, &listener_identity, connection)
+                .await
+                .expect("consumer should accept reversed relay introduction");
+            assert!(introduction.introduction.is_reverse());
+            transport
+                .send_text(r#"{"status":"ok"}"#)
+                .await
+                .expect("consumer should send accept response");
+            let frame = transport
+                .recv()
+                .await
+                .expect("consumer should receive frame");
+            assert_eq!(frame.payload, Bytes::from_static(b"hello-consumer"));
+
+            transport
+                .send(SessionFrame {
+                    header: SessionHeader {
+                        connection_id: frame.header.connection_id,
+                        sequence: 0,
+                        flags: 0,
+                    },
+                    payload: Bytes::from_static(b"hello-provider"),
+                })
+                .await
+                .expect("consumer should send reply frame");
+            transport
+                .close()
+                .await
+                .expect("consumer should gracefully finish relay stream");
+            let _ = shutdown_rx.await;
+        });
+
+        let PeerRelayDial::Accepted(mut provider_transport) = connect_peer_relay_reversed(
+            &server_identity.public_key_b64,
+            &provider_key,
+            &introduction,
+            None,
+            None,
+            &[listen_addr],
+        )
+        .await
+        .expect("provider should dial back") else {
+            panic!("consumer should accept the reversed relay leg");
+        };
+        provider_transport
+            .send(SessionFrame {
+                header: SessionHeader {
+                    connection_id: 7,
+                    sequence: 0,
+                    flags: 0,
+                },
+                payload: Bytes::from_static(b"hello-consumer"),
+            })
+            .await
+            .expect("provider should send frame");
+        let response = timeout(Duration::from_secs(5), provider_transport.recv())
+            .await
+            .expect("provider recv should not time out")
+            .expect("provider should receive reply frame");
+        assert_eq!(response.payload, Bytes::from_static(b"hello-provider"));
+
+        let _ = shutdown_tx.send(());
+        consumer_task.await.expect("consumer task should join");
+    }
+
+    #[tokio::test]
+    async fn reversed_dial_rejects_forward_introduction_without_dialing() {
+        // The dial-back verifier runs before any socket work: a
+        // forward introduction can never authorize a dial-back, and
+        // no address is dialed for it.
+        let server = DeviceKeypair::generate();
+        let provider = DeviceKeypair::generate();
+        let claims = PeerShareIntroductionClaims {
+            consumer_device_public_key: "consumer".to_owned(),
+            provider_device_public_key: provider.public_key_b64.clone(),
+            provider_instance_nonce: "nonce-1".to_owned(),
+            provider_endpoint: "192.168.1.20:54443".to_owned(),
+            listener_transport: "quic".to_owned(),
+            listener_cert_fingerprint: "sha256:listener".to_owned(),
+            expires_at: now_plus(300),
+            direction: "forward".to_owned(),
+            consumer_endpoints: Vec::new(),
+        };
+        let introduction = sign_introduction(&server, claims);
+        let result = connect_peer_relay_reversed(
+            &server.public_key_b64,
+            &provider.public_key_b64,
+            &introduction,
+            None,
+            None,
+            &[SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1)],
+        )
+        .await;
+        assert!(result.is_err(), "forward introduction should fail reversed dial");
+        let error = match result {
+            Ok(_) => panic!("forward introduction should fail reversed dial"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("not reversed"));
+    }
+
+    #[tokio::test]
+    async fn reversed_dial_never_falls_back_to_provider_endpoint() {
+        // The introduction's provider_endpoint names the provider's
+        // OWN listener: with no consumer endpoints to dial, the
+        // reversed dial must fail rather than dial the provider
+        // itself (which would loop back to its own listener).
+        let server = DeviceKeypair::generate();
+        let provider = DeviceKeypair::generate();
+        let consumer = DeviceKeypair::generate();
+        let introduction =
+            reversed_introduction(&server, &consumer.public_key_b64, &provider.public_key_b64);
+        let result = connect_peer_relay_reversed(
+            &server.public_key_b64,
+            &provider.public_key_b64,
+            &introduction,
+            None,
+            None,
+            &[],
+        )
+        .await;
+        assert!(result.is_err(), "reversed dial with no endpoints should fail");
+        let error = match result {
+            Ok(_) => panic!("reversed dial with no endpoints should fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("no consumer endpoint"));
     }
 
     #[tokio::test]

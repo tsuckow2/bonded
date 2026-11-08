@@ -1680,6 +1680,15 @@ fn start_android_session(
             } else {
                 None
             };
+            // Dial-back notifications (4.57): the session worker
+            // intercepts FLAG_PEER_DIAL_BACK frames on this
+            // session's transports and forwards them to the peer
+            // runtime's dial-back handler, which dials the
+            // consumer back. None when peer-share is off or the
+            // runtime is consumer-only (no handler exists).
+            let dial_back_tx = _peer_share_runtime
+                .as_ref()
+                .and_then(|runtime| runtime.dial_back_tx());
             // Complete server-side session binding on every path with an
             // initial PING/PONG discovery exchange, mirroring the Linux
             // packet loop. The server binds the session to the first frame
@@ -1745,6 +1754,15 @@ fn start_android_session(
                         path_index += 1;
                     }
                     Ok(Ok(frame)) => {
+                        // A dial-back notification can arrive while
+                        // binding (the session is registered at auth,
+                        // before the binding PONG): forward it to the
+                        // dial-back handler and re-send the binding
+                        // ping instead of failing session start on a
+                        // non-PONG frame (4.57).
+                        if peer_runtime::forward_dial_back_frame(&frame, &dial_back_tx) {
+                            continue;
+                        }
                         let message = format!(
                             "expected session announcement pong on path {path_index}, got a frame with flags={}",
                             frame.header.flags
@@ -2681,6 +2699,17 @@ fn start_android_session(
                         for (index, result) in recv_events {
                             match result {
                                 Ok(frame) => {
+                                    // Dial-back notifications (4.57)
+                                    // are control frames for the peer
+                                    // runtime, not TUN data: intercept
+                                    // them BEFORE the PONG check and
+                                    // the TUN write so they never
+                                    // reach the kernel as a non-IP
+                                    // packet (4.56).
+                                    if peer_runtime::forward_dial_back_frame(&frame, &dial_back_tx)
+                                    {
+                                        continue;
+                                    }
                                     // Handle heartbeat pong — don't feed it to the session reorder buffer.
                                     if frame.header.flags & FLAG_PONG != 0 {
                                         // Newer servers stamp the pong

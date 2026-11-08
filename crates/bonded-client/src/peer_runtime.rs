@@ -8,8 +8,11 @@ use anyhow::Context;
 use bonded_core::auth::{create_auth_challenge, sign_bytes, DeviceKeypair};
 use bonded_core::config::{PeerShareMode, SocketProtectFn};
 use bonded_core::peer_share::{
-    PeerShareAdvertisement, PeerShareIntroductionRequest, SignedPeerShareIntroduction,
+    PeerShareAdvertisement, PeerShareDialBackNotification, PeerShareIntroductionRequest,
+    SignedPeerShareIntroduction,
 };
+use bonded_core::session::{SessionFrame, FLAG_PEER_DIAL_BACK};
+use bonded_core::transport::QuicTransport;
 use pnet_datalink::NetworkInterface;
 use rcgen::generate_simple_self_signed;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -20,9 +23,10 @@ use tracing::{info, warn};
 use crate::cert_proof;
 use crate::peer_discovery::{PeerShareAdvertiser, PeerShareBrowser, utc_minute};
 use crate::peer_listener::{
-    accept_peer_relay, connect_peer_relay, register_peer_relay_upstream,
-    relay_peer_frames_rate_limited, AcceptedPeerRelay, PeerListenerIdentity, PeerRelayDial,
-    PeerRelayRateLimiter, PeerShareRelayStats,
+    accept_peer_relay_any, connect_peer_relay,
+    connect_peer_relay_reversed, register_peer_relay_upstream,
+    relay_peer_frames_rate_limited, verify_reversed_introduction_for_dialer, AcceptedPeerRelay,
+    PeerListenerIdentity, PeerRelayDial, PeerRelayRateLimiter, PeerShareRelayStats,
 };
 use crate::{
     bootstrap_scheme_candidates, enumerate_interfaces, establish_single_transport_path,
@@ -33,6 +37,14 @@ use crate::{
 pub struct PeerShareRuntime {
     tasks: Vec<JoinHandle<()>>,
     relay_stats: Arc<PeerShareRelayStats>,
+    /// Sender for server-pushed dial-back notifications (4.57):
+    /// the session workers intercept `FLAG_PEER_DIAL_BACK` frames on
+    /// the provider's server session and forward the notification
+    /// here; the dial-back handler task dials the consumer back.
+    /// None when this runtime never provides (consumer-only mode),
+    /// so a notification has nowhere to go and is dropped by the
+    /// worker instead.
+    dial_back_tx: Option<tokio::sync::mpsc::UnboundedSender<PeerShareDialBackNotification>>,
 }
 
 impl PeerShareRuntime {
@@ -41,6 +53,15 @@ impl PeerShareRuntime {
     /// Zero when this runtime never provided (consumer-only mode).
     pub fn relay_stats(&self) -> Arc<PeerShareRelayStats> {
         Arc::clone(&self.relay_stats)
+    }
+
+    /// Sender the session workers use to hand server-pushed
+    /// dial-back notifications to the dial-back handler (4.57).
+    /// None in consumer-only mode (no provider role, no handler).
+    pub fn dial_back_tx(
+        &self,
+    ) -> Option<tokio::sync::mpsc::UnboundedSender<PeerShareDialBackNotification>> {
+        self.dial_back_tx.clone()
     }
 }
 
@@ -254,6 +275,46 @@ impl RedialQueue {
     }
 }
 
+/// Intercept a server-pushed dial-back notification frame (4.57):
+/// parse it and forward it to the peer runtime's dial-back handler
+/// instead of feeding it to the session reorder buffer or the TUN
+/// device. Returns true when the frame carried the dial-back flag
+/// (handled, whether the parse/forward succeeded or not — a bad or
+/// undeliverable notification is dropped, never retried here; the
+/// consumer's next introduction request re-pushes); false otherwise,
+/// so the caller keeps processing the frame as usual. Used by both
+/// session workers (Linux packet loop, Android FFI worker) at every
+/// point they read session frames: the steady-state receive arm AND
+/// the session-binding PONG wait, where a notification arriving
+/// mid-binding must not fail session start.
+/// The flag check comes FIRST, before the PONG check and the data
+/// path: the notification's sequence is u64::MAX and its payload is
+/// JSON, so the reorder buffer would swallow it and the TUN path
+/// would hand it to the kernel as a non-IP packet (4.56).
+pub fn forward_dial_back_frame(
+    frame: &SessionFrame,
+    dial_back_tx: &Option<tokio::sync::mpsc::UnboundedSender<PeerShareDialBackNotification>>,
+) -> bool {
+    if frame.header.flags & FLAG_PEER_DIAL_BACK == 0 {
+        return false;
+    }
+    match PeerShareDialBackNotification::from_control_frame(frame) {
+        Ok(notification) => {
+            if let Some(tx) = dial_back_tx {
+                if tx.send(notification).is_err() {
+                    warn!("dial-back notification dropped: dial-back handler is gone");
+                }
+            } else {
+                warn!("dial-back notification dropped: peer-share runtime is not providing");
+            }
+        }
+        Err(err) => {
+            warn!(error = %err, "dial-back notification frame failed to parse; dropped");
+        }
+    }
+    true
+}
+
 /// How long before a relay's introduction expires the consumer dials
 /// its replacement leg (make-before-break renewal). Introductions live
 /// 300 s; renewing 60 s early leaves room for one retry while the old
@@ -389,10 +450,430 @@ fn schedule_renewal_retry(
     }
 }
 
+/// Peer ids (device key + instance nonce, as in
+/// [`peer_share_peer_id`]) this device currently holds at least one
+/// relay leg for, shared between the browse loop (which owns leg
+/// tracking) and the accept loop (which must refuse a reversed leg
+/// for an already-connected peer). The accept loop checks it BEFORE
+/// sending its accept response, so a duplicate reversed leg is
+/// refused with `no_path` and the provider never opens an upstream
+/// for a leg the consumer would drop; the browse loop is the second
+/// layer and drops a reversed leg that arrives anyway (see
+/// [`note_reversed_leg`]).
+#[derive(Clone, Default)]
+struct ConnectedPeers(Arc<std::sync::Mutex<HashSet<String>>>);
+
+impl ConnectedPeers {
+    fn mark_connected(&self, peer_id: &str) {
+        self.0
+            .lock()
+            .expect("connected peers lock poisoned")
+            .insert(peer_id.to_owned());
+    }
+
+    fn mark_disconnected(&self, peer_id: &str) {
+        self.0
+            .lock()
+            .expect("connected peers lock poisoned")
+            .remove(peer_id);
+    }
+
+    fn is_connected(&self, peer_id: &str) -> bool {
+        self.0
+            .lock()
+            .expect("connected peers lock poisoned")
+            .contains(peer_id)
+    }
+}
+
+/// A reversed leg the accept loop verified and accepted, handed to
+/// the browse loop so all leg bookkeeping (tracker, renewal, close
+/// re-drive) stays in one place. The peer id is the provider's
+/// device key + instance nonce from the reversed introduction, i.e.
+/// the same key the browse loop tracks forward legs under.
+struct ReversedLeg {
+    transport: QuicTransport,
+    peer_id: String,
+    expires_at: u64,
+}
+
+/// Record an incoming reversed leg in the browse loop's tracker
+/// (4.57 dedup, consumer side). Returns the renewal generation when
+/// the leg is accepted, or None when this device already holds a leg
+/// for the peer — the caller then closes the duplicate transport.
+/// The peer-level check is all the consumer can observe (it does not
+/// know which provider path a reversed leg is pinned to); the
+/// path-level dedup lives on the provider in `RelayPathClaims`,
+/// shared by the forward accept loop and the dial-back handler, so
+/// at most one leg exists per (peer, provider path) in either
+/// direction.
+fn note_reversed_leg(
+    legs: &mut PeerLegTracker,
+    connected: &ConnectedPeers,
+    peer_id: &str,
+    expires_at: u64,
+) -> Option<u64> {
+    if legs.is_connected(peer_id) || connected.is_connected(peer_id) {
+        return None;
+    }
+    let generation = legs.note_dial(peer_id, expires_at);
+    connected.mark_connected(peer_id);
+    Some(generation)
+}
+
 impl Drop for PeerShareRuntime {
     fn drop(&mut self) {
         for task in &self.tasks {
             task.abort();
+        }
+    }
+}
+
+/// One relay pump task for a provider-side leg (4.57): shared by
+/// the forward accept loop and the dial-back handler, so both
+/// directions get the same upstream re-establishment, expiry
+/// abandonment, peer-closed detection, claim release, and wakeup
+/// accounting. The caller has already verified the introduction,
+/// claimed the provider path, and (forward) sent the accept
+/// response or (reverse) received it.
+#[allow(clippy::too_many_arguments)]
+async fn run_relay_task(
+    mut peer: QuicTransport,
+    introduction: SignedPeerShareIntroduction,
+    consumer_key: String,
+    claimed_index: usize,
+    relay_config: ClientConfig,
+    relay_path_source: ProviderPathSource,
+    relay_claims: Arc<std::sync::Mutex<RelayPathClaims>>,
+    relay_count: Arc<AtomicUsize>,
+    relay_stats: Arc<PeerShareRelayStats>,
+    bandwidth_kbps: u64,
+    relay_logger: Option<PeerShareEventLogger>,
+) {
+    let introduction_expires_at = introduction.introduction.expires_at;
+    let _in_flight = relay_count.fetch_add(1, Ordering::SeqCst);
+    // Wakeup accounting (battery profiler): one relay task per
+    // accepted leg. Counted here, not in the pump, so a leg that
+    // fails before its first pump still counts as started.
+    relay_stats
+        .relay_tasks_started
+        .fetch_add(1, Ordering::Relaxed);
+    // Resilience: if the upstream (provider->server) connection fails,
+    // re-establish it instead of terminating the relay permanently.
+    // The peer (consumer->provider QUIC) connection is kept alive
+    // across upstream reconnects.
+    let result = async {
+        let mut retry_delay = std::time::Duration::from_secs(1);
+        const MAX_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
+        loop {
+            // The introduction is a short-lived credential only
+            // the consumer can mint. Once it expires the server
+            // rejects every re-registration, so retrying is
+            // futile: abandon the relay instead. Dropping the
+            // peer connection lets the consumer notice the loss
+            // and mint a fresh introduction. (Observed
+            // 2026-10-17: ~44 rejected re-registrations over
+            // 15 minutes against one expired introduction.)
+            if introduction_expired(&introduction) {
+                anyhow::bail!(
+                    "peer relay introduction expired; abandoning relay so the consumer can re-introduce"
+                );
+            }
+            // One upstream per claimed provider path: the
+            // leg pins to its claimed path's current bind
+            // address (re-read on every re-establishment, so
+            // a re-addressed path is followed and a removed
+            // path retries until it returns or the leg is
+            // evicted consumer-side). The unpinned slot
+            // keeps the old single-upstream behavior.
+            let mut upstream =
+                match establish_relay_upstream(&relay_config, &relay_path_source, claimed_index).await {
+                    Ok(upstream) => upstream,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "provider: failed to establish relay upstream, retrying");
+                        tokio::time::sleep(retry_delay).await;
+                        retry_delay =
+                            std::cmp::min(retry_delay * 2, MAX_RETRY_DELAY);
+                        continue;
+                    }
+                };
+            tracing::warn!("provider: sending relay registration");
+            if let Err(e) = register_peer_relay_upstream(&mut upstream, introduction.clone()).await {
+                tracing::warn!(error = %e, "provider: relay registration failed, retrying");
+                tokio::time::sleep(retry_delay).await;
+                retry_delay = std::cmp::min(retry_delay * 2, MAX_RETRY_DELAY);
+                continue;
+            }
+            tracing::warn!("provider: relay registration sent");
+            let mut limiter = PeerRelayRateLimiter::new(bandwidth_kbps);
+            match relay_peer_frames_rate_limited(
+                &mut peer,
+                &mut upstream,
+                &mut limiter,
+                &relay_stats,
+            )
+            .await
+            {
+                Ok(()) => {
+                    // Relay completed normally (peer disconnected)
+                    return Ok(());
+                }
+                Err(e) => {
+                    // A dead peer must end the task (and free
+                    // its path claim) instead of looping on
+                    // upstream re-establishment until the
+                    // introduction expires: the peer QUIC
+                    // connection reports closed, while a live
+                    // peer with a dead upstream does not.
+                    if peer.connection_closed() {
+                        tracing::warn!("provider: peer connection closed, ending relay");
+                        return Ok(());
+                    }
+                    tracing::warn!(error = %e, "provider: relay upstream failed, re-establishing");
+                    tokio::time::sleep(retry_delay).await;
+                    retry_delay = std::cmp::min(retry_delay * 2, MAX_RETRY_DELAY);
+                    // Continue loop to re-establish upstream
+                }
+            }
+        }
+    }
+    .await;
+    relay_count.fetch_sub(1, Ordering::SeqCst);
+    // Release the path claim (a no-op when a newer leg has
+    // already taken the path over) so the path is claimable
+    // by the consumer's next dial.
+    relay_claims.lock().expect("relay path claims lock poisoned").release(
+        &consumer_key,
+        claimed_index,
+        introduction_expires_at,
+    );
+    match result {
+        Ok(()) => {
+            emit_peer_share_event(
+                relay_logger.as_ref(),
+                format!("relay loop completed for consumer={consumer_key}"),
+            );
+        }
+        Err(err) => {
+            warn!(error = %err, consumer = %consumer_key, "peer relay terminated");
+            emit_peer_share_event(
+                relay_logger.as_ref(),
+                format!("relay terminated for consumer={consumer_key}: {err}"),
+            );
+        }
+    }
+    // Wakeup accounting (battery profiler). A task dropped
+    // mid-flight by runtime shutdown never reaches this line,
+    // so `ended` is a lower bound on started tasks.
+    relay_stats
+        .relay_tasks_ended
+        .fetch_add(1, Ordering::Relaxed);
+}
+
+/// A dial-back notification the provider is ready to act on (4.57):
+/// the reversed introduction verified, the consumer's endpoints
+/// parsed, and a provider path claimed for the leg. The claim is
+/// what makes the plan exclusive: the forward accept loop claims
+/// from the same `RelayPathClaims`, so a forward and a reversed leg
+/// for the same consumer can never hold the same provider path.
+#[derive(Debug)]
+struct DialBackPlan {
+    consumer_key: String,
+    endpoints: Vec<SocketAddr>,
+    introduction: SignedPeerShareIntroduction,
+    claimed_path: usize,
+    expires_at: u64,
+}
+
+/// Decide whether a server-pushed dial-back notification should be
+/// dialed, and claim the provider path for it first (4.57 dedup,
+/// provider side). Pure over the claims map apart from the mutex
+/// the caller holds, so the duplicate-leg cases are unit-testable
+/// without a QUIC connection. Drops (Err) when the reversed
+/// introduction does not verify, no consumer endpoint parses, or
+/// every provider path is already held by a live-or-newer claim for
+/// this consumer — the last case is the dedup working: a leg for
+/// that (peer, path) already exists, so dialing would only duplicate
+/// it. The caller releases the claim when the dial does not produce
+/// a leg; a leg that is established hands the claim to its relay
+/// task, which releases it when the leg ends.
+fn plan_dial_back(
+    server_public_key: &str,
+    own_device_public_key: &str,
+    notification: &PeerShareDialBackNotification,
+    claims: &mut RelayPathClaims,
+    path_indexes: &[usize],
+) -> anyhow::Result<DialBackPlan> {
+    verify_reversed_introduction_for_dialer(
+        server_public_key,
+        own_device_public_key,
+        &notification.introduction,
+    )?;
+    let introduction_claims = &notification.introduction.introduction;
+    let endpoints: Vec<SocketAddr> = introduction_claims
+        .consumer_endpoints
+        .iter()
+        .filter_map(|endpoint| endpoint.parse().ok())
+        .collect();
+    if endpoints.is_empty() {
+        anyhow::bail!("reversed peer introduction names no dialable consumer endpoint");
+    }
+    let consumer_key = introduction_claims
+        .consumer_device_public_key
+        .clone();
+    let expires_at = introduction_claims.expires_at;
+    let Some(claimed_path) = claims.claim(&consumer_key, path_indexes, expires_at) else {
+        anyhow::bail!(
+            "no free provider path for consumer={consumer_key}: every path already holds a leg"
+        );
+    };
+    Ok(DialBackPlan {
+        consumer_key,
+        endpoints,
+        introduction: notification.introduction.clone(),
+        claimed_path,
+        expires_at,
+    })
+}
+
+/// Handle server-pushed dial-back notifications (4.57): for each one,
+/// verify + claim a provider path (the dedup), dial the consumer's
+/// endpoints in order with the reversed introduction, and — when the
+/// consumer accepts — open the relayed server session on the claimed
+/// path with the same relay task the forward accept loop uses. A
+/// `no_path` accept means the consumer already holds a leg for this
+/// peer (its own dedup refused the leg); a failed dial releases the
+/// claim and drops the notification — the consumer's next
+/// introduction request re-pushes. No retries here: the push is the
+/// retry mechanism.
+#[allow(clippy::too_many_arguments)]
+async fn run_dial_back_handler(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<PeerShareDialBackNotification>,
+    server_key: String,
+    own_device_public_key: String,
+    config: ClientConfig,
+    socket_protect: Option<SocketProtectFn>,
+    bind_ip: Option<IpAddr>,
+    path_claims: Arc<std::sync::Mutex<RelayPathClaims>>,
+    active_relays: Arc<AtomicUsize>,
+    relay_stats: Arc<PeerShareRelayStats>,
+    path_source: ProviderPathSource,
+    bandwidth_kbps: u64,
+    logger: Option<PeerShareEventLogger>,
+) {
+    while let Some(notification) = rx.recv().await {
+        let consumer_key = notification.consumer_device_public_key.clone();
+        let plan = {
+            let mut claims = path_claims
+                .lock()
+                .expect("relay path claims lock poisoned");
+            let path_indexes: Vec<usize> = path_source
+                .snapshot()
+                .iter()
+                .map(|(index, _)| *index)
+                .collect();
+            plan_dial_back(
+                &server_key,
+                &own_device_public_key,
+                &notification,
+                &mut claims,
+                &path_indexes,
+            )
+        };
+        let plan = match plan {
+            Ok(plan) => plan,
+            Err(err) => {
+                warn!(consumer = %consumer_key, error = %err, "dial-back dropped");
+                emit_peer_share_event(
+                    logger.as_ref(),
+                    format!("dial-back dropped for consumer={consumer_key}: {err}"),
+                );
+                continue;
+            }
+        };
+        let claimed_path = plan.claimed_path;
+        let expires_at = plan.expires_at;
+        info!(
+            consumer = %plan.consumer_key,
+            endpoints = %plan.endpoints.iter().map(SocketAddr::to_string).collect::<Vec<_>>().join(","),
+            claimed_path = claimed_path,
+            "dialing back consumer"
+        );
+        emit_peer_share_event(
+            logger.as_ref(),
+            format!(
+                "dialing back consumer={} path={}",
+                plan.consumer_key, claimed_path
+            ),
+        );
+        match connect_peer_relay_reversed(
+            &server_key,
+            &own_device_public_key,
+            &plan.introduction,
+            socket_protect.as_ref(),
+            bind_ip,
+            &plan.endpoints,
+        )
+        .await
+        {
+            Ok(PeerRelayDial::Accepted(transport)) => {
+                info!(
+                    consumer = %plan.consumer_key,
+                    claimed_path = claimed_path,
+                    "dial-back relay accepted"
+                );
+                emit_peer_share_event(
+                    logger.as_ref(),
+                    format!(
+                        "dial-back relay accepted for consumer={} path={}",
+                        plan.consumer_key, claimed_path
+                    ),
+                );
+                tokio::spawn(run_relay_task(
+                    transport,
+                    plan.introduction,
+                    plan.consumer_key,
+                    claimed_path,
+                    config.clone(),
+                    path_source.clone(),
+                    path_claims.clone(),
+                    active_relays.clone(),
+                    relay_stats.clone(),
+                    bandwidth_kbps,
+                    logger.clone(),
+                ));
+            }
+            Ok(PeerRelayDial::NoPath) => {
+                // The consumer refused with no_path: it already
+                // holds a leg for this peer (consumer-side dedup).
+                // Release the claim so the path stays available.
+                path_claims
+                    .lock()
+                    .expect("relay path claims lock poisoned")
+                    .release(&plan.consumer_key, claimed_path, expires_at);
+                warn!(
+                    consumer = %plan.consumer_key,
+                    "dial-back refused: consumer reports no free path (duplicate leg)"
+                );
+                emit_peer_share_event(
+                    logger.as_ref(),
+                    format!(
+                        "dial-back refused for consumer={}: no free path",
+                        plan.consumer_key
+                    ),
+                );
+            }
+            Err(err) => {
+                path_claims
+                    .lock()
+                    .expect("relay path claims lock poisoned")
+                    .release(&plan.consumer_key, claimed_path, expires_at);
+                warn!(consumer = %plan.consumer_key, error = %err, "dial-back dial failed");
+                emit_peer_share_event(
+                    logger.as_ref(),
+                    format!("dial-back dial failed for consumer={}: {err}", plan.consumer_key),
+                );
+            }
         }
     }
 }
@@ -415,6 +896,12 @@ async fn run_peer_accept_loop(
     relay_stats: Arc<PeerShareRelayStats>,
     path_source: ProviderPathSource,
     config: ClientConfig,
+    // Consumer-side handoff for reversed legs (4.57): None in
+    // provider-only mode, where no browse loop exists to take the
+    // leg. `connected_peers` is the browse loop's live leg set, so
+    // a duplicate reversed leg is refused before it is accepted.
+    reversed_leg_tx: Option<tokio::sync::mpsc::UnboundedSender<ReversedLeg>>,
+    connected_peers: ConnectedPeers,
 ) {
     while let Some(incoming) = endpoint.accept().await {
         let connection = match incoming.await {
@@ -432,7 +919,7 @@ async fn run_peer_accept_loop(
         let AcceptedPeerRelay {
             transport: mut peer,
             introduction,
-        } = match accept_peer_relay(&server_key, &identity, connection).await {
+        } = match accept_peer_relay_any(&server_key, &identity, connection).await {
             Ok(peer) => peer,
             Err(err) => {
                 warn!(error = %err, "peer-share introduction verification failed");
@@ -443,6 +930,65 @@ async fn run_peer_accept_loop(
                 continue;
             }
         };
+        // Reversed leg (4.57): the provider dialed this consumer's
+        // listener, and the introduction verified as listener. This
+        // device is the consumer here, so there is no provider path
+        // to claim and no upstream to open — the transport goes to
+        // the browse loop, which turns it into a session path exactly
+        // like a forward dial it made itself. A provider-only
+        // runtime has no consumer side and rejects the leg; a
+        // duplicate (this device already holds a leg for the peer)
+        // is refused with no_path, which is the dial-back handler's
+        // stop signal.
+        if introduction.introduction.is_reverse() {
+            let provider_key = introduction
+                .introduction
+                .provider_device_public_key
+                .clone();
+            let peer_id = format!(
+                "{}:{}",
+                provider_key, introduction.introduction.provider_instance_nonce
+            );
+            let expires_at = introduction.introduction.expires_at;
+            let Some(reversed_tx) = reversed_leg_tx.as_ref() else {
+                warn!(provider = %provider_key, "reversed relay rejected: provider-only runtime has no consumer side");
+                if peer.send_text(r#"{"status":"rejected"}"#).await.is_err() {
+                    warn!(provider = %provider_key, "reversed relay reject response send failed");
+                }
+                continue;
+            };
+            if connected_peers.is_connected(&peer_id) {
+                warn!(peer = %peer_id, "reversed relay refused: duplicate leg for already-connected peer");
+                emit_peer_share_event(
+                    logger.as_ref(),
+                    format!("reversed relay refused for peer={peer_id}: duplicate leg"),
+                );
+                if peer.send_text(r#"{"status":"no_path"}"#).await.is_err() {
+                    warn!(peer = %peer_id, "reversed relay no_path response send failed");
+                }
+                continue;
+            }
+            if peer.send_text(r#"{"status":"ok"}"#).await.is_err() {
+                warn!(peer = %peer_id, "reversed relay accept response send failed");
+                continue;
+            }
+            info!(peer = %peer_id, "peer-share reversed relay accepted");
+            emit_peer_share_event(
+                logger.as_ref(),
+                format!("accepted reversed relay for peer={peer_id}"),
+            );
+            if reversed_tx
+                .send(ReversedLeg {
+                    transport: peer,
+                    peer_id,
+                    expires_at,
+                })
+                .is_err()
+            {
+                warn!("reversed relay handoff channel closed; leg dropped");
+            }
+            continue;
+        }
         let consumer_key = introduction.introduction.consumer_device_public_key.clone();
         let introduction_expires_at = introduction.introduction.expires_at;
         // Cap counts distinct consumers, not legs: one consumer
@@ -513,7 +1059,6 @@ async fn run_peer_accept_loop(
             warn!(consumer = %consumer_key, "peer-share accept response send failed");
             continue;
         }
-        let _in_flight = active_relays.fetch_add(1, Ordering::SeqCst);
         info!(
             consumer = %consumer_key,
             provider_nonce = %introduction.introduction.provider_instance_nonce,
@@ -527,132 +1072,19 @@ async fn run_peer_accept_loop(
                 consumer_key, introduction.introduction.provider_instance_nonce, claimed_index,
             ),
         );
-
-        let relay_config = config.clone();
-        let relay_logger = logger.clone();
-        let relay_claims = path_claims.clone();
-        let relay_path_source = path_source.clone();
-        let relay_count = active_relays.clone();
-        let relay_stats = relay_stats.clone();
-        // Wakeup accounting (battery profiler): one relay task per
-        // accepted leg. Counted here, not in the pump, so a leg that
-        // fails before its first pump still counts as started.
-        relay_stats
-            .relay_tasks_started
-            .fetch_add(1, Ordering::Relaxed);
-        tokio::spawn(async move {
-            let mut peer = peer;
-            // Resilience: if the upstream (provider->server) connection fails,
-            // re-establish it instead of terminating the relay permanently.
-            // The peer (consumer->provider QUIC) connection is kept alive
-            // across upstream reconnects.
-            let result = async {
-                let mut retry_delay = std::time::Duration::from_secs(1);
-                const MAX_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
-                loop {
-                    // The introduction is a short-lived credential only
-                    // the consumer can mint. Once it expires the server
-                    // rejects every re-registration, so retrying is
-                    // futile: abandon the relay instead. Dropping the
-                    // peer connection lets the consumer notice the loss
-                    // and mint a fresh introduction. (Observed
-                    // 2026-10-17: ~44 rejected re-registrations over
-                    // 15 minutes against one expired introduction.)
-                    if introduction_expired(&introduction) {
-                        anyhow::bail!(
-                            "peer relay introduction expired; abandoning relay so the consumer can re-introduce"
-                        );
-                    }
-                    // One upstream per claimed provider path: the
-                    // leg pins to its claimed path's current bind
-                    // address (re-read on every re-establishment, so
-                    // a re-addressed path is followed and a removed
-                    // path retries until it returns or the leg is
-                    // evicted consumer-side). The unpinned slot
-                    // keeps the old single-upstream behavior.
-                    let mut upstream =
-                        match establish_relay_upstream(&relay_config, &relay_path_source, claimed_index).await {
-                            Ok(upstream) => upstream,
-                            Err(e) => {
-                                tracing::warn!(error = %e, "provider: failed to establish relay upstream, retrying");
-                                tokio::time::sleep(retry_delay).await;
-                                retry_delay =
-                                    std::cmp::min(retry_delay * 2, MAX_RETRY_DELAY);
-                                continue;
-                            }
-                        };
-                    tracing::warn!("provider: sending relay registration");
-                    if let Err(e) = register_peer_relay_upstream(&mut upstream, introduction.clone()).await {
-                        tracing::warn!(error = %e, "provider: relay registration failed, retrying");
-                        tokio::time::sleep(retry_delay).await;
-                        retry_delay = std::cmp::min(retry_delay * 2, MAX_RETRY_DELAY);
-                        continue;
-                    }
-                    tracing::warn!("provider: relay registration sent");
-                    let mut limiter = PeerRelayRateLimiter::new(bandwidth_kbps);
-                    match relay_peer_frames_rate_limited(
-                        &mut peer,
-                        &mut upstream,
-                        &mut limiter,
-                        &relay_stats,
-                    )
-                    .await
-                    {
-                        Ok(()) => {
-                            // Relay completed normally (peer disconnected)
-                            return Ok(());
-                        }
-                        Err(e) => {
-                            // A dead peer must end the task (and free
-                            // its path claim) instead of looping on
-                            // upstream re-establishment until the
-                            // introduction expires: the peer QUIC
-                            // connection reports closed, while a live
-                            // peer with a dead upstream does not.
-                            if peer.connection_closed() {
-                                tracing::warn!("provider: peer connection closed, ending relay");
-                                return Ok(());
-                            }
-                            tracing::warn!(error = %e, "provider: relay upstream failed, re-establishing");
-                            tokio::time::sleep(retry_delay).await;
-                            retry_delay = std::cmp::min(retry_delay * 2, MAX_RETRY_DELAY);
-                            // Continue loop to re-establish upstream
-                        }
-                    }
-                }
-            }
-            .await;
-            relay_count.fetch_sub(1, Ordering::SeqCst);
-            // Release the path claim (a no-op when a newer leg has
-            // already taken the path over) so the path is claimable
-            // by the consumer's next dial.
-            relay_claims.lock().expect("relay path claims lock poisoned").release(
-                &consumer_key,
-                claimed_index,
-                introduction_expires_at,
-            );
-            match result {
-                Ok(()) => {
-                    emit_peer_share_event(
-                        relay_logger.as_ref(),
-                        format!("relay loop completed for consumer={consumer_key}"),
-                    );
-                }
-                Err(err) => {
-                    warn!(error = %err, consumer = %consumer_key, "peer relay terminated");
-                    emit_peer_share_event(
-                        relay_logger.as_ref(),
-                        format!("relay terminated for consumer={consumer_key}: {err}"),
-                    );
-                }
-            }
-            // Wakeup accounting (battery profiler). A task dropped
-            // mid-flight by runtime shutdown never reaches this line,
-            // so `ended` is a lower bound on started tasks.
-            relay_stats
-                .relay_tasks_ended
-                .fetch_add(1, Ordering::Relaxed);
-        });
+        tokio::spawn(run_relay_task(
+            peer,
+            introduction,
+            consumer_key,
+            claimed_index,
+            config.clone(),
+            path_source.clone(),
+            path_claims.clone(),
+            active_relays.clone(),
+            relay_stats.clone(),
+            bandwidth_kbps,
+            logger.clone(),
+        ));
     }
 }
 
@@ -860,6 +1292,43 @@ pub async fn start_peer_share_runtime(
     // always carries one; a consumer-only runtime stays at zero.
     let relay_stats = Arc::new(PeerShareRelayStats::default());
 
+    // Provider-side shared state (4.57): ONE claim set for the whole
+    // provider, shared by the forward accept loop and the dial-back
+    // handler — the (peer, path) dedup lives here, so a forward and
+    // a reversed leg for the same consumer can never hold the same
+    // provider path. `active_relays` is likewise shared by both
+    // directions' relay tasks. `connected_peers` is the browse
+    // loop's live leg set, shared with the accept loop so a
+    // duplicate reversed leg is refused before it is accepted.
+    let path_claims = Arc::new(std::sync::Mutex::new(RelayPathClaims::default()));
+    let active_relays = Arc::new(AtomicUsize::new(0));
+    let connected_peers = ConnectedPeers::default();
+
+    // Dial-back notifications (4.57): the session workers forward
+    // server-pushed notifications into this channel; the handler
+    // task below dials the consumer back. Created in all modes so
+    // the sender can be handed out unconditionally; only a provider
+    // runtime spawns the handler, so a consumer-only sender's
+    // messages are dropped (nothing ever pushes to it — a
+    // consumer-only device never asked for dial-back).
+    let (dial_back_tx, dial_back_rx) =
+        tokio::sync::mpsc::unbounded_channel::<PeerShareDialBackNotification>();
+    // Reversed legs (4.57): the accept loop hands verified reversed
+    // legs to the browse loop, which owns all leg bookkeeping. Only
+    // meaningful in Both mode (a provider-only runtime has no browse
+    // loop to take the leg; a consumer-only runtime has no accept
+    // loop to produce one).
+    let (reversed_leg_tx, reversed_leg_rx) =
+        tokio::sync::mpsc::unbounded_channel::<ReversedLeg>();
+
+    // The provider-path source falls back to the session-start
+    // config bind addresses when no live map was supplied
+    // (non-FFI clients). Computed once: the accept loop and the
+    // dial-back handler share it.
+    let provider_path_source = provider_paths.unwrap_or_else(|| {
+        ProviderPathSource::Config(config.client.path_bind_addresses.clone())
+    });
+
     // Provider side: one accept loop on the wildcard listener, owned
     // by the advertise watcher. The watcher only re-registers the
     // advertisement when the address list changes; the loop is never
@@ -872,19 +1341,19 @@ pub async fn start_peer_share_runtime(
         let accept_logger = event_logger.clone();
         let accept_max_consumers = config.client.peer_share_max_consumers.max(1) as usize;
         let accept_bandwidth_kbps = config.client.peer_share_relay_bandwidth_kbps;
-        let active_relays = Arc::new(AtomicUsize::new(0));
-        // One claim set for the whole provider (shared with the relay
-        // tasks for release on end). The provider-path source falls back
-        // to the session-start config bind addresses when no live map
-        // was supplied (non-FFI clients).
-        let path_claims = Arc::new(std::sync::Mutex::new(RelayPathClaims::default()));
-        let path_source = provider_paths.unwrap_or_else(|| {
-            ProviderPathSource::Config(config.client.path_bind_addresses.clone())
-        });
+        let path_source = provider_path_source.clone();
         let initial_ips = listener_advertise_ips.expect("provider mode requires advertise IPs");
         let initial_endpoint = listener_endpoint
             .clone()
             .expect("provider mode requires listener");
+        // A reversed leg only has somewhere to go when this runtime
+        // is also a consumer; a provider-only runtime rejects
+        // reversed introductions at the accept loop instead.
+        let accept_reversed_tx = if is_consumer {
+            Some(reversed_leg_tx)
+        } else {
+            None
+        };
         let initial_handle = tokio::spawn(run_peer_accept_loop(
             initial_endpoint,
             accept_server_key,
@@ -897,6 +1366,8 @@ pub async fn start_peer_share_runtime(
             relay_stats.clone(),
             path_source.clone(),
             config.clone(),
+            accept_reversed_tx,
+            connected_peers.clone(),
         ));
         Some(tokio::spawn(run_advertise_watcher(
             config.clone(),
@@ -908,6 +1379,36 @@ pub async fn start_peer_share_runtime(
             advertiser.expect("provider mode requires advertiser"),
             initial_handle,
         )))
+    } else {
+        None
+    };
+
+    // Dial-back handler (4.57): provider mode only. The handler
+    // owns the receiver half; the runtime struct below hands the
+    // sender half to the session workers. The handler shares the
+    // provider's claim set, relay counters, and path source with the
+    // accept loop, so its legs are deduped and accounted exactly
+    // like forward legs.
+    let dial_back_task = if is_provider {
+        Some(tokio::spawn(run_dial_back_handler(
+            dial_back_rx,
+            config.client.server_public_key.clone(),
+            device_keypair.public_key_b64.clone(),
+            config.clone(),
+            config.socket_protect.clone(),
+            peer_relay_bind_ip(config)?,
+            path_claims.clone(),
+            active_relays.clone(),
+            relay_stats.clone(),
+            provider_path_source.clone(),
+            config.client.peer_share_relay_bandwidth_kbps,
+            event_logger.clone(),
+        )))
+    } else {
+        None
+    };
+    let dial_back_tx = if is_provider {
+        Some(dial_back_tx)
     } else {
         None
     };
@@ -949,6 +1450,16 @@ pub async fn start_peer_share_runtime(
         // the re-query lands inside the 10s window the Kotlin lock
         // scheduler holds on the same clock.
         let mut last_window_minute = utc_minute(now_unix_secs());
+        // Reversed legs (4.57) only arrive when this runtime also
+        // provides (Both mode): the accept loop hands them over on
+        // this channel. A consumer-only runtime has no accept loop,
+        // so its receiver stays pending forever.
+        let mut reversed_leg_rx = if is_provider {
+            Some(reversed_leg_rx)
+        } else {
+            None
+        };
+        let browse_connected_peers = connected_peers.clone();
         Some(tokio::spawn(async move {
         let mut legs = PeerLegTracker::default();
         // Last advertisement seen per peer. mDNS resolves each service
@@ -967,6 +1478,7 @@ pub async fn start_peer_share_runtime(
                 tokio::select! {
                     Some(peer_id) = closed_peer_rx.recv() => {
                         if legs.note_close(&peer_id) {
+                            browse_connected_peers.mark_disconnected(&peer_id);
                             info!(peer = %peer_id, "peer-share path closed; allowing rediscovery");
                             emit_peer_share_event(
                                 browse_logger.as_ref(),
@@ -981,6 +1493,68 @@ pub async fn start_peer_share_runtime(
                                 remaining = legs.leg_count(&peer_id),
                                 "peer-share relay leg closed; peer still connected"
                             );
+                        }
+                        continue;
+                    }
+                    Some(leg) = async {
+                        match reversed_leg_rx.as_mut() {
+                            Some(rx) => rx.recv().await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        // A leg the provider dialed to us (4.57),
+                        // already verified and accepted by the accept
+                        // loop. It becomes a session path exactly
+                        // like a forward leg this loop dialed itself,
+                        // with the same renewal and close handling.
+                        // Dedup (second layer — the accept loop
+                        // refused duplicates first): drop the leg
+                        // when one for the peer already exists.
+                        let peer_id = leg.peer_id.clone();
+                        match note_reversed_leg(
+                            &mut legs,
+                            &browse_connected_peers,
+                            &peer_id,
+                            leg.expires_at,
+                        ) {
+                            Some(generation) => {
+                                info!(peer = %peer_id, "peer-share reversed relay leg received");
+                                emit_peer_share_event(
+                                    browse_logger.as_ref(),
+                                    format!("reversed relay leg received for peer={peer_id}"),
+                                );
+                                if peer_transport_tx
+                                    .send(ClientTransport::peer_relay(
+                                        leg.transport,
+                                        peer_id.clone(),
+                                        closed_peer_tx.clone(),
+                                        leg.expires_at,
+                                    ))
+                                    .is_err()
+                                {
+                                    // The session worker is gone;
+                                    // forget the leg we just noted.
+                                    if legs.note_close(&peer_id) {
+                                        browse_connected_peers.mark_disconnected(&peer_id);
+                                    }
+                                    break;
+                                }
+                                spawn_renewal_notice(
+                                    &renewal_tx,
+                                    peer_id.clone(),
+                                    generation,
+                                    renewal_delay(leg.expires_at, now_unix_secs()),
+                                );
+                            }
+                            None => {
+                                warn!(peer = %peer_id, "dropping duplicate reversed relay leg");
+                                emit_peer_share_event(
+                                    browse_logger.as_ref(),
+                                    format!("duplicate reversed relay leg dropped for peer={peer_id}"),
+                                );
+                                let mut transport = leg.transport;
+                                let _ = transport.close().await;
+                            }
                         }
                         continue;
                     }
@@ -1121,6 +1695,7 @@ pub async fn start_peer_share_runtime(
                         }
                         legs_dialed += 1;
                         generation = legs.note_dial(&peer_id, relay_expires_at);
+                        browse_connected_peers.mark_connected(&peer_id);
                     }
                     Ok(PeerRelayDial::NoPath) => {
                         break;
@@ -1204,6 +1779,9 @@ pub async fn start_peer_share_runtime(
     if let Some(task) = watcher_task {
         tasks.push(task);
     }
+    if let Some(task) = dial_back_task {
+        tasks.push(task);
+    }
     if let Some(task) = browse_task {
         tasks.push(task);
     }
@@ -1211,7 +1789,11 @@ pub async fn start_peer_share_runtime(
     // Endpoints are owned by their accept loops (spawned by the watcher),
     // never by the runtime struct, so pruning an endpoint actually tears
     // it down instead of lingering on a struct-kept clone.
-    Ok(PeerShareRuntime { tasks, relay_stats })
+    Ok(PeerShareRuntime {
+        tasks,
+        relay_stats,
+        dial_back_tx,
+    })
 }
 
 /// Upstream protocols for relay legs: QUIC/WebSocket only, no
@@ -1825,24 +2407,28 @@ fn build_peer_server_config(cert_der: Vec<u8>, key_der: Vec<u8>) -> quinn::Serve
 
 #[cfg(test)]
 mod tests {
-    use bonded_core::auth::verify_signature;
+    use bonded_core::auth::{sign_bytes, verify_signature};
 
     use super::{
-        advertisable_ips_from_pairs, build_peer_introduction_request, introduction_expired,
-        is_cellular_interface_name, is_tunnel_interface, peer_share_peer_id,
-        prefer_path_subnet_candidate, renewal_delay, resolve_advertise_ips,
-        select_advertise_ip, select_advertise_ip_for_binds, should_accept_discovered_peer,
-        DialBackParams, PeerLegTracker, RedialQueue, RelayPathClaims,
-        PEER_REDISCOVERY_MAX_ATTEMPTS, PEER_RELAY_RENEWAL_LEAD_SECS,
-        PEER_RELAY_RENEWAL_MIN_DELAY,
+        advertisable_ips_from_pairs, build_peer_introduction_request, forward_dial_back_frame,
+        introduction_expired, is_cellular_interface_name, is_tunnel_interface,
+        note_reversed_leg, peer_share_peer_id, plan_dial_back, prefer_path_subnet_candidate,
+        renewal_delay, resolve_advertise_ips, select_advertise_ip, select_advertise_ip_for_binds,
+        should_accept_discovered_peer, ConnectedPeers, DialBackParams, PeerLegTracker,
+        RedialQueue, RelayPathClaims, PEER_REDISCOVERY_MAX_ATTEMPTS,
+        PEER_RELAY_RENEWAL_LEAD_SECS, PEER_RELAY_RENEWAL_MIN_DELAY,
     };
     use bonded_core::auth::DeviceKeypair;
     use bonded_core::config::{ClientConfig, PeerShareMode};
     use bonded_core::peer_share::{
-        PeerShareAdvertisement, PeerShareIntroductionRequest, SignedPeerShareIntroduction,
+        PeerShareAdvertisement, PeerShareDialBackNotification, PeerShareIntroductionClaims,
+        PeerShareIntroductionRequest, SignedPeerShareIntroduction,
     };
+    use bonded_core::session::{SessionFrame, SessionHeader, FLAG_PEER_DIAL_BACK};
+    use bytes::Bytes;
     use pnet_datalink::NetworkInterface;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn leg_tracker_counts_overlapping_legs_per_peer() {
@@ -2390,5 +2976,368 @@ mod tests {
             select_advertise_ip_for_binds(&[], &candidates),
             Some(IpAddr::V4(Ipv4Addr::new(10, 8, 0, 2)))
         );
+    }
+
+    fn now_plus(offset_secs: u64) -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("current time should be after unix epoch")
+            .as_secs()
+            .saturating_add(offset_secs)
+    }
+
+    fn sign_introduction(
+        server: &DeviceKeypair,
+        claims: PeerShareIntroductionClaims,
+    ) -> SignedPeerShareIntroduction {
+        let server_signature = sign_bytes(
+            server,
+            &claims.signing_payload().expect("claims should serialize"),
+        )
+        .expect("server should sign claims");
+        SignedPeerShareIntroduction {
+            introduction: claims,
+            server_signature,
+        }
+    }
+
+    fn dial_back_notification(
+        server: &DeviceKeypair,
+        consumer_key: &str,
+        provider_key: &str,
+        expires_at: u64,
+    ) -> PeerShareDialBackNotification {
+        let claims = PeerShareIntroductionClaims {
+            consumer_device_public_key: consumer_key.to_owned(),
+            provider_device_public_key: provider_key.to_owned(),
+            provider_instance_nonce: "nonce-1".to_owned(),
+            provider_endpoint: "192.168.1.20:54443".to_owned(),
+            listener_transport: "quic".to_owned(),
+            listener_cert_fingerprint: "sha256:consumer-listener".to_owned(),
+            expires_at,
+            direction: "reverse".to_owned(),
+            consumer_endpoints: vec!["192.168.43.10:54443".to_owned()],
+        };
+        PeerShareDialBackNotification {
+            consumer_device_public_key: consumer_key.to_owned(),
+            consumer_endpoints: vec!["192.168.43.10:54443".to_owned()],
+            introduction: sign_introduction(server, claims),
+        }
+    }
+
+    #[test]
+    fn dial_back_plan_claims_single_path_for_reversed_leg() {
+        // The hotspot case: the provider has one path, the consumer
+        // cannot dial it, and the server pushes a dial-back. The
+        // plan verifies, parses the consumer endpoint, and claims
+        // the provider's only path for the reversed leg.
+        let server = DeviceKeypair::generate();
+        let provider = DeviceKeypair::generate();
+        let consumer = DeviceKeypair::generate();
+        let expires_at = now_plus(300);
+        let notification = dial_back_notification(
+            &server,
+            &consumer.public_key_b64,
+            &provider.public_key_b64,
+            expires_at,
+        );
+        let mut claims = RelayPathClaims::default();
+        let plan = plan_dial_back(
+            &server.public_key_b64,
+            &provider.public_key_b64,
+            &notification,
+            &mut claims,
+            &[0],
+        )
+        .expect("dial-back plan should succeed");
+        assert_eq!(plan.consumer_key, consumer.public_key_b64);
+        assert_eq!(plan.claimed_path, 0);
+        assert_eq!(plan.expires_at, expires_at);
+        assert_eq!(
+            plan.endpoints,
+            vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 43, 10)), 54443)]
+        );
+    }
+
+    #[test]
+    fn dial_back_plan_drops_duplicate_leg_for_same_peer_and_path() {
+        // Both sides initiating for the same (peer, path) yields
+        // exactly one leg: a forward leg already holds the only
+        // provider path for this consumer at the same introduction
+        // expiry, so the reversed plan is dropped instead of
+        // dialing a duplicate leg for that path.
+        let server = DeviceKeypair::generate();
+        let provider = DeviceKeypair::generate();
+        let consumer = DeviceKeypair::generate();
+        let expires_at = now_plus(300);
+        let notification = dial_back_notification(
+            &server,
+            &consumer.public_key_b64,
+            &provider.public_key_b64,
+            expires_at,
+        );
+        let mut claims = RelayPathClaims::default();
+        let claimed = claims.claim(&consumer.public_key_b64, &[0], expires_at);
+        assert_eq!(claimed, Some(0));
+        let error = plan_dial_back(
+            &server.public_key_b64,
+            &provider.public_key_b64,
+            &notification,
+            &mut claims,
+            &[0],
+        )
+        .expect_err("reversed plan should drop when the path is held");
+        assert!(error.to_string().contains("no free provider path"));
+    }
+
+    #[test]
+    fn dial_back_plan_claims_second_path_when_first_is_held() {
+        // Two provider paths, one already held by a forward leg:
+        // the reversed leg is complementary, not a duplicate — it
+        // claims the free path, so the pair converges to full path
+        // coverage instead of dropping the leg.
+        let server = DeviceKeypair::generate();
+        let provider = DeviceKeypair::generate();
+        let consumer = DeviceKeypair::generate();
+        let expires_at = now_plus(300);
+        let notification = dial_back_notification(
+            &server,
+            &consumer.public_key_b64,
+            &provider.public_key_b64,
+            expires_at,
+        );
+        let mut claims = RelayPathClaims::default();
+        assert_eq!(
+            claims.claim(&consumer.public_key_b64, &[0, 1], expires_at),
+            Some(0)
+        );
+        let plan = plan_dial_back(
+            &server.public_key_b64,
+            &provider.public_key_b64,
+            &notification,
+            &mut claims,
+            &[0, 1],
+        )
+        .expect("reversed plan should claim the free path");
+        assert_eq!(plan.claimed_path, 1);
+    }
+
+    #[test]
+    fn dial_back_plan_newer_generation_takes_over_path() {
+        // The takeover rule still holds across directions: a
+        // reversed leg from a NEWER introduction generation takes
+        // over a path held by an older forward leg (the old leg
+        // keeps its upstream until it expires; its release is a
+        // no-op because the expiry no longer matches).
+        let server = DeviceKeypair::generate();
+        let provider = DeviceKeypair::generate();
+        let consumer = DeviceKeypair::generate();
+        let mut claims = RelayPathClaims::default();
+        assert_eq!(
+            claims.claim(&consumer.public_key_b64, &[0], now_plus(300)),
+            Some(0)
+        );
+        let notification = dial_back_notification(
+            &server,
+            &consumer.public_key_b64,
+            &provider.public_key_b64,
+            now_plus(600),
+        );
+        let plan = plan_dial_back(
+            &server.public_key_b64,
+            &provider.public_key_b64,
+            &notification,
+            &mut claims,
+            &[0],
+        )
+        .expect("newer generation should take the path over");
+        assert_eq!(plan.claimed_path, 0);
+    }
+
+    #[test]
+    fn dial_back_plan_rejects_forward_introduction() {
+        // A forward introduction must never produce a dial-back
+        // plan: the direction check runs before any claim or dial.
+        let server = DeviceKeypair::generate();
+        let provider = DeviceKeypair::generate();
+        let consumer = DeviceKeypair::generate();
+        let claims = PeerShareIntroductionClaims {
+            consumer_device_public_key: consumer.public_key_b64.clone(),
+            provider_device_public_key: provider.public_key_b64.clone(),
+            provider_instance_nonce: "nonce-1".to_owned(),
+            provider_endpoint: "192.168.1.20:54443".to_owned(),
+            listener_transport: "quic".to_owned(),
+            listener_cert_fingerprint: "sha256:consumer-listener".to_owned(),
+            expires_at: now_plus(300),
+            direction: "forward".to_owned(),
+            consumer_endpoints: Vec::new(),
+        };
+        let notification = PeerShareDialBackNotification {
+            consumer_device_public_key: consumer.public_key_b64.clone(),
+            consumer_endpoints: vec!["192.168.43.10:54443".to_owned()],
+            introduction: sign_introduction(&server, claims),
+        };
+        let mut path_claims = RelayPathClaims::default();
+        let error = plan_dial_back(
+            &server.public_key_b64,
+            &provider.public_key_b64,
+            &notification,
+            &mut path_claims,
+            &[0],
+        )
+        .expect_err("forward introduction should fail dial-back planning");
+        assert!(error.to_string().contains("not reversed"));
+        // And no path was claimed for it.
+        assert_eq!(
+            path_claims.claim(&consumer.public_key_b64, &[0], now_plus(300)),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn dial_back_plan_rejects_unparseable_endpoints() {
+        // A reversed introduction whose consumer endpoints do not
+        // parse to socket addresses is undiallable: drop it before
+        // claiming a path, so the claim is never wasted. (The bad
+        // endpoints are signed in, not mutated after signing —
+        // mutating signed claims fails the signature check first.)
+        let server = DeviceKeypair::generate();
+        let provider = DeviceKeypair::generate();
+        let consumer = DeviceKeypair::generate();
+        let claims = PeerShareIntroductionClaims {
+            consumer_device_public_key: consumer.public_key_b64.clone(),
+            provider_device_public_key: provider.public_key_b64.clone(),
+            provider_instance_nonce: "nonce-1".to_owned(),
+            provider_endpoint: "192.168.1.20:54443".to_owned(),
+            listener_transport: "quic".to_owned(),
+            listener_cert_fingerprint: "sha256:consumer-listener".to_owned(),
+            expires_at: now_plus(300),
+            direction: "reverse".to_owned(),
+            consumer_endpoints: vec!["not-an-address".to_owned()],
+        };
+        let notification = PeerShareDialBackNotification {
+            consumer_device_public_key: consumer.public_key_b64.clone(),
+            consumer_endpoints: vec!["not-an-address".to_owned()],
+            introduction: sign_introduction(&server, claims),
+        };
+        let mut path_claims = RelayPathClaims::default();
+        let error = plan_dial_back(
+            &server.public_key_b64,
+            &provider.public_key_b64,
+            &notification,
+            &mut path_claims,
+            &[0],
+        )
+        .expect_err("undiallable endpoints should fail dial-back planning");
+        assert!(error.to_string().contains("no dialable consumer endpoint"));
+    }
+
+    #[test]
+    fn reversed_leg_accepted_when_peer_not_connected() {
+        // The hotspot case at the consumer layer: no forward leg
+        // exists for the peer, so the reversed leg is recorded and
+        // its renewal generation returned.
+        let mut legs = PeerLegTracker::default();
+        let connected = ConnectedPeers::default();
+        let generation = note_reversed_leg(&mut legs, &connected, "peer-a:nonce-1", 1_000)
+            .expect("reversed leg should be accepted");
+        assert_eq!(generation, 1);
+        assert!(legs.is_connected("peer-a:nonce-1"));
+        assert!(connected.is_connected("peer-a:nonce-1"));
+    }
+
+    #[test]
+    fn reversed_leg_dropped_when_peer_already_connected() {
+        // Both sides initiating for the same peer: the consumer
+        // already holds a forward leg, so the reversed leg is a
+        // duplicate and is dropped (the accept loop refuses it
+        // first with no_path; this is the browse loop's backstop
+        // for the race where the forward leg lands between the
+        // accept check and the handoff).
+        let mut legs = PeerLegTracker::default();
+        let connected = ConnectedPeers::default();
+        legs.note_dial("peer-a:nonce-1", 1_000);
+        connected.mark_connected("peer-a:nonce-1");
+        assert_eq!(
+            note_reversed_leg(&mut legs, &connected, "peer-a:nonce-1", 1_000),
+            None
+        );
+        assert_eq!(legs.leg_count("peer-a:nonce-1"), 1);
+    }
+
+    #[test]
+    fn reversed_leg_accepted_again_after_last_leg_closes() {
+        // Once the last leg for a peer closes, a reversed leg for
+        // the same peer is a fresh leg, not a duplicate.
+        let mut legs = PeerLegTracker::default();
+        let connected = ConnectedPeers::default();
+        assert!(note_reversed_leg(&mut legs, &connected, "peer-a:nonce-1", 1_000).is_some());
+        assert!(legs.note_close("peer-a:nonce-1"));
+        connected.mark_disconnected("peer-a:nonce-1");
+        assert!(note_reversed_leg(&mut legs, &connected, "peer-a:nonce-1", 1_300).is_some());
+        assert!(legs.is_connected("peer-a:nonce-1"));
+    }
+
+    #[test]
+    fn dial_back_frame_intercepted_before_data_path() {
+        // The session workers call forward_dial_back_frame on every
+        // inbound frame before the PONG check and the data path:
+        // a dial-back frame is forwarded to the handler (the
+        // notification round-trips through the channel), a data
+        // frame is untouched, and a frame with the wrong flag is
+        // untouched.
+        let server = DeviceKeypair::generate();
+        let provider = DeviceKeypair::generate();
+        let consumer = DeviceKeypair::generate();
+        let notification = dial_back_notification(
+            &server,
+            &consumer.public_key_b64,
+            &provider.public_key_b64,
+            now_plus(300),
+        );
+        let frame = notification
+            .clone()
+            .into_control_frame()
+            .expect("notification should serialize");
+        // The control frame's header is rewritten by the server push
+        // (session connection id + sequence u64::MAX); the helper
+        // only reads the flag, so rebuild it as the push sends it.
+        let pushed = SessionFrame {
+            header: SessionHeader {
+                connection_id: 7,
+                sequence: u64::MAX,
+                flags: FLAG_PEER_DIAL_BACK,
+            },
+            payload: frame.payload,
+        };
+        let (tx, mut rx) =
+            tokio::sync::mpsc::unbounded_channel::<PeerShareDialBackNotification>();
+        assert!(forward_dial_back_frame(&pushed, &Some(tx)));
+        let received = rx.try_recv().expect("notification should be forwarded");
+        assert_eq!(received, notification);
+
+        // A plain data frame passes through untouched.
+        let data = SessionFrame {
+            header: SessionHeader {
+                connection_id: 7,
+                sequence: 1,
+                flags: 0,
+            },
+            payload: Bytes::from_static(b"not a notification"),
+        };
+        assert!(!forward_dial_back_frame(&data, &None));
+        assert!(rx.try_recv().is_err());
+
+        // A dial-back flag with an unparseable payload is still
+        // intercepted (dropped, never fed to the data path).
+        let garbage = SessionFrame {
+            header: SessionHeader {
+                connection_id: 7,
+                sequence: u64::MAX,
+                flags: FLAG_PEER_DIAL_BACK,
+            },
+            payload: Bytes::from_static(b"{not json"),
+        };
+        assert!(forward_dial_back_frame(&garbage, &None));
     }
 }
