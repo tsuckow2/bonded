@@ -33,8 +33,7 @@ use std::os::fd::FromRawFd;
 use std::path::PathBuf;
 use std::slice;
 #[cfg(any(target_os = "android", test))]
-use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(any(target_os = "android", test))]
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 #[cfg(any(target_os = "android", test))]
 use std::thread::{self, JoinHandle};
@@ -978,6 +977,12 @@ enum PathControl {
         bind_addresses: Vec<String>,
         cellular_bind_addresses: Vec<String>,
     },
+    /// Display interactivity (screen on/off) from the platform
+    /// layer (4.58): the worker combines it with the traffic idle
+    /// state into the peer-runtime pacing flag. No path is touched;
+    /// this only paces the peer-share browse/advertise loops.
+    /// `interactive = true` means the screen is on.
+    DisplayInteractive { interactive: bool },
 }
 
 /// Demote paused paths to the end of an already mode-ordered
@@ -1629,6 +1634,16 @@ fn start_android_session(
             ));
             let (peer_transport_tx, mut peer_transport_rx) = tokio::sync::mpsc::unbounded_channel();
             let _peer_transport_hold = peer_transport_tx.clone();
+            // Peer-share idle pacing (4.58): the browse loop and the
+            // advertise watcher slow down while the session is idle
+            // with the screen off. The worker owns the flag and
+            // refreshes it from the traffic idle state (heartbeat
+            // tick) and the display state the platform layer pushes
+            // (`PathControl::DisplayInteractive`); the peer runtime
+            // only reads it. Created here, ahead of the peer runtime
+            // start, so the runtime can share it.
+            let peer_pacing_idle = Arc::new(AtomicBool::new(false));
+            let mut display_interactive = true;
             let _peer_share_runtime = if config.client.peer_share_enabled {
                 let peer_snapshot = Arc::clone(&worker_snapshot);
                 let peer_logger = Arc::new(move |message: String| {
@@ -1651,6 +1666,7 @@ fn start_android_session(
                     peer_transport_tx,
                     Some(peer_logger),
                     Some(peer_runtime::ProviderPathSource::Live(path_addresses.clone())),
+                    Some(peer_pacing_idle.clone()),
                 )
                 .await {
                     Ok(runtime) => {
@@ -1979,6 +1995,26 @@ fn start_android_session(
                                     "Worker: path {} {}",
                                     path_index,
                                     if paused { "paused" } else { "resumed" }
+                                );
+                            }
+                            Some(PathControl::DisplayInteractive { interactive }) => {
+                                // Peer-share idle pacing (4.58): the
+                                // flag flips now, not on the next
+                                // heartbeat tick, so a screen-on
+                                // restores full discovery cadence
+                                // immediately.
+                                display_interactive = interactive;
+                                let idle_now = is_idle(
+                                    last_traffic,
+                                    last_transport_change,
+                                    Instant::now(),
+                                );
+                                peer_pacing_idle.store(
+                                    !interactive && idle_now,
+                                    Ordering::Relaxed,
+                                );
+                                alog_info!(
+                                    "Worker: display interactive={interactive}"
                                 );
                             }
                             Some(PathControl::Reset { path_index }) => {
@@ -2880,6 +2916,15 @@ fn start_android_session(
                                 period.as_secs()
                             );
                         }
+                        // Peer-share idle pacing (4.58): refresh on
+                        // every tick so the flag tracks the traffic
+                        // idle state as well as display changes
+                        // (which flip it immediately in the control
+                        // arm above).
+                        peer_pacing_idle.store(
+                            !display_interactive && idle_now,
+                            Ordering::Relaxed,
+                        );
                         // Battery saver: re-evaluate cellular parking
                         // on every tick. Path liveness changes between
                         // ticks, so this also clears parking when
@@ -3700,6 +3745,35 @@ pub extern "system" fn Java_com_bonded_bonded_1app_BondedVpnService_nativePauseP
                 .send(PathControl::Pause {
                     path_index: path_index as usize,
                     paused: paused != 0,
+                })
+                .is_ok()
+        })
+        .unwrap_or(false) as jni::sys::jboolean
+}
+
+/// Display interactivity (screen on/off) from the platform layer
+/// (4.58): feeds `PathControl::DisplayInteractive` to the running
+/// worker, which combines it with the traffic idle state into the
+/// peer-runtime pacing flag. Returns false when no session is
+/// running (the caller re-pushes the current state at session
+/// start). A missed update only costs pacing precision, never
+/// connectivity.
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_bonded_bonded_1app_BondedVpnService_nativeSetDisplayInteractive(
+    _env: jni::JNIEnv,
+    _obj: jni::objects::JObject,
+    interactive: jni::sys::jboolean,
+) -> jni::sys::jboolean {
+    android_session_slot()
+        .lock()
+        .expect("android session slot lock poisoned")
+        .as_ref()
+        .map(|handle| {
+            handle
+                .path_control_tx
+                .send(PathControl::DisplayInteractive {
+                    interactive: interactive != 0,
                 })
                 .is_ok()
         })

@@ -59,6 +59,15 @@ fn backoff_delay(failed_attempts: u32) -> Duration {
     }
 }
 
+/// Cooldown after a bind PONG timeout (4.58): the dial succeeded
+/// — the server authenticated us — but the first session frame
+/// never arrived (the server logs "failed to receive initial
+/// session frame"). Re-dialing such a path on the 60 s backoff cap
+/// just burns battery on QUIC handshakes that die the same way
+/// (88 overnight on one bench phone, ~15-20/hr); the path waits
+/// 10 minutes before its next attempt instead.
+const BIND_TIMEOUT_COOLDOWN: Duration = Duration::from_secs(600);
+
 /// What the supervisor hands back to the worker loop.
 pub enum RedialOutcome {
     /// The path was re-dialed and bound to the live session; insert
@@ -98,6 +107,11 @@ enum PathStatus {
     Missing {
         failed_attempts: u32,
         next_due: Instant,
+        /// True while the path waits out a bind-timeout cooldown
+        /// (`BIND_TIMEOUT_COOLDOWN`) rather than the ordinary
+        /// backoff. Only a cooldown is reset by a path-set change;
+        /// an ordinary backoff keeps its schedule.
+        cooling_down: bool,
     },
 }
 
@@ -124,6 +138,7 @@ impl PathSupervisorState {
                     PathStatus::Missing {
                         failed_attempts: 0,
                         next_due: now + INITIAL_MISSING_DELAY,
+                        cooling_down: false,
                     }
                 },
             );
@@ -139,6 +154,7 @@ impl PathSupervisorState {
                 *status = PathStatus::Missing {
                     failed_attempts: 0,
                     next_due: now + FIRST_RETRY_DELAY,
+                    cooling_down: false,
                 };
             }
         }
@@ -164,9 +180,11 @@ impl PathSupervisorState {
             Some(PathStatus::Missing {
                 failed_attempts,
                 next_due,
+                cooling_down,
             }) => {
                 *failed_attempts = 0;
                 *next_due = now;
+                *cooling_down = false;
             }
             Some(PathStatus::Present) => {}
             None => {
@@ -175,6 +193,7 @@ impl PathSupervisorState {
                     PathStatus::Missing {
                         failed_attempts: 0,
                         next_due: now,
+                        cooling_down: false,
                     },
                 );
             }
@@ -200,13 +219,62 @@ impl PathSupervisorState {
             Some(PathStatus::Missing {
                 failed_attempts,
                 next_due,
+                cooling_down,
             }) => {
                 *failed_attempts += 1;
                 let delay = backoff_delay(*failed_attempts);
                 *next_due = now + delay;
+                *cooling_down = false;
                 delay
             }
             _ => Duration::ZERO,
+        }
+    }
+
+    /// Record a bind PONG timeout (the dial succeeded but the first
+    /// session frame never arrived); returns the cooldown until the
+    /// next attempt. Unlike the ordinary backoff this is 10 minutes
+    /// (`BIND_TIMEOUT_COOLDOWN`): the failure is a property of the
+    /// path, not of the moment, and re-dialing it promptly only
+    /// repeats a handshake that dies the same way. The failure
+    /// count still increments, so a later ordinary failure backs
+    /// off from where the count stands.
+    pub fn note_bind_timeout(&mut self, path: usize, now: Instant) -> Duration {
+        match self.paths.get_mut(&path) {
+            Some(PathStatus::Missing {
+                failed_attempts,
+                next_due,
+                cooling_down,
+            }) => {
+                *failed_attempts += 1;
+                *next_due = now + BIND_TIMEOUT_COOLDOWN;
+                *cooling_down = true;
+                BIND_TIMEOUT_COOLDOWN
+            }
+            _ => Duration::ZERO,
+        }
+    }
+
+    /// A path-set change invalidates the evidence behind every
+    /// bind-timeout cooldown: the network may have changed under a
+    /// path that was cooling down, so each cooling path becomes due
+    /// now with its failure count reset (exactly as `note_added`
+    /// does for a newly appeared path). Paths in an ordinary
+    /// backoff keep their schedule — only the cooldown resets.
+    pub fn reset_cooldowns(&mut self, now: Instant) {
+        for status in self.paths.values_mut() {
+            if let PathStatus::Missing {
+                failed_attempts,
+                next_due,
+                cooling_down,
+            } = status
+            {
+                if *cooling_down {
+                    *failed_attempts = 0;
+                    *next_due = now;
+                    *cooling_down = false;
+                }
+            }
         }
     }
 
@@ -298,6 +366,11 @@ enum AttemptResult {
         bind_address: Option<String>,
     },
     Failed(String),
+    /// The bind PONG timed out: the dial succeeded (the server
+    /// authenticated us) but the first session frame never arrived.
+    /// The supervisor cools this path down for
+    /// `BIND_TIMEOUT_COOLDOWN` instead of the ordinary backoff.
+    BindTimedOut(String),
     SessionDead(String),
 }
 
@@ -305,6 +378,13 @@ enum BindFailure {
     /// The PONG named a different session: the server replaced the
     /// session wholesale.
     SessionReplaced(u32),
+    /// The binding PONG never arrived within `BIND_TIMEOUT`: the
+    /// dial succeeded but the first session frame never completed
+    /// — the server logs this as "failed to receive initial
+    /// session frame". Kept distinct from `Retryable` so the
+    /// supervisor can cool the path down instead of re-dialing on
+    /// the ordinary backoff.
+    BindTimedOut,
     Retryable(String),
 }
 
@@ -339,7 +419,7 @@ async fn bind_redialed_transport(
             frame.header.flags
         ))),
         Ok(Err(err)) => Err(BindFailure::Retryable(format!("bind recv failed: {err}"))),
-        Err(_) => Err(BindFailure::Retryable("bind timed out".to_owned())),
+        Err(_) => Err(BindFailure::BindTimedOut),
     }
 }
 
@@ -388,6 +468,10 @@ async fn attempt_redial(
             AttemptResult::SessionDead(format!(
                 "re-dialed path {path_index} bound to session {other}, expected {session_id}; the server replaced the session"
             ))
+        }
+        Err(BindFailure::BindTimedOut) => {
+            let _ = transport.close().await;
+            AttemptResult::BindTimedOut("bind timed out".to_owned())
         }
         Err(BindFailure::Retryable(reason)) => {
             let _ = transport.close().await;
@@ -453,6 +537,12 @@ pub fn spawn_path_supervisor(
                             for path in added {
                                 state.note_added(path, now);
                             }
+                            // The set changed under paths that were
+                            // not added or removed: a network change
+                            // invalidates their bind-timeout
+                            // cooldowns too (ordinary backoffs are
+                            // untouched).
+                            state.reset_cooldowns(now);
                             // Loop back: wakeup is recomputed, so a
                             // newly added path (due now) dials
                             // without waiting out a stale sleep.
@@ -503,6 +593,25 @@ pub fn spawn_path_supervisor(
                                     );
                                     log(format!(
                                         "path {path} re-dial failed ({reason}); next attempt in {}s",
+                                        delay.as_secs()
+                                    ));
+                                }
+                            }
+                            AttemptResult::BindTimedOut(reason) => {
+                                // The dial succeeded but the first
+                                // session frame never arrived: cool
+                                // the path down for 10 minutes
+                                // instead of the ordinary backoff.
+                                // A path removed while its dial was
+                                // in flight is no longer in state;
+                                // don't log a phantom cooldown.
+                                if state.contains(path) {
+                                    let delay = state.note_bind_timeout(
+                                        path,
+                                        Instant::now(),
+                                    );
+                                    log(format!(
+                                        "path {path} re-dial failed ({reason}); bind timeout, cooling down for {}s",
                                         delay.as_secs()
                                     ));
                                 }
@@ -582,6 +691,64 @@ mod tests {
             at += delay;
             assert_eq!(state.next_wakeup(), Some(at));
         }
+    }
+
+    #[test]
+    fn bind_timeout_cools_down_for_ten_minutes() {
+        let now = t0();
+        let mut state = PathSupervisorState::new(&[0], &[], now);
+        let delay = state.note_bind_timeout(0, now + INITIAL_MISSING_DELAY);
+        assert_eq!(delay, BIND_TIMEOUT_COOLDOWN);
+        assert_eq!(delay, Duration::from_secs(600));
+        // Not due at the ordinary 60 s backoff cap, nor at 599 s.
+        assert!(state
+            .due_paths(now + INITIAL_MISSING_DELAY + Duration::from_secs(60))
+            .is_empty());
+        assert!(state
+            .due_paths(now + INITIAL_MISSING_DELAY + Duration::from_secs(599))
+            .is_empty());
+        assert_eq!(
+            state.due_paths(now + INITIAL_MISSING_DELAY + BIND_TIMEOUT_COOLDOWN),
+            vec![0]
+        );
+        assert_eq!(
+            state.next_wakeup(),
+            Some(now + INITIAL_MISSING_DELAY + BIND_TIMEOUT_COOLDOWN)
+        );
+    }
+
+    #[test]
+    fn path_set_change_resets_bind_cooldown_only() {
+        let now = t0();
+        let mut state = PathSupervisorState::new(&[0, 1], &[], now);
+        let at = now + INITIAL_MISSING_DELAY;
+        // Path 0 cools down after a bind timeout; path 1 sits in an
+        // ordinary backoff after a dial failure.
+        state.note_bind_timeout(0, at);
+        let backoff = state.note_attempt_failed(1, at);
+        assert_eq!(backoff, Duration::from_secs(10));
+        // A path-set change resets the cooldown to due now, and the
+        // failure count with it (so the next ordinary failure backs
+        // off from 10 s, not from the cooldown's count).
+        state.reset_cooldowns(at);
+        assert_eq!(state.due_paths(at), vec![0]);
+        assert_eq!(state.next_wakeup(), Some(at));
+        let next = state.note_attempt_failed(0, at);
+        assert_eq!(next, Duration::from_secs(10));
+        // The ordinary backoff on path 1 is untouched: still due
+        // 10 s after the failure, not now.
+        assert!(state.due_paths(at).is_empty());
+        assert_eq!(state.next_wakeup(), Some(at + Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn added_path_resets_bind_cooldown() {
+        let now = t0();
+        let mut state = PathSupervisorState::new(&[0], &[], now);
+        state.note_bind_timeout(0, now + INITIAL_MISSING_DELAY);
+        assert!(state.due_paths(now + Duration::from_secs(60)).is_empty());
+        state.note_added(0, now + Duration::from_secs(60));
+        assert_eq!(state.due_paths(now + Duration::from_secs(60)), vec![0]);
     }
 
     #[test]

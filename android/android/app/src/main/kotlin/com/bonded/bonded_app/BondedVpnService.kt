@@ -3,8 +3,10 @@ package com.bonded.bonded_app
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
@@ -12,6 +14,7 @@ import android.net.VpnService
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.ParcelFileDescriptor
+import android.os.PowerManager
 import android.os.SystemClock
 import androidx.annotation.Keep
 import androidx.core.app.NotificationCompat
@@ -234,11 +237,45 @@ class BondedVpnService : VpnService() {
 
     @Volatile private var shutdownInProgress = false
 
+    // Display interactivity for native idle pacing (4.58): the
+    // peer-share browse/advertise loops slow down while the session
+    // is idle with the screen off. ACTION_SCREEN_ON/OFF are not
+    // delivered to manifest receivers, so this is registered on the
+    // running service; the current state is pushed at every session
+    // start from PowerManager. A missed push only costs pacing
+    // precision, never connectivity.
+    private val displayReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            when (intent?.action) {
+                Intent.ACTION_SCREEN_ON -> pushDisplayInteractive(true)
+                Intent.ACTION_SCREEN_OFF -> pushDisplayInteractive(false)
+            }
+        }
+    }
+
+    private fun pushDisplayInteractive(interactive: Boolean) {
+        try {
+            nativeSetDisplayInteractive(interactive)
+        } catch (_: UnsatisfiedLinkError) {
+        }
+    }
+
     override fun onCreate() {
         super.onCreate()
         activeInstance = this
         if (batteryProfiler == null) {
             batteryProfiler = BatteryProfiler(applicationContext)
+        }
+        val displayFilter = IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_ON)
+            addAction(Intent.ACTION_SCREEN_OFF)
+        }
+        // API 33+ requires the export flag on a dynamic receiver;
+        // the screen broadcasts are system-only, so not-exported.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(displayReceiver, displayFilter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            registerReceiver(displayReceiver, displayFilter)
         }
     }
 
@@ -457,6 +494,10 @@ class BondedVpnService : VpnService() {
     override fun onDestroy() {
         if (activeInstance === this) {
             activeInstance = null
+        }
+        try {
+            unregisterReceiver(displayReceiver)
+        } catch (_: IllegalArgumentException) {
         }
         shutdownVpnNow()
         super.onDestroy()
@@ -797,6 +838,20 @@ class BondedVpnService : VpnService() {
         sessionMonitorThread =
                 thread(name = "bonded-session-monitor", start = true) {
                     var monitorTick = 0L
+                    // Idle detection for the background cadence
+                    // (4.58): traffic is the snapshot's inbound +
+                    // outbound bytes; the screen state comes from
+                    // PowerManager, read once here (the service
+                    // outlives the monitor thread). While idle with
+                    // the screen off the monitor sleeps 60 s instead
+                    // of 30 s — the battery profiler samples on this
+                    // tick, so its sample rate halves in that state
+                    // (accepted: the profiler's idle segmentation
+                    // already treats 60 s as the idle threshold).
+                    val powerManager =
+                            getSystemService(Context.POWER_SERVICE) as? PowerManager
+                    var lastTrafficBytes = -1L
+                    var lastTrafficAtMs = monitorStartedAtMs
                     while (sessionMonitorRunning) {
                         val snapshot = getNativeSessionSnapshot()
                         if (snapshot != null) {
@@ -816,6 +871,12 @@ class BondedVpnService : VpnService() {
                                         "Native snapshot: state=${snapshot.state}, outbound=${snapshot.outboundPackets}/${snapshot.outboundBytes}B, inbound=${snapshot.inboundPackets}/${snapshot.inboundBytes}B, lastError=${snapshot.lastError}",
                                 )
                             }
+                            val trafficBytes =
+                                    snapshot.inboundBytes + snapshot.outboundBytes
+                            if (trafficBytes != lastTrafficBytes) {
+                                lastTrafficBytes = trafficBytes
+                                lastTrafficAtMs = SystemClock.elapsedRealtime()
+                            }
                         }
 
                         // Adaptive poll (battery): the snapshot is only
@@ -829,11 +890,22 @@ class BondedVpnService : VpnService() {
                         // up to 30 s late in the background, which is
                         // acceptable when nobody is watching. The
                         // data plane is independent of this thread.
+                        // Idle with the screen off (4.58): 60 s —
+                        // the first minute after start is still fast
+                        // (uiActive covers it), and a screen-on or
+                        // traffic restores the faster cadence on the
+                        // next tick.
                         val nowMs = SystemClock.elapsedRealtime()
                         val uiActive = nowMs - lastUiStatusRequestMs < 5_000 ||
                                 nowMs - monitorStartedAtMs < 60_000
+                        val screenOn = powerManager?.isInteractive ?: true
+                        val idle = !screenOn && nowMs - lastTrafficAtMs >= 60_000
                         try {
-                            Thread.sleep(if (uiActive) 1_000 else 30_000)
+                            Thread.sleep(
+                                    if (uiActive) 1_000
+                                    else if (idle) 60_000
+                                    else 30_000
+                            )
                         } catch (_: InterruptedException) {
                             return@thread
                         }
@@ -1147,6 +1219,8 @@ class BondedVpnService : VpnService() {
 
     private external fun nativeResetPath(pathIndex: Int): Boolean
 
+    private external fun nativeSetDisplayInteractive(interactive: Boolean): Boolean
+
     private external fun nativeUpdatePaths(
             bindAddressesJson: String,
             cellularBindAddressesJson: String,
@@ -1323,6 +1397,13 @@ class BondedVpnService : VpnService() {
             android.util.Log.i("BondedVPN", "nativeStartSession returned: $started")
             if (started) {
                 lastNetworkBindingSignature = bindAddressesJson
+                // Idle pacing (4.58): the screen receiver only fires
+                // on changes, so push the current state now — a
+                // session (re)started with the screen already off
+                // must pace from the first tick.
+                val powerManager =
+                        getSystemService(Context.POWER_SERVICE) as? PowerManager
+                pushDisplayInteractive(powerManager?.isInteractive ?: true)
                 flushPendingOutboundPackets(MAX_PENDING_FLUSH_ON_SESSION_START)
             }
             started

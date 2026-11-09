@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -1093,6 +1093,20 @@ async fn run_peer_accept_loop(
 /// the consumer's redial/renewal recovery.
 const PEER_ADVERTISE_POLL: Duration = Duration::from_secs(5);
 
+/// Advertise-watcher poll while the session is idle with the screen
+/// off (4.58): 30 s instead of 5 s. The watcher still wakes at the
+/// next UTC minute boundary when it comes first, so the window
+/// re-announce still lands inside the 10 s lock window.
+const PEER_ADVERTISE_POLL_IDLE: Duration = Duration::from_secs(30);
+
+/// Browse-recv timeout while the session is idle with the screen off
+/// (4.58): the 1 s timeout exists only to notice a new UTC minute
+/// within a second so the window re-query lands inside the 10 s lock
+/// window; 5 s still lands inside the window and wakes the task 5x
+/// less often.
+const BROWSE_RECV_TIMEOUT_IDLE: Duration = Duration::from_secs(5);
+const BROWSE_RECV_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// The single accept loop for the wildcard listener. The listener
 /// binds the wildcard of the advertised address family, so one loop
 /// serves every advertised address and no re-bind is ever needed;
@@ -1126,6 +1140,7 @@ async fn run_advertise_watcher(
     initial_advertisement: PeerShareAdvertisement,
     initial_advertiser: PeerShareAdvertiser,
     initial_loop: JoinHandle<()>,
+    pacing_idle: Arc<AtomicBool>,
 ) {
     let _accept_loop = AcceptLoop {
         handle: initial_loop,
@@ -1135,7 +1150,19 @@ async fn run_advertise_watcher(
     let mut advertiser: Option<PeerShareAdvertiser> = Some(initial_advertiser);
     let mut last_window_minute = utc_minute(now_unix_secs());
     loop {
-        sleep(PEER_ADVERTISE_POLL).await;
+        // Idle pacing (4.58): poll every 30 s instead of 5 s while
+        // the session is idle with the screen off — but wake at the
+        // next UTC minute boundary when it comes first, so the
+        // window re-announce below still lands inside the 10 s lock
+        // window even on the idle poll.
+        let poll = if pacing_idle.load(Ordering::Relaxed) {
+            PEER_ADVERTISE_POLL_IDLE
+        } else {
+            PEER_ADVERTISE_POLL
+        };
+        let now = now_unix_secs();
+        let to_boundary = Duration::from_secs(60 - (now % 60));
+        sleep(poll.min(to_boundary)).await;
         // Windowed discovery: re-announce at the start of each UTC
         // minute so a consumer whose lock is only held for the 10s
         // window still sees us. This runs every poll iteration,
@@ -1199,12 +1226,23 @@ async fn run_advertise_watcher(
 /// they are unicast dials from the cached advertisement and need no
 /// multicast lock, so a previously seen peer can be re-dialed outside
 /// any window.
+///
+/// While the session is idle with the screen off (`pacing_idle`,
+/// 4.58) the timeout is 5 s instead of 1 s: the re-query then lands
+/// within 5 s of the minute boundary, still inside the 10 s window,
+/// and the task wakes 5x less often.
 async fn recv_discovery_in_window(
     browser: &mut PeerShareBrowser,
     last_window_minute: &mut u64,
+    pacing_idle: &AtomicBool,
 ) -> anyhow::Result<PeerShareAdvertisement> {
     loop {
-        match tokio::time::timeout(Duration::from_secs(1), browser.recv()).await {
+        let timeout = if pacing_idle.load(Ordering::Relaxed) {
+            BROWSE_RECV_TIMEOUT_IDLE
+        } else {
+            BROWSE_RECV_TIMEOUT
+        };
+        match tokio::time::timeout(timeout, browser.recv()).await {
             Ok(result) => return result,
             Err(_) => {
                 let minute = utc_minute(now_unix_secs());
@@ -1222,6 +1260,12 @@ pub async fn start_peer_share_runtime(
     peer_transport_tx: tokio::sync::mpsc::UnboundedSender<ClientTransport>,
     event_logger: Option<PeerShareEventLogger>,
     provider_paths: Option<ProviderPathSource>,
+    // Idle-pacing flag (4.58), shared with the session worker: set
+    // while the session is idle (no traffic for 60 s+) with the
+    // screen off. The browse loop and the advertise watcher slow
+    // down while it is set. `None` (e.g. the Linux CLI, which has
+    // no screen) means never paced.
+    idle_pacing: Option<Arc<AtomicBool>>,
 ) -> anyhow::Result<PeerShareRuntime> {
     let private_key_path = crate::expand_home_path(&config.client.private_key_path);
     let public_key_path = crate::expand_home_path(&config.client.public_key_path);
@@ -1329,6 +1373,12 @@ pub async fn start_peer_share_runtime(
         ProviderPathSource::Config(config.client.path_bind_addresses.clone())
     });
 
+    // Idle pacing (4.58): when the session is idle with the screen
+    // off, the browse loop and the advertise watcher slow down.
+    // The session worker owns the flag and flips it; `None` (the
+    // Linux CLI) paces nothing.
+    let pacing_idle = idle_pacing.unwrap_or_default();
+
     // Provider side: one accept loop on the wildcard listener, owned
     // by the advertise watcher. The watcher only re-registers the
     // advertisement when the address list changes; the loop is never
@@ -1378,6 +1428,7 @@ pub async fn start_peer_share_runtime(
             advertisement.clone().expect("provider mode requires advertisement"),
             advertiser.expect("provider mode requires advertiser"),
             initial_handle,
+            pacing_idle.clone(),
         )))
     } else {
         None
@@ -1448,7 +1499,9 @@ pub async fn start_peer_share_runtime(
         // UTC minute of the last discovery-window re-query. The 1s
         // recv timeout below notices a new minute within a second, so
         // the re-query lands inside the 10s window the Kotlin lock
-        // scheduler holds on the same clock.
+        // scheduler holds on the same clock (5 s while idle-paced,
+        // still inside the window).
+        let browse_pacing_idle = pacing_idle.clone();
         let mut last_window_minute = utc_minute(now_unix_secs());
         // Reversed legs (4.57) only arrive when this runtime also
         // provides (Both mode): the accept loop hands them over on
@@ -1581,6 +1634,7 @@ pub async fn start_peer_share_runtime(
                     advertisement = recv_discovery_in_window(
                         &mut browser,
                         &mut last_window_minute,
+                        &browse_pacing_idle,
                     ) => {
                         match advertisement {
                             Ok(advertisement) => (advertisement, false, false),

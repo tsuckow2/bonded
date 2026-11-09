@@ -255,6 +255,8 @@ impl ClientRuntime {
                     peer_transport_tx,
                     None,
                     None,
+                    // No screen on the CLI: never idle-paced.
+                    None,
                 )
                 .await
                 {

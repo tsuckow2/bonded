@@ -7,6 +7,16 @@ use std::net::SocketAddr;
 
 pub const PEER_SHARE_SERVICE_TYPE: &str = "_bonded-peer._udp.local.";
 
+/// How often each mDNS daemon re-checks interface IPs (4.58 idle
+/// pacing): the 5 s default wakes the daemon even when the session
+/// is idle and nothing is changing. 60 s is enough — the advertise
+/// watcher re-reads the interfaces itself on its own poll, and the
+/// browse loop re-queries every UTC minute regardless. Tradeoff:
+/// the daemon can take up to 60 s to notice a new interface (e.g.
+/// joining a new network) on its own; the watcher and the window
+/// re-query cover the cases that matter.
+const MDNS_IP_CHECK_INTERVAL_SECS: u32 = 60;
+
 /// UTC minute index for windowed discovery. Windows are the first 10
 /// seconds of each UTC minute, derived from the same device clock the
 /// Kotlin lock scheduler uses, so both sides agree on window
@@ -23,6 +33,9 @@ pub struct PeerShareAdvertiser {
 impl PeerShareAdvertiser {
     pub fn start(advertisement: &PeerShareAdvertisement) -> anyhow::Result<Self> {
         let daemon = ServiceDaemon::new().context("failed to create mDNS daemon")?;
+        daemon
+            .set_ip_check_interval(MDNS_IP_CHECK_INTERVAL_SECS)
+            .context("failed to set mDNS IP check interval")?;
         let service_info = service_info_from_advertisement(advertisement)?;
         daemon
             .register(service_info.clone())
@@ -69,6 +82,9 @@ pub struct PeerShareBrowser {
 impl PeerShareBrowser {
     pub fn start() -> anyhow::Result<Self> {
         let daemon = ServiceDaemon::new().context("failed to create mDNS daemon")?;
+        daemon
+            .set_ip_check_interval(MDNS_IP_CHECK_INTERVAL_SECS)
+            .context("failed to set mDNS IP check interval")?;
         let receiver = daemon
             .browse(PEER_SHARE_SERVICE_TYPE)
             .context("failed to browse peer-share mDNS service")?;
