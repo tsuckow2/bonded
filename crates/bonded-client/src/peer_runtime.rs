@@ -2201,15 +2201,29 @@ fn should_accept_discovered_peer(
 const TUNNEL_CLIENT_IPV4: Ipv4Addr = Ipv4Addr::new(10, 8, 0, 2);
 const TUNNEL_CLIENT_IPV6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0x10, 0x8, 0, 0, 0, 0, 2);
 
-/// Whether an interface with this name carries cellular (metered WWAN)
-/// traffic: Android Qualcomm `rmnet*`, MediaTek `ccmni*`, Linux
-/// `wwan*`, older Android `pdp*`. A LAN peer cannot dial these
-/// addresses (carrier NAT), so they must never be advertised.
-fn is_cellular_interface_name(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    ["rmnet", "ccmni", "wwan", "pdp"]
-        .iter()
-        .any(|prefix| lower.starts_with(prefix))
+/// Whether an address may be advertised as a peer-share endpoint: it
+/// must be in a non-routable/private block — 10.0.0.0/8, 172.16.0.0/12,
+/// 192.168.0.0/16, or link-local 169.254.0.0/16. A LAN peer can only
+/// dial addresses on a local network, so a public address (notably the
+/// cellular address, e.g. 192.0.0.4) must never leak into the
+/// advertisement — a consumer reading only the mDNS A record would
+/// dial an unreachable address. The check is on the address itself,
+/// not the interface name: interface naming varies by vendor
+/// (Qualcomm `rmnet*`, MediaTek `ccmni*`, `v4-rmnet1`, …) and a
+/// prefix list misses new names. A carrier-assigned private address
+/// on a cellular interface rides along (accepted: that edge case is
+/// out of scope). IPv6 addresses are not advertised.
+fn is_advertisable_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            let octets = ip.octets();
+            octets[0] == 10
+                || (octets[0] == 172 && (octets[1] & 0xf0) == 0x10)
+                || (octets[0] == 192 && octets[1] == 168)
+                || (octets[0] == 169 && octets[1] == 254)
+        }
+        IpAddr::V6(_) => false,
+    }
 }
 
 /// Whether an interface is the VPN tunnel: its name is the configured
@@ -2230,15 +2244,16 @@ fn is_tunnel_interface(name: &str, tun_name: &str, ip: &IpAddr) -> bool {
 }
 
 /// All addresses this provider can be dialed on: every bindable
-/// address on a non-cellular, non-tunnel interface, in a stable
-/// (sorted) order. Cellular addresses are excluded (a LAN peer cannot
-/// dial them — carrier NAT), as are the VPN tunnel addresses
-/// (identical on every client). The caller picks the primary from
-/// this list; the rest are fallbacks for the consumer to try.
+/// address in a private/link-local block on a non-tunnel interface,
+/// in a stable (sorted) order. Public addresses are excluded by the
+/// block filter (a LAN peer cannot dial them — carrier NAT), as are
+/// the VPN tunnel addresses (identical on every client). The caller
+/// picks the primary from this list; the rest are fallbacks for the
+/// consumer to try.
 fn advertisable_ips_from_pairs(pairs: &[(&str, IpAddr)], tun_name: &str) -> Vec<IpAddr> {
     let mut ips = Vec::new();
     for (name, ip) in pairs {
-        if is_cellular_interface_name(name) {
+        if !is_advertisable_ip(ip) {
             continue;
         }
         if is_tunnel_interface(name, tun_name, ip) {
@@ -2275,7 +2290,7 @@ fn advertisable_interface_ips(
 /// An explicit `peer_share_advertise_ip` pins a single address (as
 /// before); a pinned bind address likewise advertises only itself
 /// (the listener only serves that address). Otherwise every
-/// non-cellular, non-tunnel bindable address is advertised, primary
+/// private/link-local, non-tunnel bindable address is advertised, primary
 /// first (the existing path-subnet preference), so a consumer can
 /// fall through to any address it can actually reach. The list is
 /// scoped to the primary's address family: the listener binds the
@@ -2325,7 +2340,7 @@ fn resolve_advertise_ips(
 /// candidate sharing a /24 with a path bind address is on the link the
 /// client actually uses.
 ///
-/// Callers pass an already-filtered candidate list (cellular and
+/// Callers pass an already-filtered candidate list (public and
 /// tunnel addresses removed by `advertisable_interface_ips`); this
 /// helper only picks the primary from that list. Its unit tests keep
 /// the tunnel address in the candidate list to pin the preference
@@ -2395,17 +2410,19 @@ fn prefer_path_subnet_candidate(candidates: &[IpAddr], bind_addresses: &[String]
 }
 
 /// Whether the peer-share listener can actually bind and advertise this
-/// address: not loopback/unspecified/multicast, and not link-local. A
-/// link-local address (169.254.0.0/16, fe80::/10) cannot be bound without
-/// a scope id, so `UdpSocket::bind` rejects it with EINVAL — and interface
-/// enumeration on phones commonly lists a link-local IPv6 address ahead of
-/// the usable LAN IPv4 address.
+/// address: not loopback/unspecified/multicast, and not IPv6
+/// link-local. An IPv6 link-local address (fe80::/10) cannot be bound
+/// without a scope id, so `UdpSocket::bind` rejects it with EINVAL —
+/// and interface enumeration on phones commonly lists a link-local
+/// IPv6 address ahead of the usable LAN IPv4 address. An IPv4
+/// link-local address (169.254.0.0/16) binds like any IPv4 address
+/// and is advertisable (see `is_advertisable_ip`).
 fn is_bindable_advertise_ip(ip: &IpAddr) -> bool {
     if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() {
         return false;
     }
     match ip {
-        IpAddr::V4(ip) => !ip.is_link_local(),
+        IpAddr::V4(_) => true,
         IpAddr::V6(ip) => (ip.segments()[0] & 0xffc0) != 0xfe80,
     }
 }
@@ -2465,9 +2482,9 @@ mod tests {
 
     use super::{
         advertisable_ips_from_pairs, build_peer_introduction_request, forward_dial_back_frame,
-        introduction_expired, is_cellular_interface_name, is_tunnel_interface,
-        note_reversed_leg, peer_share_peer_id, plan_dial_back, prefer_path_subnet_candidate,
-        renewal_delay, resolve_advertise_ips, select_advertise_ip, select_advertise_ip_for_binds,
+        introduction_expired, is_advertisable_ip, is_tunnel_interface, note_reversed_leg,
+        peer_share_peer_id, plan_dial_back, prefer_path_subnet_candidate, renewal_delay,
+        resolve_advertise_ips, select_advertise_ip, select_advertise_ip_for_binds,
         should_accept_discovered_peer, ConnectedPeers, DialBackParams, PeerLegTracker,
         RedialQueue, RelayPathClaims, PEER_REDISCOVERY_MAX_ATTEMPTS,
         PEER_RELAY_RENEWAL_LEAD_SECS, PEER_RELAY_RENEWAL_MIN_DELAY,
@@ -2819,11 +2836,11 @@ mod tests {
     }
 
     #[test]
-    fn advertisable_ips_excludes_cellular_and_tunnel() {
-        // The hotspot failure mode: the provider's cellular address
-        // (rmnet) and the VPN tunnel address (10.8.0.2, identical on
-        // every client) must never be advertised — a LAN peer cannot
-        // dial either. Only the Wi-Fi address survives.
+    fn advertisable_ips_excludes_public_and_tunnel() {
+        // The hotspot failure mode: the provider's public cellular
+        // address (rmnet) and the VPN tunnel address (10.8.0.2,
+        // identical on every client) must never be advertised — a LAN
+        // peer cannot dial either. Only the Wi-Fi address survives.
         let pairs: Vec<(&str, IpAddr)> = vec![
             ("rmnet_data0", IpAddr::V4(Ipv4Addr::new(100, 64, 1, 2))),
             ("wlan0", IpAddr::V4(Ipv4Addr::new(192, 168, 43, 1))),
@@ -2838,15 +2855,57 @@ mod tests {
     }
 
     #[test]
-    fn advertisable_ips_excludes_cellular_by_name_prefix() {
-        assert!(is_cellular_interface_name("rmnet_data0"));
-        assert!(is_cellular_interface_name("rmnet0"));
-        assert!(is_cellular_interface_name("ccmni0"));
-        assert!(is_cellular_interface_name("wwan0"));
-        assert!(is_cellular_interface_name("pdp0"));
-        assert!(!is_cellular_interface_name("wlan0"));
-        assert!(!is_cellular_interface_name("eth0"));
-        assert!(!is_cellular_interface_name("bonded0"));
+    fn advertisable_ip_allow_list_is_private_and_link_local_only() {
+        // The allow-list is the address, not the interface name:
+        // every private block and link-local is kept, every public
+        // address is dropped, whatever the interface is called.
+        assert!(is_advertisable_ip(&IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5))));
+        assert!(is_advertisable_ip(&IpAddr::V4(Ipv4Addr::new(
+            172, 20, 72, 22
+        ))));
+        assert!(is_advertisable_ip(&IpAddr::V4(Ipv4Addr::new(
+            192, 168, 1, 140
+        ))));
+        assert!(is_advertisable_ip(&IpAddr::V4(Ipv4Addr::new(
+            169, 254, 1, 2
+        ))));
+        assert!(!is_advertisable_ip(&IpAddr::V4(Ipv4Addr::new(
+            192, 0, 0, 4
+        ))));
+        assert!(!is_advertisable_ip(&IpAddr::V4(Ipv4Addr::new(
+            100, 64, 1, 2
+        ))));
+        assert!(!is_advertisable_ip(&IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
+        assert!(!is_advertisable_ip(&IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert!(!is_advertisable_ip(&IpAddr::V4(Ipv4Addr::UNSPECIFIED)));
+        assert!(!is_advertisable_ip(&IpAddr::V6(Ipv6Addr::new(
+            0x2001, 0xdb8, 0, 0, 0, 0, 0, 1
+        ))));
+    }
+
+    #[test]
+    fn advertisable_ips_excludes_v4_rmnet1_public_cellular_address() {
+        // The 6a regression: its cellular interface is named
+        // `v4-rmnet1` (not a `rmnet` prefix), so the old
+        // interface-name exclusion missed it and its public address
+        // 192.0.0.4 became the primary advertised endpoint. The
+        // IP-block filter drops it regardless of the name, while the
+        // Wi-Fi, hotspot, and link-local addresses survive.
+        let pairs: Vec<(&str, IpAddr)> = vec![
+            ("v4-rmnet1", IpAddr::V4(Ipv4Addr::new(192, 0, 0, 4))),
+            ("wlan0", IpAddr::V4(Ipv4Addr::new(192, 168, 1, 140))),
+            ("ap_br_wlan2", IpAddr::V4(Ipv4Addr::new(172, 20, 72, 22))),
+            ("eth0", IpAddr::V4(Ipv4Addr::new(169, 254, 1, 2))),
+            ("tun0", IpAddr::V4(Ipv4Addr::new(10, 8, 0, 2))),
+        ];
+        assert_eq!(
+            advertisable_ips_from_pairs(&pairs, "bonded0"),
+            vec![
+                IpAddr::V4(Ipv4Addr::new(169, 254, 1, 2)),
+                IpAddr::V4(Ipv4Addr::new(172, 20, 72, 22)),
+                IpAddr::V4(Ipv4Addr::new(192, 168, 1, 140)),
+            ]
+        );
     }
 
     #[test]
@@ -2877,7 +2936,7 @@ mod tests {
     }
 
     #[test]
-    fn advertise_ips_returns_all_non_cellular_primary_first() {
+    fn advertise_ips_returns_all_private_primary_first() {
         // A phone with two LAN addresses advertises both, primary
         // first: the address sharing a /24 with a live path bind
         // wins the primary slot (the existing preference), and the
@@ -2906,8 +2965,8 @@ mod tests {
     }
 
     #[test]
-    fn advertise_ips_errors_when_only_cellular_and_tunnel_exist() {
-        // A hotspot-only phone with no LAN address at all (cellular +
+    fn advertise_ips_errors_when_only_public_and_tunnel_exist() {
+        // A hotspot-only phone with no LAN address at all (public +
         // tunnel only) has nothing dialable to advertise: error, so
         // the watcher keeps the previous advertisement instead of
         // publishing an unreachable one.
@@ -2984,14 +3043,18 @@ mod tests {
     }
 
     #[test]
-    fn advertise_ip_skips_link_local_ipv4_for_global_ipv6() {
+    fn advertise_ip_prefers_link_local_ipv4_over_global_ipv6() {
+        // IPv4 link-local is a valid advertised address (it is in the
+        // IP-block allow-list and binds like any IPv4 address), while
+        // a global IPv6 address is not advertised at all — so the
+        // link-local IPv4 wins as the first bindable IPv4.
         let candidates = vec![
             IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1)),
             IpAddr::V6(Ipv6Addr::new(0x2600, 0, 0, 0, 0, 0, 0, 5)),
         ];
         assert_eq!(
             select_advertise_ip(&candidates),
-            Some(IpAddr::V6(Ipv6Addr::new(0x2600, 0, 0, 0, 0, 0, 0, 5)))
+            Some(IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1)))
         );
     }
 
