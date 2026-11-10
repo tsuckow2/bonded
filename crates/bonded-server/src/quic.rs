@@ -25,8 +25,8 @@ use std::sync::{Arc, RwLock};
 
 use anyhow::Context as _;
 use bonded_core::session::{
-    decode_observed_address, encode_observed_address, parse_session_epoch, SessionFrame,
-    SessionHeader, FLAG_PATH_RETIRE, FLAG_PING, FLAG_PONG,
+    decode_observed_address, encode_observed_address, is_answerable_ping, parse_session_epoch,
+    SessionFrame, SessionHeader, FLAG_PATH_RETIRE, FLAG_PONG,
 };
 use bonded_core::transport::{QuicTransport, Transport as _};
 use bytes::{Buf, Bytes};
@@ -325,10 +325,7 @@ async fn handle_quic_connection(
         }
 
         if let Some(frame) = pending_frame.take() {
-            if frame.header.flags & FLAG_PING != 0
-                && (frame.payload.is_empty()
-                    || parse_session_epoch(&frame).is_some())
-            {
+            if is_answerable_ping(&frame) {
                 session_ctx.router.note_frame_flags(frame.header.flags);
                 if let Some(epoch) = parse_session_epoch(&frame) {
                     session_ctx.router.adopt_epoch(transport_id, epoch);
@@ -395,17 +392,19 @@ async fn handle_quic_connection(
                             }
                             continue;
                         }
-                        if frame.header.flags & FLAG_PING != 0
-                            && (frame.payload.is_empty()
-                                || parse_session_epoch(&frame).is_some())
-                        {
+                        if is_answerable_ping(&frame) {
                             session_ctx.router.note_frame_flags(frame.header.flags);
                             if let Some(epoch) = parse_session_epoch(&frame) {
                                 session_ctx.router.adopt_epoch(transport_id, epoch);
                             }
                             let pong = SessionFrame {
                                 header: SessionHeader {
-                                    connection_id: frame.header.connection_id,
+                                    // Stamp the real session id, not the
+                                    // ping's connection id: the client sends
+                                    // discovery and heartbeat pings with
+                                    // connection_id 0 and adopts the pong's
+                                    // connection_id as its session id.
+                                    connection_id: handle.session_id as u32,
                                     sequence: frame.header.sequence,
                                     flags: FLAG_PONG,
                                 },

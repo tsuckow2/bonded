@@ -21,7 +21,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::Context;
 use base64::Engine as _;
 use bonded_core::config::DEFAULT_WIREGUARD_PEER_LEASE_SECS;
-use bonded_core::session::{SessionFrame, SessionHeader, FLAG_PING, FLAG_PONG};
+use bonded_core::session::{
+    is_answerable_ping, parse_session_epoch, SessionFrame, SessionHeader, FLAG_PING, FLAG_PONG,
+};
 use bonded_core::transport::WireGuardKeypair;
 use boringtun::noise::{Tunn, TunnResult};
 use boringtun::x25519::PublicKey;
@@ -835,9 +837,15 @@ async fn handle_decoded_frames(
     for frame in frames {
         maybe_log_tunnel_packet(tunnel_pcap, &frame.payload);
 
-        if frame.header.flags & FLAG_PING != 0 && frame.payload.is_empty() {
+        if is_answerable_ping(&frame) {
             if let Some(ctx) = &peer.session_ctx {
                 ctx.router.note_frame_flags(frame.header.flags);
+                // A binding PING carries the worker's session epoch:
+                // adopt it so transports left by a previous worker
+                // retire, exactly as the websocket/QUIC loops do.
+                if let Some(epoch) = parse_session_epoch(&frame) {
+                    ctx.router.adopt_epoch(peer.transport_id, epoch);
+                }
             }
             info!(
                 session_id = peer.session_id,
@@ -847,10 +855,19 @@ async fn handle_decoded_frames(
             );
             let pong = SessionFrame {
                 header: SessionHeader {
-                    connection_id: frame.header.connection_id,
+                    // Stamp the real session id, not the ping's
+                    // connection id: the client sends discovery and
+                    // heartbeat pings with connection_id 0 and adopts
+                    // the pong's connection_id as its session id.
+                    connection_id: peer.session_id as u32,
                     sequence: frame.header.sequence,
                     flags: FLAG_PONG,
                 },
+                // Echo the ping payload (empty for a plain ping, the
+                // 8-byte epoch for a binding ping). The client ignores
+                // unparseable PONG payloads, so the epoch echo is
+                // harmless; the observed-address stamp is not plumbed
+                // into this path.
                 payload: frame.payload,
             };
             if let Err(err) = peer.runtime.send_frame(pong).await {

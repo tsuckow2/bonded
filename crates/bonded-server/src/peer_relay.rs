@@ -4,6 +4,7 @@ use bonded_core::peer_share::{PeerRelayRegistration, SignedPeerShareIntroduction
 use bonded_core::session::{SessionFrame, FLAG_PEER_RELAY_REGISTRATION};
 use bonded_core::transport::Transport;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tracing::warn;
 
 pub struct SessionBinding {
     pub client_public_key: String,
@@ -19,10 +20,24 @@ pub async fn resolve_session_binding<T>(
 where
     T: Transport,
 {
-    let first_frame = transport
-        .recv()
-        .await
-        .context("failed to receive initial session frame")?;
+    // The bind waits on the first frame with no timeout: it only
+    // fails when the transport closes or errors. Log which one it
+    // was, so the log can say who killed the connection — a clean
+    // close means the peer closed the transport right after
+    // authentication; an error means the network or a decode
+    // failure killed it. The error text below is unchanged.
+    let first_frame = match transport.recv().await {
+        Ok(frame) => frame,
+        Err(err) => {
+            warn!(
+                authenticated_public_key = %authenticated_public_key,
+                outcome = classify_bind_recv_error(&err),
+                error = %err,
+                "session bind recv failed"
+            );
+            return Err(err).context("failed to receive initial session frame");
+        }
+    };
 
     if first_frame.header.flags & FLAG_PEER_RELAY_REGISTRATION == 0 {
         return Ok(SessionBinding {
@@ -48,6 +63,29 @@ where
         initial_frame: None,
         relayed_via_provider: true,
     })
+}
+
+/// Classify a bind-step recv failure so the log can say who killed
+/// the connection: "clean-close" when the peer closed the transport
+/// (EOF / close frame — the transport's own "closed" message),
+/// "reset" when the socket was reset or aborted, "error" for
+/// anything else (decode failure, other I/O errors).
+fn classify_bind_recv_error(err: &anyhow::Error) -> &'static str {
+    for cause in err.chain() {
+        if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {
+            return match io_err.kind() {
+                std::io::ErrorKind::UnexpectedEof => "clean-close",
+                std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::BrokenPipe => "reset",
+                _ => "error",
+            };
+        }
+        if cause.to_string().to_lowercase().contains("closed") {
+            return "clean-close";
+        }
+    }
+    "error"
 }
 
 fn verify_relay_registration(
@@ -95,7 +133,7 @@ fn verify_relay_registration(
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_session_binding;
+    use super::{classify_bind_recv_error, resolve_session_binding};
     use async_trait::async_trait;
     use bonded_core::auth::{sign_bytes, DeviceKeypair};
     use bonded_core::peer_share::{
@@ -254,6 +292,60 @@ mod tests {
         assert!(!binding.relayed_via_provider);
     }
 
+    #[tokio::test]
+    async fn bind_recv_failure_keeps_error_text() {
+        // The close-vs-error distinction is a log line only; the
+        // error the caller sees must keep its existing text.
+        let server_identity = DeviceKeypair::generate();
+        let mut transport =
+            FailingTransport::new("connection closed while reading frame length prefix");
+        let error = match resolve_session_binding(
+            &mut transport,
+            "provider".to_owned(),
+            &server_identity,
+        )
+        .await
+        {
+            Ok(_) => panic!("a recv failure should fail the bind"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("failed to receive initial session frame"),
+            "bind error text must be unchanged, got: {error}"
+        );
+    }
+
+    #[test]
+    fn classify_bind_recv_error_distinguishes_close_reset_and_error() {
+        // I/O EOF: the peer closed the transport cleanly.
+        let eof = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "failed to fill whole buffer",
+        ));
+        assert_eq!(classify_bind_recv_error(&eof), "clean-close");
+        // Socket reset / abort: the transport died, not cleanly.
+        let reset = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "connection reset by peer",
+        ));
+        assert_eq!(classify_bind_recv_error(&reset), "reset");
+        // The transports' own "closed" messages: clean close.
+        let tcp_closed =
+            anyhow::anyhow!("connection closed while reading frame length prefix");
+        assert_eq!(classify_bind_recv_error(&tcp_closed), "clean-close");
+        let ws_closed = anyhow::anyhow!("websocket closed");
+        assert_eq!(classify_bind_recv_error(&ws_closed), "clean-close");
+        let quic_closed = anyhow::anyhow!(
+            "QUIC: connection closed while reading frame length prefix"
+        );
+        assert_eq!(classify_bind_recv_error(&quic_closed), "clean-close");
+        // Anything else is an error, not a close.
+        let decode = anyhow::anyhow!(
+            "invalid session frame length prefix: 3 bytes (minimum 16)"
+        );
+        assert_eq!(classify_bind_recv_error(&decode), "error");
+    }
+
     fn now_plus(offset_secs: u64) -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -271,6 +363,33 @@ mod tests {
             Self {
                 frames: VecDeque::from(frames),
             }
+        }
+    }
+
+    struct FailingTransport {
+        error_message: String,
+    }
+
+    impl FailingTransport {
+        fn new(error_message: &str) -> Self {
+            Self {
+                error_message: error_message.to_owned(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Transport for FailingTransport {
+        async fn send(&mut self, _frame: SessionFrame) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn recv(&mut self) -> anyhow::Result<SessionFrame> {
+            Err(anyhow::anyhow!(self.error_message.clone()))
+        }
+
+        fn kind(&self) -> TransportKind {
+            TransportKind::Quic
         }
     }
 

@@ -91,6 +91,18 @@ pub fn parse_session_epoch(frame: &SessionFrame) -> Option<u64> {
     ))
 }
 
+/// Whether a frame is a session/heartbeat PING the server should
+/// answer with a PONG: a PING with an empty payload (plain heartbeat
+/// or plain-retry binding ping) or a PING carrying a session epoch
+/// (binding ping). A PING with any other payload is data, not a
+/// heartbeat, and is forwarded. Every transport's session loop must
+/// use this one predicate, so an epoch PING is answered on TCP and
+/// WireGuard exactly as on websocket and QUIC.
+pub fn is_answerable_ping(frame: &SessionFrame) -> bool {
+    frame.header.flags & FLAG_PING != 0
+        && (frame.payload.is_empty() || parse_session_epoch(frame).is_some())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionHeader {
     pub connection_id: u32,
@@ -295,6 +307,41 @@ mod tests {
         assert_eq!(first.header.sequence, 0);
         assert_eq!(second.header.sequence, 1);
         assert_eq!(state.next_tx_sequence(), 2);
+    }
+
+    #[test]
+    fn answerable_ping_covers_empty_and_epoch_pings_only() {
+        use super::{is_answerable_ping, FLAG_PING, FLAG_SESSION_EPOCH};
+        let ping = |flags: u32, payload: Bytes| SessionFrame {
+            header: SessionHeader {
+                connection_id: 0,
+                sequence: 0,
+                flags,
+            },
+            payload,
+        };
+        // Plain heartbeat / plain-retry binding ping: empty payload.
+        assert!(is_answerable_ping(&ping(FLAG_PING, Bytes::new())));
+        // Binding ping carrying the 8-byte session epoch.
+        assert!(is_answerable_ping(&ping(
+            FLAG_PING | FLAG_SESSION_EPOCH,
+            Bytes::copy_from_slice(&12345u64.to_be_bytes()),
+        )));
+        // A PING with any other payload is data, not a heartbeat.
+        assert!(!is_answerable_ping(&ping(
+            FLAG_PING,
+            Bytes::from_static(b"not an epoch")
+        )));
+        // An epoch flag with a wrong-length payload is not an epoch.
+        assert!(!is_answerable_ping(&ping(
+            FLAG_PING | FLAG_SESSION_EPOCH,
+            Bytes::from_static(b"short")
+        )));
+        // A non-PING frame is never answerable, even with an epoch.
+        assert!(!is_answerable_ping(&ping(
+            FLAG_SESSION_EPOCH,
+            Bytes::copy_from_slice(&12345u64.to_be_bytes()),
+        )));
     }
 
     #[test]

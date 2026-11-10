@@ -29,8 +29,8 @@ use bonded_core::peer_share::{
     SignedPeerShareIntroduction,
 };
 use bonded_core::session::{
-    decode_observed_address, encode_observed_address, parse_session_epoch, SessionFrame,
-    SessionHeader, FLAG_PATH_RETIRE, FLAG_PING, FLAG_PONG,
+    decode_observed_address, encode_observed_address, is_answerable_ping, parse_session_epoch,
+    SessionFrame, SessionHeader, FLAG_PATH_RETIRE, FLAG_PONG,
 };
 use bonded_core::transport::{PrependedStream, Transport, WebSocketTlsTransport};
 use http::StatusCode;
@@ -1203,10 +1203,7 @@ async fn handle_transport_session<T: Transport>(
 
         if let Some(frame) = pending_frame.take() {
             log_tunnel_packet(&tunnel_pcap, &frame.payload);
-            if frame.header.flags & FLAG_PING != 0
-                && (frame.payload.is_empty()
-                    || parse_session_epoch(&frame).is_some())
-            {
+            if is_answerable_ping(&frame) {
                 session_ctx.router.note_frame_flags(frame.header.flags);
                 if let Some(epoch) = parse_session_epoch(&frame) {
                     session_ctx.router.adopt_epoch(transport_id, epoch);
@@ -1293,10 +1290,7 @@ async fn handle_transport_session<T: Transport>(
                             }
                             continue;
                         }
-                        if frame.header.flags & FLAG_PING != 0
-                            && (frame.payload.is_empty()
-                                || parse_session_epoch(&frame).is_some())
-                        {
+                        if is_answerable_ping(&frame) {
                             session_ctx.router.note_frame_flags(frame.header.flags);
                             if let Some(epoch) = parse_session_epoch(&frame) {
                                 session_ctx.router.adopt_epoch(transport_id, epoch);
@@ -1375,6 +1369,7 @@ mod tests {
     use super::*;
     use crate::authorized_keys::{authorize_device_key, AuthorizedKeysStore};
     use bonded_core::auth::{sign_bytes, verify_signature, DeviceKeypair};
+    use bonded_core::session::FLAG_PING;
     use bonded_core::diagnostics::{
         DiagnosticsUploadRequest, DIAGNOSTICS_FILES_PER_DEVICE, MAX_DIAGNOSTICS_LOG_BYTES,
     };

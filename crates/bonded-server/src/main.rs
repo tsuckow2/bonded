@@ -55,7 +55,8 @@ use authorized_keys::{AuthorizedKeysStore, AuthorizedKeysWatcher};
 use anyhow::Context as _;
 use bonded_core::config::{load_server_config, ServerConfig, DEFAULT_SERVER_CONFIG_PATH};
 use bonded_core::session::{
-    encode_observed_address, SessionFrame, SessionHeader, FLAG_PING, FLAG_PONG,
+    encode_observed_address, is_answerable_ping, parse_session_epoch, SessionFrame,
+    SessionHeader, FLAG_PING, FLAG_PONG,
 };
 use bonded_core::transport::{NaiveTcpTransport, Transport};
 use clap::Parser;
@@ -742,9 +743,16 @@ async fn run_server(
 
                         if let Some(frame) = pending_frame.take() {
                             maybe_log_tunnel_packet(&tunnel_pcap, &frame.payload);
-                            if frame.header.flags & FLAG_PING != 0 && frame.payload.is_empty() {
+                            if is_answerable_ping(&frame) {
                                 if let Some(ctx) = &session_ctx {
                                     ctx.router.note_frame_flags(frame.header.flags);
+                                    // A binding PING carries the worker's
+                                    // session epoch: adopt it so transports
+                                    // left by a previous worker retire,
+                                    // exactly as the websocket/QUIC loops do.
+                                    if let Some(epoch) = parse_session_epoch(&frame) {
+                                        ctx.router.adopt_epoch(transport_id, epoch);
+                                    }
                                 }
                                 info!(
                                     peer = %peer,
@@ -860,12 +868,15 @@ async fn run_server(
                                         );
                                         maybe_log_tunnel_packet(&tunnel_pcap, &frame.payload);
                                         // Respond to heartbeat pings without forwarding them.
-                                        // Only treat ping-bit frames as control heartbeats when
-                                        // they carry no payload; otherwise keep forwarding.
-                                        if frame.header.flags & FLAG_PING != 0 && frame.payload.is_empty() {
+                                        // An answerable ping is an empty ping or one carrying
+                                        // a session epoch; any other payload is data.
+                                        if is_answerable_ping(&frame) {
                                             if let Some(ctx) = &session_ctx {
                                                 ctx.router
                                                     .note_frame_flags(frame.header.flags);
+                                                if let Some(epoch) = parse_session_epoch(&frame) {
+                                                    ctx.router.adopt_epoch(transport_id, epoch);
+                                                }
                                             }
                                             info!(
                                                 peer = %peer,
@@ -875,7 +886,14 @@ async fn run_server(
                                             );
                                             let pong = SessionFrame {
                                                 header: SessionHeader {
-                                                    connection_id: frame.header.connection_id,
+                                                    // Stamp the real session id, not
+                                                    // the ping's connection id: the
+                                                    // client sends discovery and
+                                                    // heartbeat pings with
+                                                    // connection_id 0 and adopts the
+                                                    // pong's connection_id as its
+                                                    // session id.
+                                                    connection_id: handle.session_id as u32,
                                                     sequence: frame.header.sequence,
                                                     flags: FLAG_PONG,
                                                 },
