@@ -1084,6 +1084,34 @@ fn cellular_path_indexes(
         .collect()
 }
 
+/// Desired battery-saver auto-pause set for the CURRENT live path set.
+/// Pure: the heartbeat tick and the path-loss sites share this so a
+/// lost path re-evaluates parking the same way a tick does. When no
+/// non-cellular path is live, `compute_auto_paused` returns empty for
+/// any idle value, so a lost Wi-Fi path clears parking even if the
+/// session was idle a moment ago.
+#[cfg(any(target_os = "android", test))]
+fn desired_auto_paused(
+    battery_saver: bool,
+    idle: bool,
+    live_indexes: &[usize],
+    desired_addresses: &std::collections::HashMap<usize, String>,
+    cellular_bind_addresses: &std::collections::HashSet<String>,
+) -> std::collections::HashSet<usize> {
+    let cellular_live: std::collections::HashSet<usize> = live_indexes
+        .iter()
+        .copied()
+        .filter(|index| {
+            desired_addresses
+                .get(index)
+                .map(|address| cellular_bind_addresses.contains(address))
+                .unwrap_or(false)
+        })
+        .collect();
+    let non_cellular_up = live_indexes.iter().any(|index| !cellular_live.contains(index));
+    compute_auto_paused(battery_saver, idle, non_cellular_up, &cellular_live)
+}
+
 /// Poll every transport's `recv()` concurrently and return the frames
 /// that complete: the first one awaited, plus whatever else is already
 /// buffered (bounded drain, no waiting). Every transport impl's `recv()`
@@ -1221,6 +1249,55 @@ fn sync_paused_snapshot_flags(
             }
         }
     });
+}
+
+/// Re-evaluate battery-saver cellular parking from the CURRENT live
+/// path set and apply it — log and sync the snapshot flags when it
+/// changes — exactly as the heartbeat tick does, but immediately.
+/// Called when the live path set changes (a transport is lost), so a
+/// lost non-cellular path resumes cellular at once instead of waiting
+/// up to 25 s for the next tick. A path loss is itself a transport
+/// change, so callers pass `idle` computed after updating
+/// `last_transport_change`; the recompute then clears parking. The
+/// parking rule itself is unchanged (see `compute_auto_paused`).
+/// No-op when battery saver is off or the set is unchanged.
+#[cfg(any(target_os = "android", test))]
+#[allow(clippy::too_many_arguments)]
+fn reevaluate_auto_paused(
+    battery_saver: bool,
+    idle: bool,
+    live_indexes: &[usize],
+    desired_addresses: &Arc<std::sync::RwLock<std::collections::HashMap<usize, String>>>,
+    cellular_bind_addresses: &std::collections::HashSet<String>,
+    auto_paused_paths: &mut std::collections::HashSet<usize>,
+    paused_paths: &std::collections::HashSet<usize>,
+    snapshot: &Arc<Mutex<AndroidSessionSnapshot>>,
+) {
+    if !battery_saver {
+        return;
+    }
+    let desired = desired_addresses
+        .read()
+        .expect("path address map lock poisoned");
+    let desired_auto = desired_auto_paused(
+        battery_saver,
+        idle,
+        live_indexes,
+        &desired,
+        cellular_bind_addresses,
+    );
+    if desired_auto != *auto_paused_paths {
+        if desired_auto.is_empty() {
+            alog_info!("Worker: battery saver resumed cellular paths");
+        } else {
+            alog_info!(
+                "Worker: battery saver parked cellular paths {:?} (idle, non-cellular path up)",
+                desired_auto
+            );
+        }
+        *auto_paused_paths = desired_auto;
+        sync_paused_snapshot_flags(snapshot, paused_paths, auto_paused_paths);
+    }
 }
 
 /// Refresh the snapshot's per-path structure (which transports exist,
@@ -1728,6 +1805,13 @@ fn start_android_session(
                 candidate_paths = (0..transports.len()).collect();
             }
             let mut path_index = 0_usize;
+            // Discovery timing (4.61): elapsed times below let a
+            // client log be correlated with the server log to tell
+            // "ping never sent" (send error) from "ping lost / server
+            // never answered" (client timeout, no server-side bind)
+            // from "pong lost" (server bound the session, client
+            // timed out anyway).
+            let discovery_start = Instant::now();
             // Worker epoch: one value for this worker's whole life,
             // carried on every session-start binding PING so the
             // server can retire transports left by a previous worker
@@ -1738,6 +1822,7 @@ fn start_android_session(
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
             while path_index < transports.len() {
+                let kind = client_transport_kind(&transports[path_index]);
                 let ping = SessionFrame {
                     header: SessionHeader {
                         connection_id: 0,
@@ -1748,13 +1833,18 @@ fn start_android_session(
                 };
                 if let Err(err) = transports[path_index].send(ping).await {
                     alog_warn!(
-                        "Worker: path {} failed during session discovery (send): {}",
-                        path_index, err
+                        "Worker: discovery path {} ({}) PING send failed ({}ms into discovery): {}",
+                        path_index, kind, discovery_start.elapsed().as_millis(), err
                     );
                     transports.remove(path_index);
                     candidate_paths.remove(path_index);
                     continue;
                 }
+                let ping_sent_at = Instant::now();
+                alog_info!(
+                    "Worker: discovery path {} ({}) sent session PING ({}ms into discovery)",
+                    path_index, kind, discovery_start.elapsed().as_millis()
+                );
                 match tokio::time::timeout(
                     Duration::from_secs(10),
                     transports[path_index].recv(),
@@ -1764,8 +1854,8 @@ fn start_android_session(
                     Ok(Ok(frame)) if frame.header.flags & FLAG_PONG != 0 => {
                         session_id = frame.header.connection_id;
                         alog_info!(
-                            "Worker: path {} bound to session {}",
-                            path_index, session_id
+                            "Worker: path {} ({}) bound to session {} (PONG {}ms after PING)",
+                            path_index, kind, session_id, ping_sent_at.elapsed().as_millis()
                         );
                         path_index += 1;
                     }
@@ -1780,8 +1870,8 @@ fn start_android_session(
                             continue;
                         }
                         let message = format!(
-                            "expected session announcement pong on path {path_index}, got a frame with flags={}",
-                            frame.header.flags
+                            "expected session announcement pong on path {path_index} ({}), got a frame with flags={} ({}ms after PING)",
+                            kind, frame.header.flags, ping_sent_at.elapsed().as_millis()
                         );
                         alog_error!("Worker: {}", message);
                         update_snapshot(&worker_snapshot, |session_snapshot| {
@@ -1793,13 +1883,17 @@ fn start_android_session(
                     }
                     Ok(Err(err)) => {
                         alog_warn!(
-                            "Worker: path {} failed during session discovery (recv): {}",
-                            path_index, err
+                            "Worker: discovery path {} ({}) recv failed ({}ms after PING): {}",
+                            path_index, kind, ping_sent_at.elapsed().as_millis(), err
                         );
                         transports.remove(path_index);
                         candidate_paths.remove(path_index);
                     }
                     Err(_) => {
+                        alog_warn!(
+                            "Worker: discovery path {} ({}) epoch PING timed out ({}ms after PING); retrying as plain PING",
+                            path_index, kind, ping_sent_at.elapsed().as_millis()
+                        );
                         // Old servers drop non-empty PINGs without a
                         // PONG, so an epoch binding times out against
                         // them. Retry once as a plain PING before
@@ -1817,6 +1911,7 @@ fn start_android_session(
                         };
                         let retried = match transports[path_index].send(plain_ping).await {
                             Ok(()) => {
+                                let retry_sent_at = Instant::now();
                                 match tokio::time::timeout(
                                     Duration::from_secs(10),
                                     transports[path_index].recv(),
@@ -1828,8 +1923,8 @@ fn start_android_session(
                                     {
                                         session_id = frame.header.connection_id;
                                         alog_info!(
-                                            "Worker: path {} bound to session {} (plain retry)",
-                                            path_index, session_id
+                                            "Worker: path {} ({}) bound to session {} (plain retry, PONG {}ms after retry PING)",
+                                            path_index, kind, session_id, retry_sent_at.elapsed().as_millis()
                                         );
                                         path_index += 1;
                                         true
@@ -1837,12 +1932,18 @@ fn start_android_session(
                                     _ => false,
                                 }
                             }
-                            Err(_) => false,
+                            Err(err) => {
+                                alog_warn!(
+                                    "Worker: discovery path {} ({}) plain-retry PING send failed ({}ms since epoch PING): {}",
+                                    path_index, kind, ping_sent_at.elapsed().as_millis(), err
+                                );
+                                false
+                            }
                         };
                         if !retried {
                             alog_warn!(
-                                "Worker: path {} timed out during session discovery",
-                                path_index
+                                "Worker: path {} ({}) timed out during session discovery ({}ms since epoch PING)",
+                                path_index, kind, ping_sent_at.elapsed().as_millis()
                             );
                             transports.remove(path_index);
                             candidate_paths.remove(path_index);
@@ -2022,6 +2123,7 @@ fn start_android_session(
                                     path_index_map.vec_index_of(path_index)
                                 {
                                     paused_paths.remove(&path_index);
+                                    last_transport_change = Instant::now();
                                     let mut transport =
                                         transports.remove(vec_index);
                                     let _ = transport.close().await;
@@ -2033,6 +2135,23 @@ fn start_android_session(
                                     {
                                         active_index = 0;
                                     }
+                                    // Battery saver (4.61): a path was
+                                    // reset — re-evaluate parking
+                                    // immediately on path loss.
+                                    reevaluate_auto_paused(
+                                        config.client.battery_saver,
+                                        is_idle(
+                                            last_traffic,
+                                            last_transport_change,
+                                            Instant::now(),
+                                        ),
+                                        &path_index_map.path_indexes(),
+                                        &path_addresses,
+                                        &cellular_bind_addresses,
+                                        &mut auto_paused_paths,
+                                        &paused_paths,
+                                        &worker_snapshot,
+                                    );
                                     sync_transport_snapshot(
                                         &worker_snapshot,
                                         &transports,
@@ -2146,6 +2265,9 @@ fn start_android_session(
                                                 transports.remove(vec_index);
                                             let _ = transport.close().await;
                                             path_index_map.on_remove(vec_index);
+                                            // A removal is a transport
+                                            // change (see is_idle).
+                                            last_transport_change = Instant::now();
                                             if vec_index < active_index {
                                                 active_index -= 1;
                                             } else if vec_index == active_index
@@ -2165,6 +2287,27 @@ fn start_android_session(
                                         for (path_index, address) in &added {
                                             desired.insert(*path_index, address.clone());
                                         }
+                                    }
+                                    // Battery saver (4.61): paths were
+                                    // removed — re-evaluate parking
+                                    // immediately on path loss, now
+                                    // that the address map reflects
+                                    // the removals.
+                                    if !removed.is_empty() {
+                                        reevaluate_auto_paused(
+                                            config.client.battery_saver,
+                                            is_idle(
+                                                last_traffic,
+                                                last_transport_change,
+                                                Instant::now(),
+                                            ),
+                                            &path_index_map.path_indexes(),
+                                            &path_addresses,
+                                            &cellular_bind_addresses,
+                                            &mut auto_paused_paths,
+                                            &paused_paths,
+                                            &worker_snapshot,
+                                        );
                                     }
                                     let added_indexes: Vec<usize> = added
                                         .iter()
@@ -2597,6 +2740,24 @@ fn start_android_session(
                                                     active_index = 0;
                                                 }
                                                 shift += 1;
+                                                // Battery saver (4.61):
+                                                // re-evaluate parking
+                                                // immediately on path
+                                                // loss.
+                                                reevaluate_auto_paused(
+                                                    config.client.battery_saver,
+                                                    is_idle(
+                                                        last_traffic,
+                                                        last_transport_change,
+                                                        Instant::now(),
+                                                    ),
+                                                    &path_index_map.path_indexes(),
+                                                    &path_addresses,
+                                                    &cellular_bind_addresses,
+                                                    &mut auto_paused_paths,
+                                                    &paused_paths,
+                                                    &worker_snapshot,
+                                                );
                                                 sync_transport_snapshot(
                                                     &worker_snapshot,
                                                     &transports,
@@ -2648,6 +2809,24 @@ fn start_android_session(
                                                 {
                                                     active_index = 0;
                                                 }
+                                                // Battery saver (4.61):
+                                                // re-evaluate parking
+                                                // immediately on path
+                                                // loss.
+                                                reevaluate_auto_paused(
+                                                    config.client.battery_saver,
+                                                    is_idle(
+                                                        last_traffic,
+                                                        last_transport_change,
+                                                        Instant::now(),
+                                                    ),
+                                                    &path_index_map.path_indexes(),
+                                                    &path_addresses,
+                                                    &cellular_bind_addresses,
+                                                    &mut auto_paused_paths,
+                                                    &paused_paths,
+                                                    &worker_snapshot,
+                                                );
                                                 // The removal shifts every
                                                 // queued candidate above the
                                                 // removed index down by one.
@@ -2873,6 +3052,24 @@ fn start_android_session(
                             } else if was_active && active_index >= transports.len() {
                                 active_index = 0;
                             }
+                            // Battery saver (4.61): a path was lost —
+                            // re-evaluate parking immediately so a
+                            // lost non-cellular path resumes cellular
+                            // now instead of at the next tick.
+                            reevaluate_auto_paused(
+                                config.client.battery_saver,
+                                is_idle(
+                                    last_traffic,
+                                    last_transport_change,
+                                    Instant::now(),
+                                ),
+                                &path_index_map.path_indexes(),
+                                &path_addresses,
+                                &cellular_bind_addresses,
+                                &mut auto_paused_paths,
+                                &paused_paths,
+                                &worker_snapshot,
+                            );
                             sync_transport_snapshot(&worker_snapshot, &transports, active_index);
                             publish_path_stats(
                                 &worker_snapshot,
@@ -2926,52 +3123,23 @@ fn start_android_session(
                             Ordering::Relaxed,
                         );
                         // Battery saver: re-evaluate cellular parking
-                        // on every tick. Path liveness changes between
-                        // ticks, so this also clears parking when
-                        // Wi-Fi is lost, without needing loss-path
-                        // wiring. Live path indexes come from the map
-                        // (direct paths only; relays have no index).
+                        // on every tick. Path-loss sites re-evaluate
+                        // immediately too (see reevaluate_auto_paused),
+                        // so this tick is the periodic backstop, not
+                        // the only trigger. Live path indexes come from
+                        // the map (direct paths only; relays have no
+                        // index).
                         if config.client.battery_saver {
-                            let live_indexes = path_index_map.path_indexes();
-                            let desired = path_addresses
-                                .read()
-                                .expect("path address map lock poisoned");
-                            let cellular_live: std::collections::HashSet<usize> =
-                                live_indexes
-                                    .iter()
-                                    .copied()
-                                    .filter(|index| {
-                                        desired
-                                            .get(index)
-                                            .map(|address| {
-                                                cellular_bind_addresses
-                                                    .contains(address)
-                                            })
-                                            .unwrap_or(false)
-                                    })
-                                    .collect();
-                            let non_cellular_up = live_indexes
-                                .iter()
-                                .any(|index| !cellular_live.contains(index));
-                            let desired_auto = compute_auto_paused(
+                            reevaluate_auto_paused(
                                 true,
                                 idle_now,
-                                non_cellular_up,
-                                &cellular_live,
+                                &path_index_map.path_indexes(),
+                                &path_addresses,
+                                &cellular_bind_addresses,
+                                &mut auto_paused_paths,
+                                &paused_paths,
+                                &worker_snapshot,
                             );
-                            if desired_auto != auto_paused_paths {
-                                if desired_auto.is_empty() {
-                                    alog_info!(
-                                        "Worker: battery saver resumed cellular paths"
-                                    );
-                                } else {
-                                    alog_info!(
-                                        "Worker: battery saver parked cellular paths {:?} (idle, non-cellular path up)",
-                                        desired_auto
-                                    );
-                                }
-                                auto_paused_paths = desired_auto;
-                            }
                             // Sync flags every tick: a structural
                             // republish between ticks can restore a
                             // stale flag, and this is one cheap pass
@@ -3160,6 +3328,23 @@ fn start_android_session(
                                 &transports,
                                 &path_index_slots(&path_index_map, transports.len()),
                                 active_index,
+                            );
+                            // Battery saver (4.61): transports were
+                            // retired — re-evaluate parking immediately
+                            // on path loss.
+                            reevaluate_auto_paused(
+                                config.client.battery_saver,
+                                is_idle(
+                                    last_traffic,
+                                    last_transport_change,
+                                    Instant::now(),
+                                ),
+                                &path_index_map.path_indexes(),
+                                &path_addresses,
+                                &cellular_bind_addresses,
+                                &mut auto_paused_paths,
+                                &paused_paths,
+                                &worker_snapshot,
                             );
                         }
                     }
@@ -3996,6 +4181,7 @@ mod tests {
     use super::cellular_path_indexes;
     use super::compute_auto_paused;
     use super::demote_paused_paths;
+    use super::desired_auto_paused;
     use super::diff_path_addresses;
     use super::prefer_wireguard_first;
     use super::redundant_fan_out_targets;
@@ -5345,6 +5531,53 @@ mod tests {
         assert!(
             compute_auto_paused(false, true, true, &cellular).is_empty(),
             "battery saver off never parks"
+        );
+    }
+
+    #[test]
+    fn path_loss_clears_auto_pause_without_heartbeat_tick() {
+        // 4.61 (a): the worker re-evaluates parking on path loss, not
+        // just on heartbeat ticks. Given battery saver on, a parked
+        // cellular path, and a live Wi-Fi path, losing the Wi-Fi path
+        // clears the auto-pause set — even while the session is still
+        // idle, because `compute_auto_paused` returns empty whenever
+        // no non-cellular path is live, for any idle value. No
+        // heartbeat tick (and no idle flip) is involved.
+        use std::collections::{HashMap, HashSet};
+        let desired: HashMap<usize, String> = [
+            (0, "192.168.1.250".to_owned()),
+            (1, "192.0.0.4".to_owned()),
+        ]
+        .into_iter()
+        .collect();
+        let cellular: HashSet<String> = ["192.0.0.4".to_owned()].into_iter().collect();
+        // Before the loss: idle, Wi-Fi up — cellular is parked.
+        let parked = desired_auto_paused(true, true, &[0, 1], &desired, &cellular);
+        assert_eq!(
+            parked,
+            [1].into_iter().collect::<HashSet<usize>>(),
+            "idle + wifi up parks cellular path 1"
+        );
+        // The Wi-Fi path is lost; only cellular remains live. The
+        // recompute clears parking even though the session is still
+        // idle — no non-cellular path is left to justify parking.
+        let cleared = desired_auto_paused(true, true, &[1], &desired, &cellular);
+        assert!(
+            cleared.is_empty(),
+            "losing wifi must clear parking without a tick: got {cleared:?}"
+        );
+        // Losing the cellular path instead leaves nothing to park.
+        let no_cellular = desired_auto_paused(true, true, &[0], &desired, &cellular);
+        assert!(
+            no_cellular.is_empty(),
+            "no live cellular path means nothing to park: got {no_cellular:?}"
+        );
+        // A non-cellular path still up keeps parking while idle.
+        let still_parked = desired_auto_paused(true, true, &[0, 1], &desired, &cellular);
+        assert_eq!(
+            still_parked,
+            [1].into_iter().collect::<HashSet<usize>>(),
+            "wifi still up keeps cellular parked"
         );
     }
 
