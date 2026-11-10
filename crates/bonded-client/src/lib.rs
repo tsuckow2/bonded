@@ -314,11 +314,14 @@ pub async fn establish_transport_paths(
 /// with whatever subset connected. (Previously a path-0 failure
 /// aborted the whole session — a phone carrying a stale bind address
 /// for a network it had left could not connect at all, even with a
-/// healthy Wi-Fi/cellular path right behind it.) Callers that track
-/// paths by index (the Android supervisor) use the returned indexes to
-/// know exactly which paths are present and which to re-dial later.
-/// Returns `Err` only when no path at all could be established, or on
-/// a server-identity failure.
+/// healthy Wi-Fi/cellular path right behind it.) The same holds for a
+/// server-identity mismatch on one path (e.g. a captive portal on
+/// Wi-Fi): that path is skipped and the others are tried. Callers that
+/// track paths by index (the Android supervisor) use the returned
+/// indexes to know exactly which paths are present and which to re-dial
+/// later. Returns `Err` only when no path at all could be established;
+/// when every path failed with an identity mismatch the error is a
+/// server-identity failure.
 pub async fn establish_transport_paths_with_observer<F>(
     config: &ClientConfig,
     count: usize,
@@ -331,12 +334,17 @@ where
 
     // Session-start identity gate: when a paired server key is configured,
     // verify the bootstrap endpoint's cert proof against it before any path
-    // is established. A verification failure is fatal — the server key
-    // changed or the connection is being steered to a different server, and
-    // proceeding would silently pair a working VPN with dead peering. A
-    // reachability failure is not fatal: per-path verification below still
-    // applies, and a bound path may reach the server when the default route
-    // cannot.
+    // is established. The gate runs over the default route, so a captive
+    // portal (or any middlebox) on that route can present a cert that does
+    // not verify — that proves only that THIS route is intercepted, not
+    // that the server key changed. A gate identity mismatch is therefore
+    // NOT fatal: per-path verification below re-checks the proof on each
+    // bound path, and a path that presents the right cert (e.g. cellular
+    // while Wi-Fi is captive) carries the session. Only when every path
+    // fails with an identity mismatch is it a server-identity failure
+    // (see the empty-paths check below). A reachability failure or timeout
+    // is likewise not fatal: a bound path may reach the server when the
+    // default route cannot.
     let (gate_host, gate_port) = bootstrap_host_port(config);
     if !config.client.server_public_key.is_empty() {
         let dial_override = (!config.client.server_resolved_address.trim().is_empty())
@@ -359,10 +367,12 @@ where
                 ));
             }
             Ok(Err(err)) if cert_proof::is_identity_mismatch_error(&err) => {
-                return Err(server_identity_failure(
-                    &gate_host,
-                    gate_port,
-                    &format!("{err:#}"),
+                // Intercepted default route (e.g. a captive portal): do not
+                // abort. The per-path check below re-verifies the proof on
+                // each bound path; only if every path mismatches is it a
+                // server-identity failure.
+                observer(format!(
+                    "server identity gate mismatch ({err:#}); continuing with per-path verification"
                 ));
             }
             Ok(Err(err)) => {
@@ -400,6 +410,22 @@ where
     }
 
     if paths.is_empty() {
+        // No path established. If every path failed with an identity
+        // mismatch, every route presented a cert that does not verify
+        // against the paired server key — the key really did change, or
+        // every route is being steered to a different server. Surface
+        // the server-identity failure instead of a generic transport
+        // error. Otherwise (some path failed for another reason, e.g. it
+        // was unreachable) the key may be fine and the route was just
+        // dead, so keep the generic error.
+        let all_identity = !failure_reasons.is_empty()
+            && failure_reasons
+                .iter()
+                .all(|reason| reason.contains(cert_proof::IDENTITY_MISMATCH_MARKER));
+        if all_identity {
+            let detail = failure_reasons.join(" | ");
+            return Err(server_identity_failure(&gate_host, gate_port, &detail));
+        }
         anyhow::bail!(
             "failed to establish any transport path: {}",
             failure_reasons.join(" | ")
@@ -424,10 +450,13 @@ pub enum SinglePathResult {
 /// so the Android path supervisor can re-dial a single lost path
 /// mid-session with exactly the session-start behavior.
 ///
-/// Returns `Err` only for a server-identity failure, which is fatal and
-/// fail-closed: a well-formed cert proof that does not verify can only
-/// come from a real bonded server holding a different key (or a relay
-/// of one), never from a merely broken network.
+/// An identity mismatch on this path (a well-formed cert proof that does
+/// not verify) fails the PATH, not the session: the endpoint on this
+/// path may be a captive portal rather than the paired server, so the
+/// caller tries the remaining paths. Only when every path fails this way
+/// does the caller surface a server-identity failure. A transport that
+/// connected on this path anyway is discarded when identity evidence
+/// exists — it must not carry the session.
 /// Outcome of [`race_preferred`].
 struct RaceOutcome<T> {
     /// (rank, transport) of the winning attempt, if any.
@@ -540,7 +569,6 @@ where
         config.client.allow_insecure_debug_transports,
     );
     let target = requested_paths.max(1);
-    let (gate_host, gate_port) = bootstrap_host_port(config);
     let mut identity_error: Option<String> = None;
     let mut attempt_errors: Vec<String> = Vec::new();
 
@@ -719,13 +747,19 @@ where
         }
         let connected = outcome.winner.map(|(_, path)| path);
 
-        // Fail closed on identity evidence from any attempt: a well-formed
-        // proof that does not verify can only come from a real bonded server
-        // holding a different key (or a relay of one), never from a merely
-        // broken network — so a path that connected anyway (e.g. an
-        // unverified debug transport) must not carry this session.
+        // Fail this path closed on identity evidence from any attempt: a
+        // well-formed proof that does not verify means this path's endpoint
+        // is not the paired server (a captive portal intercepting this
+        // path, or a real key change) — so a transport that connected
+        // anyway on this path (e.g. an unverified debug transport) must
+        // not carry the session. But it is only THIS path that is
+        // suspect: fail the path, not the session, so the caller can try
+        // the remaining paths. Only when every path fails this way is it
+        // a server-identity failure (see establish_transport_paths).
         if let Some(detail) = &identity_error {
-            return Err(server_identity_failure(&gate_host, gate_port, detail));
+            return Ok(SinglePathResult::Failed(format!(
+                "server identity mismatch on this path: {detail}"
+            )));
         }
 
         Ok(match connected {
