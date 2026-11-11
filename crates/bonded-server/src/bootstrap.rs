@@ -43,7 +43,7 @@ use tracing::{error, info, warn};
 
 use crate::auth_handshake::perform_websocket_auth_handshake;
 use crate::authorized_keys::AuthorizedKeysStore;
-use crate::dial_back::DialBackPush;
+use crate::dial_back::{DialBackPush, DialBackPushOutcome};
 use crate::peer_relay::resolve_session_binding;
 use crate::session_registry::SessionRegistry;
 use crate::smoltcp_forwarder::{SessionContext, SessionOutboundRouter, SmoltcpForwarder};
@@ -994,23 +994,40 @@ fn peer_share_introduction_response(ctx: &BootstrapContext, body: &str) -> (Stat
                     consumer_endpoints: request.consumer_endpoints.clone(),
                     introduction: reversed,
                 };
-                let pushed = ctx
+                // The push is rate-limited per (consumer, provider)
+                // pair (churn-loop backoff): a flapping consumer's
+                // extra introduction requests still mint the forward
+                // introduction above, but only one dial-back push per
+                // window wakes the provider. A rate-limited drop is
+                // logged at warn — it is the signal a consumer is
+                // flapping, as in the 2026-11-11 incident.
+                let outcome = ctx
                     .dial_back_push
                     .as_ref()
                     .map(|push| push.push(&request.provider_device_public_key, &notification))
-                    .unwrap_or(false);
-                if pushed {
-                    info!(
-                        consumer = %notification.consumer_device_public_key,
-                        provider = %request.provider_device_public_key,
-                        "pushed dial-back notification to provider session"
-                    );
-                } else {
-                    info!(
-                        consumer = %notification.consumer_device_public_key,
-                        provider = %request.provider_device_public_key,
-                        "dial-back notification dropped: provider has no live session"
-                    );
+                    .unwrap_or(DialBackPushOutcome::NoLiveSession);
+                match outcome {
+                    DialBackPushOutcome::Pushed => {
+                        info!(
+                            consumer = %notification.consumer_device_public_key,
+                            provider = %request.provider_device_public_key,
+                            "pushed dial-back notification to provider session"
+                        );
+                    }
+                    DialBackPushOutcome::NoLiveSession => {
+                        info!(
+                            consumer = %notification.consumer_device_public_key,
+                            provider = %request.provider_device_public_key,
+                            "dial-back notification dropped: provider has no live session"
+                        );
+                    }
+                    DialBackPushOutcome::RateLimited => {
+                        warn!(
+                            consumer = %notification.consumer_device_public_key,
+                            provider = %request.provider_device_public_key,
+                            "dial-back notification dropped: rate-limited (flapping consumer?)"
+                        );
+                    }
                 }
             }
             Err((status, body)) => return (status, body),
