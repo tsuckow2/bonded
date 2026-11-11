@@ -3,7 +3,13 @@ use bonded_core::peer_share::PeerShareAdvertisement;
 use mdns_sd::{Receiver, ResolvedService, ServiceDaemon, ServiceEvent, ServiceInfo};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
-use std::net::SocketAddr;
+
+use std::net::{IpAddr, SocketAddr};
+use std::time::Duration;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::time::sleep;
+use tracing::{debug, warn};
+
 
 pub const PEER_SHARE_SERVICE_TYPE: &str = "_bonded-peer._udp.local.";
 
@@ -74,64 +80,221 @@ impl PeerShareAdvertiser {
     }
 }
 
-pub struct PeerShareBrowser {
-    daemon: ServiceDaemon,
-    receiver: Receiver<ServiceEvent>,
+impl Drop for PeerShareAdvertiser {
+    fn drop(&mut self) {
+        // Best-effort daemon shutdown. Dropping a ServiceDaemon
+        // without shutdown() leaks its thread and its SO_REUSEPORT
+        // *:5353 socket: mdns-sd's run loop only exits on an Exit
+        // command, and dropping the command sender does not stop it
+        // — so an aborted watcher task used to leave a live daemon
+        // behind, stealing a share of incoming multicast and still
+        // answering queries for a stale service instance.
+        // shutdown() only queues the Exit command (the daemon wakes
+        // on its signal socket), so it is safe to call here; the
+        // status receiver is dropped, the daemon still exits.
+        let _ = self.daemon.shutdown();
+    }
 }
 
-impl PeerShareBrowser {
-    pub fn start() -> anyhow::Result<Self> {
-        let daemon = ServiceDaemon::new().context("failed to create mDNS daemon")?;
-        daemon
-            .set_ip_check_interval(MDNS_IP_CHECK_INTERVAL_SECS)
-            .context("failed to set mDNS IP check interval")?;
-        let receiver = daemon
-            .browse(PEER_SHARE_SERVICE_TYPE)
-            .context("failed to browse peer-share mDNS service")?;
-        Ok(Self { daemon, receiver })
-    }
+/// Commands the browse loop sends to the drain task that owns the
+/// mDNS browser daemon (see `PeerShareBrowser`).
+enum BrowserCmd {
+    Requery,
+    Shutdown,
+}
 
-    /// Re-queries for the discovery window: stops the current browse
-    /// and starts a fresh one, resetting mdns-sd's retransmission
-    /// backoff (which doubles to an hour) so a query is actually sent
-    /// during the 10s lock window. The daemon itself is never
-    /// restarted. Callers must not hold a `recv()` future across this
-    /// call: the old receiver is replaced, so an in-flight recv on it
-    /// would never resolve.
-    pub fn requery(&mut self) -> anyhow::Result<()> {
-        self.daemon
-            .stop_browse(PEER_SHARE_SERVICE_TYPE)
-            .map_err(|error| anyhow::anyhow!(error))
-            .context("failed to stop peer-share browse for window re-query")?;
-        self.receiver = self
-            .daemon
-            .browse(PEER_SHARE_SERVICE_TYPE)
-            .map_err(|error| anyhow::anyhow!(error))
-            .context("failed to restart peer-share browse for window re-query")?;
-        Ok(())
-    }
+/// What the drain task reports when its inner loop ends: the daemon
+/// died and should be recreated, or the browser is shutting down.
+enum DrainOutcome {
+    Recreate,
+    Shutdown,
+}
 
-    pub async fn recv(&self) -> anyhow::Result<PeerShareAdvertisement> {
-        loop {
-            match self
-                .receiver
-                .recv_async()
-                .await
-                .context("peer-share mDNS browse stream ended")?
-            {
-                ServiceEvent::ServiceResolved(resolved) if resolved.is_valid() => {
-                    return advertisement_from_resolved_service(&resolved);
+/// Create a browser daemon and start browsing for the peer-share
+/// service type.
+fn start_browse_daemon() -> anyhow::Result<(ServiceDaemon, Receiver<ServiceEvent>)> {
+    let daemon = ServiceDaemon::new().context("failed to create mDNS daemon")?;
+    daemon
+        .set_ip_check_interval(MDNS_IP_CHECK_INTERVAL_SECS)
+        .context("failed to set mDNS IP check interval")?;
+    let receiver = daemon
+        .browse(PEER_SHARE_SERVICE_TYPE)
+        .context("failed to browse peer-share mDNS service")?;
+    Ok((daemon, receiver))
+}
+
+/// Re-query for the discovery window on a live daemon: stop the
+/// current browse and start a fresh one, resetting mdns-sd's
+/// retransmission backoff (which doubles to an hour) so a query is
+/// actually sent during the 10s lock window.
+fn requery_browse(
+    daemon: &ServiceDaemon,
+    receiver: &mut Receiver<ServiceEvent>,
+) -> anyhow::Result<()> {
+    daemon
+        .stop_browse(PEER_SHARE_SERVICE_TYPE)
+        .map_err(|error| anyhow::anyhow!(error))
+        .context("failed to stop peer-share browse for window re-query")?;
+    *receiver = daemon
+        .browse(PEER_SHARE_SERVICE_TYPE)
+        .map_err(|error| anyhow::anyhow!(error))
+        .context("failed to restart peer-share browse for window re-query")?;
+    Ok(())
+}
+
+/// Drain one browser daemon's event stream into the advertisement
+/// channel, handling re-query commands from the browse loop. Returns
+/// when the daemon dies (its event channel closed — recreate it) or
+/// the browser is shut down.
+async fn drain_browser_events(
+    daemon: &ServiceDaemon,
+    receiver: &mut Receiver<ServiceEvent>,
+    cmd_rx: &mut UnboundedReceiver<BrowserCmd>,
+    adv_tx: &UnboundedSender<PeerShareAdvertisement>,
+) -> DrainOutcome {
+    loop {
+        tokio::select! {
+            event = receiver.recv_async() => {
+                match event {
+                    Ok(ServiceEvent::ServiceResolved(resolved)) if resolved.is_valid() => {
+                        match advertisement_from_resolved_service(&resolved) {
+                            Ok(advertisement) => {
+                                if adv_tx.send(advertisement).is_err() {
+                                    return DrainOutcome::Shutdown;
+                                }
+                            }
+                            Err(err) => {
+                                debug!(error = %err, "ignoring unresolvable peer-share service");
+                            }
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(_) => {
+                        // The daemon's event channel closed: the
+                        // daemon thread is gone. Recreate it.
+                        return DrainOutcome::Recreate;
+                    }
                 }
-                _ => {}
+            }
+            cmd = cmd_rx.recv() => {
+                match cmd {
+                    Some(BrowserCmd::Requery) => {
+                        if let Err(err) = requery_browse(daemon, receiver) {
+                            debug!(error = %err, "peer-share browser re-query failed; recreating daemon");
+                            return DrainOutcome::Recreate;
+                        }
+                    }
+                    Some(BrowserCmd::Shutdown) | None => return DrainOutcome::Shutdown,
+                }
             }
         }
     }
+}
 
-    pub fn shutdown(self) -> anyhow::Result<()> {
-        let _ = self
-            .daemon
-            .shutdown()
-            .map_err(|error| anyhow::anyhow!(error))?;
+/// Wait out the daemon-restart backoff, returning false when the
+/// browser was shut down while waiting (so the drain task exits
+/// promptly instead of sleeping through the backoff).
+async fn browser_restart_backoff(cmd_rx: &mut UnboundedReceiver<BrowserCmd>) -> bool {
+    tokio::select! {
+        _ = sleep(Duration::from_secs(1)) => true,
+        cmd = cmd_rx.recv() => !matches!(cmd, Some(BrowserCmd::Shutdown) | None),
+    }
+}
+
+/// The browser drain task: owns the mDNS daemon for the whole
+/// browser lifetime and recreates it when it dies, so a dead daemon
+/// never ends discovery silently. It only exits when the browser is
+/// shut down (explicit command, or the command channel closing when
+/// the `PeerShareBrowser` is dropped) — either way the daemon is
+/// shut down before returning, so no daemon thread or *:5353 socket
+/// is left behind.
+async fn run_browser_drain(
+    mut cmd_rx: UnboundedReceiver<BrowserCmd>,
+    adv_tx: UnboundedSender<PeerShareAdvertisement>,
+) {
+    loop {
+        match start_browse_daemon() {
+            Ok((daemon, mut receiver)) => {
+                match drain_browser_events(&daemon, &mut receiver, &mut cmd_rx, &adv_tx).await
+                {
+                    DrainOutcome::Shutdown => {
+                        let _ = daemon.shutdown();
+                        return;
+                    }
+                    DrainOutcome::Recreate => {
+                        let _ = daemon.shutdown();
+                        if !browser_restart_backoff(&mut cmd_rx).await {
+                            return;
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                warn!(error = %err, "peer-share browser daemon failed to start; retrying");
+                if !browser_restart_backoff(&mut cmd_rx).await {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+pub struct PeerShareBrowser {
+    cmd_tx: UnboundedSender<BrowserCmd>,
+    adv_rx: UnboundedReceiver<PeerShareAdvertisement>,
+}
+
+impl PeerShareBrowser {
+    /// Start the browser. A dedicated drain task owns the mDNS daemon
+    /// and forwards resolved advertisements over an unbounded channel
+    /// to the browse loop.
+    ///
+    /// The drain task exists because mdns-sd delivers browse events
+    /// over a bounded(10) channel with a BLOCKING send: when the
+    /// browse loop is busy dialing a peer or requesting an
+    /// introduction it stops draining, the channel fills, and the
+    /// daemon thread blocks inside its socket-read loop — it stops
+    /// reading *:5353 (the kernel backlog grows; 164 KB was observed
+    /// on the OnePlus) and stops sending queries, so discovery
+    /// stalls for as long as the loop is busy. The drain task always
+    /// drains, whatever the loop is doing, so the daemon can never
+    /// block on its event channel. The same task recreates the daemon
+    /// if it dies, and shuts it down when the browser is dropped.
+    pub fn start() -> anyhow::Result<Self> {
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (adv_tx, adv_rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(run_browser_drain(cmd_rx, adv_tx));
+        Ok(Self { cmd_tx, adv_rx })
+    }
+
+    /// Re-queries for the discovery window: asks the drain task to
+    /// stop the current browse and start a fresh one, resetting
+    /// mdns-sd's retransmission backoff (which doubles to an hour)
+    /// so a query is actually sent during the 10s lock window. The
+    /// daemon itself is never restarted for a re-query, and the
+    /// request is queued, so it is safe to call while a `recv()` is
+    /// in flight.
+    pub fn requery(&self) -> anyhow::Result<()> {
+        self.cmd_tx
+            .send(BrowserCmd::Requery)
+            .map_err(|_| anyhow::anyhow!("peer-share browser drain task stopped"))
+    }
+
+    /// Receive the next discovered advertisement, forwarded by the
+    /// drain task. Returns an error when the browser has stopped.
+    pub async fn recv(&mut self) -> anyhow::Result<PeerShareAdvertisement> {
+        self.adv_rx
+            .recv()
+            .await
+            .context("peer-share browser stopped")
+    }
+
+    /// Shut the browser down: the drain task shuts down its daemon
+    /// and exits, so a later `recv()` reports the stop. Dropping the
+    /// browser without calling this has the same effect (the command
+    /// channel closes).
+    pub fn shutdown(&self) -> anyhow::Result<()> {
+        let _ = self.cmd_tx.send(BrowserCmd::Shutdown);
         Ok(())
     }
 }
@@ -213,6 +376,7 @@ fn advertisement_from_resolved_service(
 mod tests {
     use super::{
         advertisement_from_resolved_service, service_info_from_advertisement, utc_minute,
+        PeerShareBrowser,
     };
     use bonded_core::peer_share::PeerShareAdvertisement;
 
@@ -248,5 +412,33 @@ mod tests {
         assert_eq!(utc_minute(60), 1);
         assert_eq!(utc_minute(119), 1);
         assert_eq!(utc_minute(120), 2);
+    }
+
+    #[tokio::test]
+    async fn browser_drain_task_survives_requery_and_shutdown() {
+        // The drain task owns the daemon, so the browse loop can never
+        // block it: re-querying goes through the command channel and
+        // shutdown closes the advertisement channel, so recv() reports
+        // the stop instead of hanging. Runs without UDP (the drain
+        // task retries its daemon startup in the background), so it
+        // passes in the sandbox as well as on a host with mDNS. A
+        // discovery that beats the shutdown is legitimate and ignored
+        // — the property under test is that the stop is reported
+        // promptly.
+        use std::time::Duration;
+
+        let mut browser = PeerShareBrowser::start().expect("browser should start");
+        browser
+            .requery()
+            .expect("re-query should reach the drain task");
+        browser.shutdown().expect("shutdown should send");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match tokio::time::timeout_at(deadline, browser.recv()).await {
+                Ok(Ok(_)) => continue,
+                Ok(Err(_)) => break,
+                Err(_) => panic!("recv did not report the browser stop within 5 s of shutdown"),
+            }
+        }
     }
 }

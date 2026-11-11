@@ -1272,9 +1272,9 @@ async fn run_advertise_watcher(
 /// long-running browse's retransmissions off to one query per hour,
 /// so without an explicit re-query a consumer could sit through the
 /// whole 10s lock window without sending any query. The 1s timeout
-/// notices a new minute within a second; the re-query itself runs
-/// between recv calls, never while one is in flight, because
-/// `requery` replaces the receiver the in-flight recv is awaiting.
+/// notices a new minute within a second; the re-query is a queued
+/// command to the browser's drain task, so it is safe to issue
+/// between recv calls.
 /// Cached advertisements, redials, and renewals bypass this entirely:
 /// they are unicast dials from the cached advertisement and need no
 /// multicast lock, so a previously seen peer can be re-dialed outside
