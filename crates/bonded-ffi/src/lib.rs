@@ -1263,6 +1263,28 @@ fn sync_paused_snapshot_flags(
     });
 }
 
+/// Desired battery-saver supervisor-suppression set (4.64): every
+/// cellular path index — live or dead — while the park condition
+/// holds (battery saver + idle + a non-cellular path up). Pure.
+/// This is deliberately NOT the live auto-pause set: a *dead*
+/// cellular path is not in the live set, so the supervisor would
+/// keep re-dialing it on its 60 s schedule while the saver parked
+/// it. Suppression is computed from the condition, not the live
+/// set, so the dead path is suppressed exactly when a live one
+/// would be parked.
+#[cfg(any(target_os = "android", test))]
+fn desired_suppressed_paths(
+    battery_saver: bool,
+    idle: bool,
+    live_indexes: &[usize],
+    desired_addresses: &std::collections::HashMap<usize, String>,
+    cellular_bind_addresses: &std::collections::HashSet<String>,
+) -> std::collections::HashSet<usize> {
+    let cellular_all = cellular_path_indexes(desired_addresses, cellular_bind_addresses);
+    let non_cellular_up = live_indexes.iter().any(|index| !cellular_all.contains(index));
+    compute_auto_paused(battery_saver, idle, non_cellular_up, &cellular_all)
+}
+
 /// Re-evaluate battery-saver cellular parking from the CURRENT live
 /// path set and apply it — log and sync the snapshot flags when it
 /// changes — exactly as the heartbeat tick does, but immediately.
@@ -1273,6 +1295,13 @@ fn sync_paused_snapshot_flags(
 /// `last_transport_change`; the recompute then clears parking. The
 /// parking rule itself is unchanged (see `compute_auto_paused`).
 /// No-op when battery saver is off or the set is unchanged.
+///
+/// Also re-evaluates the supervisor-suppression set (4.64) and sends
+/// its diff to the supervisor: a newly parked cellular path stops
+/// being re-dialed, and a newly unparked one is due at once. The
+/// suppressed set is computed from the same condition, so parking
+/// and suppression flip together; the diff is sent only when the
+/// set actually changes.
 #[cfg(any(target_os = "android", test))]
 #[allow(clippy::too_many_arguments)]
 fn reevaluate_auto_paused(
@@ -1284,6 +1313,8 @@ fn reevaluate_auto_paused(
     auto_paused_paths: &mut std::collections::HashSet<usize>,
     paused_paths: &std::collections::HashSet<usize>,
     snapshot: &Arc<Mutex<AndroidSessionSnapshot>>,
+    suppressed_paths: &mut std::collections::HashSet<usize>,
+    supervisor_paths_tx: &tokio::sync::mpsc::UnboundedSender<PathsUpdate>,
 ) {
     if !battery_saver {
         return;
@@ -1309,6 +1340,42 @@ fn reevaluate_auto_paused(
         }
         *auto_paused_paths = desired_auto;
         sync_paused_snapshot_flags(snapshot, paused_paths, auto_paused_paths);
+    }
+    let desired_suppressed = desired_suppressed_paths(
+        battery_saver,
+        idle,
+        live_indexes,
+        &desired,
+        cellular_bind_addresses,
+    );
+    if desired_suppressed != *suppressed_paths {
+        let parked: Vec<usize> = desired_suppressed
+            .difference(suppressed_paths)
+            .copied()
+            .collect();
+        let unparked: Vec<usize> = suppressed_paths
+            .difference(&desired_suppressed)
+            .copied()
+            .collect();
+        if !parked.is_empty() {
+            alog_info!(
+                "Worker: battery saver suppressed supervisor re-dial for cellular paths {:?}",
+                parked
+            );
+        }
+        if !unparked.is_empty() {
+            alog_info!(
+                "Worker: battery saver resumed supervisor re-dial for cellular paths {:?}",
+                unparked
+            );
+        }
+        *suppressed_paths = desired_suppressed;
+        let _ = supervisor_paths_tx.send(PathsUpdate {
+            added: Vec::new(),
+            removed: Vec::new(),
+            parked,
+            unparked,
+        });
     }
 }
 
@@ -2004,6 +2071,16 @@ fn start_android_session(
             // as paused if either set contains it.
             let mut auto_paused_paths: std::collections::HashSet<usize> =
                 std::collections::HashSet::new();
+            // Battery-saver supervisor suppression (4.64): the
+            // cellular path indexes the worker has told the
+            // supervisor to stop re-dialing. Unlike the live
+            // auto-pause set above, this covers DEAD cellular paths
+            // too — a dead path is not in the live set, so it is
+            // computed from the park condition, not the live set
+            // (see `desired_suppressed_paths`). Starts empty: the
+            // session is not idle yet, so nothing is suppressed.
+            let mut suppressed_paths: std::collections::HashSet<usize> =
+                std::collections::HashSet::new();
             let mut cellular_bind_addresses: std::collections::HashSet<String> =
                 config.client.cellular_bind_addresses.iter().cloned().collect();
             let (path_lost_tx, path_lost_rx) =
@@ -2031,6 +2108,7 @@ fn start_android_session(
                     requested_paths,
                     (0..requested_paths).collect(),
                     candidate_paths.clone(),
+                    suppressed_paths.iter().copied().collect(),
                     session_id,
                     worker_cancel_token.clone(),
                     path_lost_rx.take().expect("supervisor lost channel"),
@@ -2164,6 +2242,8 @@ fn start_android_session(
                                         &mut auto_paused_paths,
                                         &paused_paths,
                                         &worker_snapshot,
+                                        &mut suppressed_paths,
+                                        &supervisor_paths_tx,
                                     );
                                     sync_transport_snapshot(
                                         &worker_snapshot,
@@ -2320,6 +2400,8 @@ fn start_android_session(
                                             &mut auto_paused_paths,
                                             &paused_paths,
                                             &worker_snapshot,
+                                            &mut suppressed_paths,
+                                            &supervisor_paths_tx,
                                         );
                                     }
                                     let added_indexes: Vec<usize> = added
@@ -2330,6 +2412,8 @@ fn start_android_session(
                                         let _ = supervisor_paths_tx.send(PathsUpdate {
                                             added: added_indexes,
                                             removed: removed.clone(),
+                                            parked: Vec::new(),
+                                            unparked: Vec::new(),
                                         });
                                     } else if !added_indexes.is_empty() {
                                         // The session started
@@ -2369,6 +2453,7 @@ fn start_android_session(
                                                     requested_paths,
                                                     desired,
                                                     present,
+                                                    suppressed_paths.iter().copied().collect(),
                                                     session_id,
                                                     worker_cancel_token.clone(),
                                                     lost_rx,
@@ -2383,6 +2468,8 @@ fn start_android_session(
                                                     PathsUpdate {
                                                         added: added_indexes,
                                                         removed: removed.clone(),
+                                                        parked: Vec::new(),
+                                                        unparked: Vec::new(),
                                                     },
                                                 );
                                             }
@@ -2771,6 +2858,8 @@ fn start_android_session(
                                                     &mut auto_paused_paths,
                                                     &paused_paths,
                                                     &worker_snapshot,
+                                                    &mut suppressed_paths,
+                                                    &supervisor_paths_tx,
                                                 );
                                                 sync_transport_snapshot(
                                                     &worker_snapshot,
@@ -2840,6 +2929,8 @@ fn start_android_session(
                                                     &mut auto_paused_paths,
                                                     &paused_paths,
                                                     &worker_snapshot,
+                                                    &mut suppressed_paths,
+                                                    &supervisor_paths_tx,
                                                 );
                                                 // The removal shifts every
                                                 // queued candidate above the
@@ -3083,6 +3174,8 @@ fn start_android_session(
                                 &mut auto_paused_paths,
                                 &paused_paths,
                                 &worker_snapshot,
+                                &mut suppressed_paths,
+                                &supervisor_paths_tx,
                             );
                             sync_transport_snapshot(&worker_snapshot, &transports, active_index);
                             publish_path_stats(
@@ -3153,6 +3246,8 @@ fn start_android_session(
                                 &mut auto_paused_paths,
                                 &paused_paths,
                                 &worker_snapshot,
+                                &mut suppressed_paths,
+                                &supervisor_paths_tx,
                             );
                             // Sync flags every tick: a structural
                             // republish between ticks can restore a
@@ -3359,6 +3454,8 @@ fn start_android_session(
                                 &mut auto_paused_paths,
                                 &paused_paths,
                                 &worker_snapshot,
+                                &mut suppressed_paths,
+                                &supervisor_paths_tx,
                             );
                         }
                     }
@@ -5599,6 +5696,57 @@ mod tests {
             still_parked,
             [1].into_iter().collect::<HashSet<usize>>(),
             "wifi still up keeps cellular parked"
+        );
+    }
+
+    #[test]
+    fn suppressed_paths_cover_dead_cellular_paths_while_parked() {
+        // 4.64: the suppression set is computed from the park
+        // condition, NOT the live auto-pause set. A dead cellular
+        // path (not in the live set) is suppressed exactly when a
+        // live one would be parked — otherwise the supervisor keeps
+        // re-dialing it every 60 s while the saver parked it.
+        use std::collections::{HashMap, HashSet};
+        use super::desired_suppressed_paths;
+        let desired: HashMap<usize, String> = [
+            (0, "192.168.1.250".to_owned()),
+            (1, "192.0.0.4".to_owned()),
+        ]
+        .into_iter()
+        .collect();
+        let cellular: HashSet<String> = ["192.0.0.4".to_owned()].into_iter().collect();
+        let suppressed: HashSet<usize> = [1].into_iter().collect();
+        // Idle, Wi-Fi up, cellular DEAD (only path 0 live): the
+        // live auto-pause set is empty (nothing live to park) but
+        // suppression still covers the dead cellular path 1.
+        assert_eq!(
+            desired_suppressed_paths(true, true, &[0], &desired, &cellular),
+            suppressed,
+            "dead cellular path is suppressed while wifi is up and idle"
+        );
+        assert!(
+            desired_auto_paused(true, true, &[0], &desired, &cellular).is_empty(),
+            "the live set is empty for a dead path — suppression is not the live set"
+        );
+        // Same condition with cellular live: both sets agree.
+        assert_eq!(
+            desired_suppressed_paths(true, true, &[0, 1], &desired, &cellular),
+            suppressed
+        );
+        // Traffic burst clears suppression (park condition lifts).
+        assert!(
+            desired_suppressed_paths(true, false, &[0], &desired, &cellular).is_empty(),
+            "traffic burst resumes re-dial"
+        );
+        // Wi-Fi loss clears suppression (no non-cellular path up).
+        assert!(
+            desired_suppressed_paths(true, true, &[1], &desired, &cellular).is_empty(),
+            "losing wifi resumes re-dial of cellular"
+        );
+        // Battery saver off: nothing suppressed.
+        assert!(
+            desired_suppressed_paths(false, true, &[0], &desired, &cellular).is_empty(),
+            "battery saver off never suppresses"
         );
     }
 

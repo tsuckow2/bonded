@@ -21,7 +21,7 @@
 //! Both surface as [`RedialOutcome::SessionDead`] and the worker tears
 //! the session down so the platform layer restarts it.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -99,9 +99,19 @@ pub enum RedialOutcome {
 /// (dial them) and interfaces that vanished (stop dialing them).
 /// Addresses travel separately, through the shared address map the
 /// supervisor reads at dial time, so this carries indexes only.
+///
+/// `parked` / `unparked` are the battery-saver suppression set
+/// (4.64): paths the worker says are parked — a dead cellular path
+/// while battery saver + idle + a non-cellular path is up. Parked
+/// paths are never re-dialed; unparking one makes it due at once
+/// (see `PathSupervisorState::note_unparked`). A park-only update
+/// (empty `added`/`removed`) is not a network change: it does not
+/// reset bind-timeout cooldowns.
 pub struct PathsUpdate {
     pub added: Vec<usize>,
     pub removed: Vec<usize>,
+    pub parked: Vec<usize>,
+    pub unparked: Vec<usize>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -122,15 +132,33 @@ enum PathStatus {
 /// which are missing, and when each missing path is next due a
 /// re-dial attempt. Kept separate from the async runner so the
 /// scheduling rules are unit-testable without sockets.
+///
+/// `parked` (4.64) is the battery-saver suppression set: paths the
+/// worker says are parked (a dead cellular path while battery saver
+/// + idle + a non-cellular path is up). A parked path is never due
+/// — `due_paths` and `next_wakeup` skip it — so the supervisor
+/// sleeps instead of waking the cellular modem every 60 s for a
+/// path the saver already parked. Parking is a separate dimension
+/// from Present/Missing: a parked path keeps its status, and
+/// unparking it makes it due at once (see `note_unparked`).
 pub struct PathSupervisorState {
     paths: BTreeMap<usize, PathStatus>,
+    parked: HashSet<usize>,
 }
 
 impl PathSupervisorState {
     /// `desired` is every direct path the session wants; `present` is
     /// the subset currently established. Missing paths become due
-    /// after [`INITIAL_MISSING_DELAY`].
-    pub fn new(desired: &[usize], present: &[usize], now: Instant) -> Self {
+    /// after [`INITIAL_MISSING_DELAY`]. `initially_parked` is the
+    /// suppression set at spawn time (empty at session start — the
+    /// session is not idle yet — non-empty for a mid-session spawn
+    /// while battery saver already parks cellular).
+    pub fn new(
+        desired: &[usize],
+        present: &[usize],
+        initially_parked: &[usize],
+        now: Instant,
+    ) -> Self {
         let mut paths = BTreeMap::new();
         for &path in desired {
             paths.insert(
@@ -146,7 +174,10 @@ impl PathSupervisorState {
                 },
             );
         }
-        Self { paths }
+        Self {
+            paths,
+            parked: initially_parked.iter().copied().collect(),
+        }
     }
 
     /// Record that a path's transport is gone. Duplicate notices for
@@ -206,9 +237,46 @@ impl PathSupervisorState {
     /// Forget a path entirely (its interface is gone): no further
     /// re-dials. A dial already in flight for it completes into the
     /// worker's stale-dial discard, and a later failure notice for
-    /// it is a no-op.
+    /// it is a no-op. Its parked entry goes with it.
     pub fn note_removed(&mut self, path: usize) {
         self.paths.remove(&path);
+        self.parked.remove(&path);
+    }
+
+    /// Suppress re-dials for a path (4.64): the worker says battery
+    /// saver parked it. The path keeps its status; `due_paths` and
+    /// `next_wakeup` simply skip it while parked, so the supervisor
+    /// sleeps instead of waking the modem. Recording a park for a
+    /// path not in the map is harmless — the entry is inert until
+    /// the path is added, and `note_removed` clears it.
+    pub fn note_parked(&mut self, path: usize) {
+        self.parked.insert(path);
+    }
+
+    /// Clear the suppression for a path (4.64): the park condition
+    /// lifted (Wi-Fi lost, traffic burst, battery saver off). A
+    /// missing path becomes due at once with its failure count
+    /// reset — exactly as `note_added` does for a newly appeared
+    /// path — so the supervisor re-dials it immediately instead of
+    /// waiting out a backoff whose evidence predates the park. A
+    /// present path just leaves the parked set.
+    pub fn note_unparked(&mut self, path: usize, now: Instant) {
+        self.parked.remove(&path);
+        if let Some(PathStatus::Missing {
+            failed_attempts,
+            next_due,
+            cooling_down,
+        }) = self.paths.get_mut(&path)
+        {
+            *failed_attempts = 0;
+            *next_due = now;
+            *cooling_down = false;
+        }
+    }
+
+    /// Whether a path is currently suppressed (4.64).
+    pub fn is_parked(&self, path: usize) -> bool {
+        self.parked.contains(&path)
     }
 
     pub fn contains(&self, path: usize) -> bool {
@@ -281,23 +349,35 @@ impl PathSupervisorState {
         }
     }
 
-    /// Paths whose re-dial is due at `now`, in path order.
+    /// Paths whose re-dial is due at `now`, in path order. Parked
+    /// paths (4.64) are never due, however long they have waited.
     pub fn due_paths(&self, now: Instant) -> Vec<usize> {
         self.paths
             .iter()
             .filter_map(|(&path, status)| match status {
-                PathStatus::Missing { next_due, .. } if *next_due <= now => Some(path),
+                PathStatus::Missing { next_due, .. }
+                    if *next_due <= now && !self.parked.contains(&path) =>
+                {
+                    Some(path)
+                }
                 _ => None,
             })
             .collect()
     }
 
-    /// The earliest moment any missing path becomes due.
+    /// The earliest moment any missing path becomes due. Parked
+    /// paths (4.64) contribute no wakeup: when every missing path
+    /// is parked the supervisor sleeps instead of waking for a
+    /// re-dial the saver already suppressed.
     pub fn next_wakeup(&self) -> Option<Instant> {
         self.paths
-            .values()
-            .filter_map(|status| match status {
-                PathStatus::Missing { next_due, .. } => Some(*next_due),
+            .iter()
+            .filter_map(|(&path, status)| match status {
+                PathStatus::Missing { next_due, .. }
+                    if !self.parked.contains(&path) =>
+                {
+                    Some(*next_due)
+                }
                 _ => None,
             })
             .min()
@@ -485,12 +565,15 @@ async fn attempt_redial(
 
 /// Spawn the supervisor task. It runs until the session's cancel
 /// token fires, the worker drops its channels, or a fatal outcome is
-/// reported.
+/// reported. `initially_parked` is the battery-saver suppression set
+/// at spawn time (4.64): empty at session start, the worker's
+/// current set for a mid-session spawn.
 pub fn spawn_path_supervisor(
     config: ClientConfig,
     requested_paths: usize,
     desired_paths: Vec<usize>,
     initially_present: Vec<usize>,
+    initially_parked: Vec<usize>,
     session_id: u32,
     cancel_token: CancellationToken,
     mut lost_rx: mpsc::UnboundedReceiver<usize>,
@@ -501,8 +584,12 @@ pub fn spawn_path_supervisor(
     wakeup_stats: Arc<SessionWakeupStats>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut state =
-            PathSupervisorState::new(&desired_paths, &initially_present, Instant::now());
+        let mut state = PathSupervisorState::new(
+            &desired_paths,
+            &initially_present,
+            &initially_parked,
+            Instant::now(),
+        );
         if state.next_wakeup().is_some() {
             log(format!(
                 "supervisor active: {} of {} direct paths present",
@@ -533,7 +620,9 @@ pub fn spawn_path_supervisor(
                 }
                 update = paths_update_rx.recv() => {
                     match update {
-                        Some(PathsUpdate { added, removed }) => {
+                        Some(PathsUpdate { added, removed, parked, unparked }) => {
+                            let path_set_changed =
+                                !added.is_empty() || !removed.is_empty();
                             for path in removed {
                                 state.note_removed(path);
                             }
@@ -545,11 +634,25 @@ pub fn spawn_path_supervisor(
                             // not added or removed: a network change
                             // invalidates their bind-timeout
                             // cooldowns too (ordinary backoffs are
-                            // untouched).
-                            state.reset_cooldowns(now);
+                            // untouched). A park-only update is not
+                            // a network change, so it does not reset
+                            // cooldowns (4.64).
+                            if path_set_changed {
+                                state.reset_cooldowns(now);
+                            }
+                            // Battery-saver suppression (4.64):
+                            // parked paths stop being re-dialed;
+                            // unparked ones are due at once (their
+                            // backoff is reset by note_unparked).
+                            for path in parked {
+                                state.note_parked(path);
+                            }
+                            for path in unparked {
+                                state.note_unparked(path, now);
+                            }
                             // Loop back: wakeup is recomputed, so a
-                            // newly added path (due now) dials
-                            // without waiting out a stale sleep.
+                            // newly added or unparked path (due now)
+                            // dials without waiting out a stale sleep.
                         }
                         None => break,
                     }
@@ -653,7 +756,7 @@ mod tests {
     #[test]
     fn initially_missing_paths_become_due_after_initial_delay() {
         let now = t0();
-        let state = PathSupervisorState::new(&[0, 1, 2], &[0], now);
+        let state = PathSupervisorState::new(&[0, 1, 2], &[0], &[], now);
         assert!(state.is_present(0));
         assert!(!state.is_present(1));
         assert!(state.due_paths(now).is_empty());
@@ -670,7 +773,7 @@ mod tests {
     #[test]
     fn lost_path_is_due_after_first_retry_delay() {
         let now = t0();
-        let mut state = PathSupervisorState::new(&[0, 1], &[0, 1], now);
+        let mut state = PathSupervisorState::new(&[0, 1], &[0, 1], &[], now);
         assert_eq!(state.next_wakeup(), None);
         state.note_lost(1, now);
         assert!(state.due_paths(now).is_empty());
@@ -680,7 +783,7 @@ mod tests {
     #[test]
     fn duplicate_loss_notice_does_not_reset_backoff() {
         let now = t0();
-        let mut state = PathSupervisorState::new(&[0], &[0], now);
+        let mut state = PathSupervisorState::new(&[0], &[0], &[], now);
         state.note_lost(0, now);
         let first_due = state.next_wakeup().expect("due after loss");
         state.note_attempt_failed(0, now + FIRST_RETRY_DELAY);
@@ -694,7 +797,7 @@ mod tests {
     #[test]
     fn backoff_grows_and_caps() {
         let now = t0();
-        let mut state = PathSupervisorState::new(&[0], &[], now);
+        let mut state = PathSupervisorState::new(&[0], &[], &[], now);
         let mut at = now + INITIAL_MISSING_DELAY;
         for expected in [10_u64, 20, 40, 60, 60] {
             let delay = state.note_attempt_failed(0, at);
@@ -707,7 +810,7 @@ mod tests {
     #[test]
     fn bind_timeout_cools_down_for_ten_minutes() {
         let now = t0();
-        let mut state = PathSupervisorState::new(&[0], &[], now);
+        let mut state = PathSupervisorState::new(&[0], &[], &[], now);
         let delay = state.note_bind_timeout(0, now + INITIAL_MISSING_DELAY);
         assert_eq!(delay, BIND_TIMEOUT_COOLDOWN);
         assert_eq!(delay, Duration::from_secs(600));
@@ -731,7 +834,7 @@ mod tests {
     #[test]
     fn path_set_change_resets_bind_cooldown_only() {
         let now = t0();
-        let mut state = PathSupervisorState::new(&[0, 1], &[], now);
+        let mut state = PathSupervisorState::new(&[0, 1], &[], &[], now);
         let at = now + INITIAL_MISSING_DELAY;
         // Path 0 cools down after a bind timeout; path 1 sits in an
         // ordinary backoff after a dial failure.
@@ -755,7 +858,7 @@ mod tests {
     #[test]
     fn added_path_resets_bind_cooldown() {
         let now = t0();
-        let mut state = PathSupervisorState::new(&[0], &[], now);
+        let mut state = PathSupervisorState::new(&[0], &[], &[], now);
         state.note_bind_timeout(0, now + INITIAL_MISSING_DELAY);
         assert!(state.due_paths(now + Duration::from_secs(60)).is_empty());
         state.note_added(0, now + Duration::from_secs(60));
@@ -763,9 +866,93 @@ mod tests {
     }
 
     #[test]
+    fn parked_path_is_never_due_and_contributes_no_wakeup() {
+        let now = t0();
+        let mut state = PathSupervisorState::new(&[0, 1], &[0], &[], now);
+        // Path 1 is missing and due after the initial delay; path 0
+        // is present. Parking path 1 suppresses it entirely: no due
+        // path, no wakeup — the supervisor sleeps instead of waking
+        // the modem for a path the saver already parked.
+        let at = now + INITIAL_MISSING_DELAY;
+        assert_eq!(state.due_paths(at), vec![1]);
+        state.note_parked(1);
+        assert!(state.is_parked(1));
+        assert!(state.due_paths(at).is_empty());
+        assert!(state.due_paths(at + Duration::from_secs(3600)).is_empty());
+        assert_eq!(state.next_wakeup(), None);
+        // Parking a present path is a no-op for the schedule.
+        state.note_parked(0);
+        assert_eq!(state.next_wakeup(), None);
+    }
+
+    #[test]
+    fn unparked_path_is_due_at_once_with_count_reset() {
+        let now = t0();
+        let mut state = PathSupervisorState::new(&[0], &[], &[], now);
+        let at = now + INITIAL_MISSING_DELAY;
+        // Fail twice (10 s, then 20 s backoff) and park mid-backoff.
+        state.note_attempt_failed(0, at);
+        state.note_attempt_failed(0, at + Duration::from_secs(10));
+        assert_eq!(state.next_wakeup(), Some(at + Duration::from_secs(30)));
+        state.note_parked(0);
+        assert_eq!(state.next_wakeup(), None);
+        // Unparking makes it due now with the failure count reset,
+        // so the next failure backs off from 10 s, not from the
+        // pre-park count.
+        let unpark_at = at + Duration::from_secs(100);
+        state.note_unparked(0, unpark_at);
+        assert!(!state.is_parked(0));
+        assert_eq!(state.due_paths(unpark_at), vec![0]);
+        let next = state.note_attempt_failed(0, unpark_at);
+        assert_eq!(next, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn initially_parked_paths_start_suppressed() {
+        let now = t0();
+        let state = PathSupervisorState::new(&[0, 1], &[0], &[1], now);
+        assert!(state.is_parked(1));
+        assert!(state.due_paths(now + INITIAL_MISSING_DELAY).is_empty());
+        assert_eq!(state.next_wakeup(), None);
+    }
+
+    #[test]
+    fn parked_path_stays_parked_across_readd_and_removal_clears_it() {
+        let now = t0();
+        let mut state = PathSupervisorState::new(&[0, 1], &[0, 1], &[], now);
+        state.note_lost(1, now);
+        state.note_parked(1);
+        // The interface vanishes and comes back while parked: the
+        // path is due-now via note_added but still suppressed.
+        state.note_removed(1);
+        assert!(!state.is_parked(1));
+        state.note_added(1, now);
+        assert_eq!(state.due_paths(now), vec![1]);
+        state.note_parked(1);
+        assert!(state.due_paths(now).is_empty());
+        // Only the unpark clears it.
+        state.note_unparked(1, now);
+        assert_eq!(state.due_paths(now), vec![1]);
+    }
+
+    #[test]
+    fn non_parked_path_is_still_retried_on_schedule() {
+        let now = t0();
+        let mut state = PathSupervisorState::new(&[0, 1], &[0], &[1], now);
+        // Path 1 is parked; path 0 is present. A second missing path
+        // that is NOT parked keeps its ordinary backoff: parking
+        // one path must not disturb the other's re-dial.
+        let at = now + INITIAL_MISSING_DELAY;
+        state.note_lost(0, at);
+        assert!(state.due_paths(at).is_empty());
+        assert_eq!(state.due_paths(at + FIRST_RETRY_DELAY), vec![0]);
+        assert_eq!(state.next_wakeup(), Some(at + FIRST_RETRY_DELAY));
+    }
+
+    #[test]
     fn bound_path_leaves_the_schedule() {
         let now = t0();
-        let mut state = PathSupervisorState::new(&[0, 1], &[0], now);
+        let mut state = PathSupervisorState::new(&[0, 1], &[0], &[], now);
         assert_eq!(state.next_wakeup(), Some(now + INITIAL_MISSING_DELAY));
         state.note_bound(1);
         assert_eq!(state.next_wakeup(), None);
@@ -775,7 +962,7 @@ mod tests {
     #[test]
     fn added_path_is_due_immediately_and_removed_path_is_forgotten() {
         let now = t0();
-        let mut state = PathSupervisorState::new(&[0, 1], &[0, 1], now);
+        let mut state = PathSupervisorState::new(&[0, 1], &[0, 1], &[], now);
         assert_eq!(state.next_wakeup(), None);
         // A removed path leaves the schedule entirely: no wakeup,
         // and a later failure notice for it is a silent no-op.
