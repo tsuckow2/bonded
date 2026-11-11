@@ -40,6 +40,22 @@ use std::time::{Duration, Instant};
 /// No user traffic (and no transport churn) for this long => idle.
 pub const IDLE_AFTER: Duration = Duration::from_secs(60);
 
+/// No user traffic for this long => the heartbeat goes idle (4.65).
+/// Longer than [`IDLE_AFTER`]: background app traffic (a packet
+/// every few seconds) resets the 60 s gate constantly, so the
+/// heartbeat flaps between the 10 s active and 25 s idle cadences
+/// and averages ~16 s instead of 25 s. 180 s is long enough to ride
+/// out a sync burst but short enough that a genuinely quiet session
+/// backs off. Transport churn does NOT reset this threshold — churn
+/// affects only the new path's probing, not the global cadence.
+pub const HEARTBEAT_IDLE_AFTER: Duration = Duration::from_secs(180);
+
+/// Consecutive heartbeat ticks with traffic observed required to
+/// leave the idle cadence (4.65). A single background packet spans
+/// one tick only, so it cannot re-arm the 10 s all-paths heartbeat;
+/// sustained traffic spans two or more.
+const HEARTBEAT_ACTIVE_TICKS: u32 = 2;
+
 /// Heartbeat interval while idle. Deliberately 25 s, not longer: see
 /// the module docs — the server reaps a silent transport at 30 s.
 pub const IDLE_INTERVAL: Duration = Duration::from_secs(25);
@@ -50,6 +66,32 @@ pub const IDLE_INTERVAL: Duration = Duration::from_secs(25);
 pub fn is_idle(last_traffic: Instant, last_transport_change: Instant, now: Instant) -> bool {
     now.duration_since(last_traffic) >= IDLE_AFTER
         && now.duration_since(last_transport_change) >= IDLE_AFTER
+}
+
+/// Next heartbeat-idle state, with hysteresis (4.65). Pure, so the
+/// worker's cadence flip is unit-testable without a session. This is
+/// the heartbeat cadence's own idle gate — traffic-only, decoupled
+/// from transport churn. Parking and peer pacing keep the 60 s
+/// churn-aware [`is_idle`]; only the heartbeat cadence uses this.
+///
+/// - Go idle after [`HEARTBEAT_IDLE_AFTER`] of no user traffic.
+///   The active cadence (10 s) and idle cadence (25 s) are
+///   unchanged; only WHEN the mode switches changes.
+/// - Go active only after sustained traffic: `traffic_ticks`
+///   consecutive ticks with traffic observed (the worker counts a
+///   tick when `last_traffic` advanced since the previous tick).
+///   A lone background packet does not re-arm the 10 s heartbeat.
+pub fn next_heartbeat_idle(
+    currently_idle: bool,
+    last_traffic: Instant,
+    traffic_ticks: u32,
+    now: Instant,
+) -> bool {
+    if currently_idle {
+        traffic_ticks < HEARTBEAT_ACTIVE_TICKS
+    } else {
+        now.duration_since(last_traffic) >= HEARTBEAT_IDLE_AFTER
+    }
 }
 
 /// Pong-silence threshold for a heartbeat interval: three missed
@@ -89,5 +131,28 @@ mod tests {
             pong_silence_timeout(IDLE_INTERVAL),
             Duration::from_secs(75)
         );
+    }
+
+    #[test]
+    fn heartbeat_idle_uses_traffic_only_with_hysteresis() {
+        let now = Instant::now();
+        // Active -> idle needs 180 s of no traffic, not 60 s.
+        let quiet_60 = now - Duration::from_secs(61);
+        assert!(
+            !next_heartbeat_idle(false, quiet_60, 0, now),
+            "60 s quiet is not idle for the heartbeat"
+        );
+        let quiet_180 = now - HEARTBEAT_IDLE_AFTER;
+        assert!(next_heartbeat_idle(false, quiet_180, 0, now));
+        // A single tick with traffic does not re-arm the heartbeat.
+        assert!(
+            next_heartbeat_idle(true, now, 1, now),
+            "one traffic tick keeps the heartbeat idle"
+        );
+        // Sustained traffic (two consecutive ticks) goes active.
+        assert!(!next_heartbeat_idle(true, now, 2, now));
+        assert!(!next_heartbeat_idle(true, now, 5, now));
+        // Idle with no traffic stays idle regardless of the count.
+        assert!(next_heartbeat_idle(true, quiet_180, 0, now));
     }
 }

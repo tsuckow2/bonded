@@ -6,7 +6,7 @@ use bonded_client::{
 };
 #[cfg(any(target_os = "android", test))]
 use bonded_core::config::ClientConfig;
-use bonded_core::heartbeat::{is_idle, IDLE_INTERVAL};
+use bonded_core::heartbeat::{is_idle, next_heartbeat_idle, IDLE_INTERVAL};
 #[cfg(target_os = "android")]
 use bonded_core::config::SocketNetworkBindFn;
 #[cfg(target_os = "android")]
@@ -2152,6 +2152,12 @@ fn start_android_session(
             let mut last_traffic = Instant::now();
             let mut last_transport_change = Instant::now();
             let mut heartbeat_idle = false;
+            // Heartbeat hysteresis (4.65): consecutive ticks with
+            // user traffic observed, and the previous tick's time.
+            // A tick counts when last_traffic advanced since the
+            // previous tick; any quiet tick resets the count.
+            let mut heartbeat_traffic_ticks: u32 = 0;
+            let mut prev_heartbeat_tick = Instant::now();
             // Consume the immediate first tick so the first ping fires after 10s, not instantly.
             heartbeat.tick().await;
 
@@ -3193,6 +3199,30 @@ fn start_android_session(
                         }
                     }
                     _ = heartbeat.tick() => {
+                        // Heartbeat cadence (4.65): traffic-only idle
+                        // with hysteresis, decoupled from transport
+                        // churn. A tick counts as "traffic" when
+                        // last_traffic advanced since the previous
+                        // tick; any quiet tick resets the count, so
+                        // a lone background packet cannot re-arm the
+                        // 10 s all-paths heartbeat. The churn-aware
+                        // is_idle below still drives peer pacing and
+                        // battery-saver parking — only the heartbeat
+                        // cadence uses the decoupled gate.
+                        let now = Instant::now();
+                        let traffic_this_tick = last_traffic > prev_heartbeat_tick;
+                        prev_heartbeat_tick = now;
+                        if traffic_this_tick {
+                            heartbeat_traffic_ticks += 1;
+                        } else {
+                            heartbeat_traffic_ticks = 0;
+                        }
+                        let heartbeat_idle_now = next_heartbeat_idle(
+                            heartbeat_idle,
+                            last_traffic,
+                            heartbeat_traffic_ticks,
+                            now,
+                        );
                         // Adaptive cadence: flip the interval when the
                         // idle state changes, consuming the fresh
                         // interval's immediate tick so a full period
@@ -3200,10 +3230,10 @@ fn start_android_session(
                         let idle_now = is_idle(
                             last_traffic,
                             last_transport_change,
-                            Instant::now(),
+                            now,
                         );
-                        if idle_now != heartbeat_idle {
-                            heartbeat_idle = idle_now;
+                        if heartbeat_idle_now != heartbeat_idle {
+                            heartbeat_idle = heartbeat_idle_now;
                             let period = if heartbeat_idle {
                                 IDLE_INTERVAL
                             } else {
