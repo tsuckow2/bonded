@@ -39,10 +39,16 @@ data class WakeupCounts(
         val mdnsWindows: Long = 0,
         val relayTasksStarted: Long = 0,
         val relayTasksEnded: Long = 0,
+        /** Path-supervisor re-dial attempts (one per due path per
+         * wakeup). Counted by the native worker and read live from
+         * the snapshot, like heartbeatPings. A re-dialed transport
+         * restarts its own counters from zero, so this field is the
+         * only way to see the re-dial loop's share. */
+        val supervisorRedials: Long = 0,
 ) {
     fun total(): Long =
             heartbeatPings + quicPings + snapshotSerializations + networkCallbacks +
-                    mdnsWindows + relayTasksStarted + relayTasksEnded
+                    mdnsWindows + relayTasksStarted + relayTasksEnded + supervisorRedials
 
     /** Per-field delta, saturating at zero (a counter that went
      * backwards — e.g. a re-dialed transport restarting its QUIC
@@ -61,6 +67,22 @@ data class WakeupCounts(
                             (relayTasksStarted - before.relayTasksStarted).coerceAtLeast(0),
                     relayTasksEnded =
                             (relayTasksEnded - before.relayTasksEnded).coerceAtLeast(0),
+                    supervisorRedials =
+                            (supervisorRedials - before.supervisorRedials).coerceAtLeast(0),
+            )
+
+    /** Per-field values as a named map, for the persisted
+     * per-source breakdown. Keys are the field names. */
+    fun asMap(): Map<String, Long> =
+            mapOf(
+                    "heartbeatPings" to heartbeatPings,
+                    "quicPings" to quicPings,
+                    "snapshotSerializations" to snapshotSerializations,
+                    "networkCallbacks" to networkCallbacks,
+                    "mdnsWindows" to mdnsWindows,
+                    "relayTasksStarted" to relayTasksStarted,
+                    "relayTasksEnded" to relayTasksEnded,
+                    "supervisorRedials" to supervisorRedials,
             )
 }
 
@@ -97,7 +119,12 @@ data class BatterySample(
         val context: SampleContext,
 )
 
-/** One hour of rolled-up samples, persisted across restarts. */
+/** One hour of rolled-up samples, persisted across restarts.
+ * `wakeupsBySource` is the per-source wakeup rate (per
+ * [WakeupCounts] field, e.g. "heartbeatPings" -> 144.0) and
+ * `threadCpuMsPerHour` the per-thread CPU rate (per
+ * [ThreadCpuReader] label); both default empty so aggregates
+ * written by older builds still decode. */
 data class HourAggregate(
         val hourStartMs: Long,
         val sampleCount: Int,
@@ -107,6 +134,8 @@ data class HourAggregate(
         /** mAh/h per segment key ("idle", "wifi", "peerSharingOn", …);
          * only segments with a computable rate are present. */
         val segments: Map<String, Double>,
+        val wakeupsBySource: Map<String, Double> = emptyMap(),
+        val threadCpuMsPerHour: Map<String, Double> = emptyMap(),
 )
 
 /** Pure rate math over samples. No Android APIs: unit-testable on the JVM. */
@@ -132,8 +161,9 @@ object BatteryProfileMath {
      * last) charge counter / elapsed hours. Null when the counter is
      * unavailable, fewer than two discharging samples exist, or the
      * span is under a minute. A counter that rose while discharging
-     * (weak charger, status lag) reports 0 rather than a negative
-     * drain. */
+     * (weak charger, status lag) is UNMEASURABLE that hour — it
+     * returns null, not 0.0, so "0.0 measured" (counter exactly
+     * flat) stays distinguishable from "no drain reading". */
     fun mahPerHour(samples: List<BatterySample>): Double? {
         val discharging =
                 samples.filter { !it.charging && it.chargeUah != null }
@@ -143,7 +173,7 @@ object BatteryProfileMath {
         val elapsedMs = last.timestampMs - first.timestampMs
         if (elapsedMs < MIN_WINDOW_MS) return null
         val drainedUah = (first.chargeUah!! - last.chargeUah!!).toDouble()
-        if (drainedUah < 0) return 0.0
+        if (drainedUah < 0) return null
         return drainedUah / 1000.0 / (elapsedMs / 3_600_000.0)
     }
 
@@ -164,6 +194,39 @@ object BatteryProfileMath {
         if (elapsedMs < MIN_WINDOW_MS) return null
         val delta = samples.last().wakeups.deltaFrom(samples.first().wakeups).total()
         return delta / (elapsedMs / 3_600_000.0)
+    }
+
+    /** Wakeups per hour per source (one rate per [WakeupCounts]
+     * field, keyed by field name). Empty when the span is too short
+     * to rate. A counter that went backwards contributes 0 for that
+     * field (see [WakeupCounts.deltaFrom]). */
+    fun wakeupRatesBySource(samples: List<BatterySample>): Map<String, Double> {
+        if (samples.size < 2) return emptyMap()
+        val elapsedMs = samples.last().timestampMs - samples.first().timestampMs
+        if (elapsedMs < MIN_WINDOW_MS) return emptyMap()
+        val hours = elapsedMs / 3_600_000.0
+        val delta = samples.last().wakeups.deltaFrom(samples.first().wakeups).asMap()
+        return delta.mapValues { (_, count) -> count / hours }
+    }
+
+    /** Process-thread CPU ms per hour, one rate per [ThreadCpuReader]
+     * label. A thread that appeared mid-span (or whose counter went
+     * backwards) contributes from its first observed value; a thread
+     * present only in the first sample contributes 0. Empty when the
+     * span is too short to rate. */
+    fun threadCpuMsPerHour(samples: List<BatterySample>): Map<String, Double> {
+        if (samples.size < 2) return emptyMap()
+        val elapsedMs = samples.last().timestampMs - samples.first().timestampMs
+        if (elapsedMs < MIN_WINDOW_MS) return emptyMap()
+        val hours = elapsedMs / 3_600_000.0
+        val first = samples.first().threadCpuMs
+        val last = samples.last().threadCpuMs
+        val labels = first.keys + last.keys
+        return labels.associateWith { label ->
+            val delta =
+                    ((last[label] ?: 0L) - (first[label] ?: 0L)).coerceAtLeast(0)
+            delta / hours
+        }
     }
 
     /** mAh/h per segment key, from the samples in each segment.
@@ -205,6 +268,16 @@ object BatteryProfileMath {
                     if (it.context.batterySaver) "batterySaverOn" else "batterySaverOff"
                 }
         )
+        segments.putAll(
+                segmentedMahPerHour(samples) {
+                    if (it.context.screenOn) "screenOn" else "screenOff"
+                }
+        )
+        segments.putAll(
+                segmentedMahPerHour(samples) {
+                    if (it.context.doze) "doze" else "notDoze"
+                }
+        )
         return HourAggregate(
                 hourStartMs = hourStartMs,
                 sampleCount = samples.size,
@@ -212,6 +285,8 @@ object BatteryProfileMath {
                 cpuMsPerHour = cpuMsPerHour(samples),
                 wakeupsPerHour = wakeupsPerHour(samples),
                 segments = segments,
+                wakeupsBySource = wakeupRatesBySource(samples),
+                threadCpuMsPerHour = threadCpuMsPerHour(samples),
         )
     }
 }
@@ -252,6 +327,20 @@ object ThreadCpuReader {
         val utime = fields[11].toLongOrNull() ?: return null
         val stime = fields[12].toLongOrNull() ?: return null
         return (utime + stime) * TICK_MS
+    }
+
+    /** Process CPU ms from /proc/self/stat (utime + stime, fields
+     * 14 + 15) — the ground truth `batterystats` uses. Preferred
+     * over `Process.getElapsedCpuTime()`, whose value on the 6a
+     * advances at wall-clock rate (~3.6M ms/h, i.e. 100% of one
+     * core, while batterystats shows ~0.5%). Null when the file
+     * cannot be read or parsed; the caller falls back. */
+    fun readProcessCpuMs(statFile: File = File("/proc/self/stat")): Long? {
+        return try {
+            parseStatCpuMs(statFile.readText())
+        } catch (_: Exception) {
+            null
+        }
     }
 
     /** Read CPU ms per tracked thread name from a task dir
@@ -305,12 +394,22 @@ object BatteryAggregatesCodec {
                     agg.segments.entries.joinToString(",") { (key, value) ->
                         "\"$key\":$value"
                     }
+            val wakeupsBySource =
+                    agg.wakeupsBySource.entries.joinToString(",") { (key, value) ->
+                        "\"$key\":$value"
+                    }
+            val threadCpu =
+                    agg.threadCpuMsPerHour.entries.joinToString(",") { (key, value) ->
+                        "\"$key\":$value"
+                    }
             val mah = agg.mahPerHour?.toString() ?: "null"
             val cpu = agg.cpuMsPerHour?.toString() ?: "null"
             val wakeups = agg.wakeupsPerHour?.toString() ?: "null"
             "{\"hour\":${agg.hourStartMs},\"samples\":${agg.sampleCount}," +
                     "\"mah\":$mah,\"cpu\":$cpu,\"wakeups\":$wakeups," +
-                    "\"segments\":{$segments}}"
+                    "\"segments\":{$segments}," +
+                    "\"wakeupsBySource\":{$wakeupsBySource}," +
+                    "\"threadCpu\":{$threadCpu}}"
         }
     }
 
@@ -331,34 +430,42 @@ object BatteryAggregatesCodec {
         return token.toDoubleOrNull()
     }
 
+    /** Parse a `"key":{"a":1.0,"b":2.0}` object. Absent or malformed
+     * keys yield an empty map, so aggregates written by older builds
+     * (which lack the newer keys) still decode. Values are numbers,
+     * so the body ends at the first '}'. */
+    private fun stringDoubleMapAfter(line: String, key: String): Map<String, Double> {
+        val start = line.indexOf("\"$key\":{")
+        if (start < 0) return emptyMap()
+        val body =
+                line.substring(start + key.length + 4)
+                        .substringBefore('}')
+        if (body.isBlank()) return emptyMap()
+        val out = mutableMapOf<String, Double>()
+        for (entry in body.split(",")) {
+            val parts = entry.split(":")
+            if (parts.size != 2) continue
+            val entryKey = parts[0].trim().trim('"')
+            val value = parts[1].trim().toDoubleOrNull() ?: continue
+            out[entryKey] = value
+        }
+        return out
+    }
+
     private fun decodeLine(line: String): HourAggregate? {
         val trimmed = line.trim()
         if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) return null
         val hour = numberAfter(trimmed, "hour")?.toLong() ?: return null
         val samples = numberAfter(trimmed, "samples")?.toInt() ?: return null
-        val segments = mutableMapOf<String, Double>()
-        val segStart = trimmed.indexOf("\"segments\":{")
-        if (segStart >= 0) {
-            val segBody =
-                    trimmed.substring(segStart + "\"segments\":{".length)
-                            .substringBefore('}')
-            if (segBody.isNotBlank()) {
-                for (entry in segBody.split(",")) {
-                    val parts = entry.split(":")
-                    if (parts.size != 2) continue
-                    val key = parts[0].trim().trim('"')
-                    val value = parts[1].trim().toDoubleOrNull() ?: continue
-                    segments[key] = value
-                }
-            }
-        }
         return HourAggregate(
                 hourStartMs = hour,
                 sampleCount = samples,
                 mahPerHour = numberAfter(trimmed, "mah"),
                 cpuMsPerHour = numberAfter(trimmed, "cpu"),
                 wakeupsPerHour = numberAfter(trimmed, "wakeups"),
-                segments = segments,
+                segments = stringDoubleMapAfter(trimmed, "segments"),
+                wakeupsBySource = stringDoubleMapAfter(trimmed, "wakeupsBySource"),
+                threadCpuMsPerHour = stringDoubleMapAfter(trimmed, "threadCpu"),
         )
     }
 }
@@ -446,6 +553,7 @@ class BatteryProfiler(context: Context) {
                             mdnsWindows = mdnsWindows,
                             relayTasksStarted = snapshot.relayTasksStarted,
                             relayTasksEnded = snapshot.relayTasksEnded,
+                            supervisorRedials = snapshot.supervisorRedialAttempts,
                     )
             val sample =
                     BatterySample(
@@ -454,7 +562,14 @@ class BatteryProfiler(context: Context) {
                             currentUa = currentUa,
                             capacityPct = capacityPct,
                             charging = charging,
-                            processCpuMs = Process.getElapsedCpuTime(),
+                            // Process CPU from /proc/self/stat, not
+                            // Process.getElapsedCpuTime(): the latter
+                            // advances at wall-clock rate on the 6a
+                            // (~3.6M ms/h). Falls back to it only when
+                            // /proc is unreadable.
+                            processCpuMs =
+                                    ThreadCpuReader.readProcessCpuMs()
+                                            ?: Process.getElapsedCpuTime(),
                             threadCpuMs = ThreadCpuReader.read(),
                             wakeups = wakeups,
                             context = context,
@@ -639,6 +754,16 @@ class BatteryProfiler(context: Context) {
                     if (it.context.batterySaver) "batterySaverOn" else "batterySaverOff"
                 }
         )
+        segments.putAll(
+                BatteryProfileMath.segmentedMahPerHour(window) {
+                    if (it.context.screenOn) "screenOn" else "screenOff"
+                }
+        )
+        segments.putAll(
+                BatteryProfileMath.segmentedMahPerHour(window) {
+                    if (it.context.doze) "doze" else "notDoze"
+                }
+        )
         segmentSamples.putAll(
                 BatteryProfileMath.segmentSampleCounts(window) {
                     if (it.context.idle) "idle" else "active"
@@ -657,6 +782,16 @@ class BatteryProfiler(context: Context) {
                     if (it.context.batterySaver) "batterySaverOn" else "batterySaverOff"
                 }
         )
+        segmentSamples.putAll(
+                BatteryProfileMath.segmentSampleCounts(window) {
+                    if (it.context.screenOn) "screenOn" else "screenOff"
+                }
+        )
+        segmentSamples.putAll(
+                BatteryProfileMath.segmentSampleCounts(window) {
+                    if (it.context.doze) "doze" else "notDoze"
+                }
+        )
         val chargeAvailable = ring.any { it.chargeUah != null }
         val currentUa = ring.lastOrNull()?.currentUa
         val capacityPct = ring.lastOrNull()?.capacityPct
@@ -669,6 +804,8 @@ class BatteryProfiler(context: Context) {
                 "mahPerHour" to BatteryProfileMath.mahPerHour(window),
                 "cpuMsPerHour" to BatteryProfileMath.cpuMsPerHour(window),
                 "wakeupsPerHour" to BatteryProfileMath.wakeupsPerHour(window),
+                "wakeupsBySource" to BatteryProfileMath.wakeupRatesBySource(window),
+                "threadCpuMsPerHour" to BatteryProfileMath.threadCpuMsPerHour(window),
                 "currentUa" to currentUa,
                 "capacityPct" to capacityPct,
                 "segments" to segments,
@@ -683,6 +820,8 @@ class BatteryProfiler(context: Context) {
                                     "cpuMsPerHour" to agg.cpuMsPerHour,
                                     "wakeupsPerHour" to agg.wakeupsPerHour,
                                     "segments" to agg.segments,
+                                    "wakeupsBySource" to agg.wakeupsBySource,
+                                    "threadCpuMsPerHour" to agg.threadCpuMsPerHour,
                             )
                         },
         )

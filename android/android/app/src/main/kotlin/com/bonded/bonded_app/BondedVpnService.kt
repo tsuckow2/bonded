@@ -46,6 +46,9 @@ data class SessionSnapshot(
         /** Session heartbeat PINGs sent by the native worker (all
          * paths, all ticks). Wakeup accounting for the profiler. */
         val heartbeatPingsSent: Long = 0,
+        /** Path-supervisor re-dial attempts (one per due path per
+         * supervisor wakeup). Wakeup accounting for the profiler. */
+        val supervisorRedialAttempts: Long = 0,
         /** Relay pump tasks started / ended (one per accepted leg).
          * Wakeup accounting for the profiler. */
         val relayTasksStarted: Long = 0,
@@ -967,6 +970,7 @@ class BondedVpnService : VpnService() {
                     relayedUpBytes = json.optLong("relayedUpBytes", 0),
                     relayedDownBytes = json.optLong("relayedDownBytes", 0),
                     heartbeatPingsSent = json.optLong("heartbeatPingsSent", 0),
+                    supervisorRedialAttempts = json.optLong("supervisorRedialAttempts", 0),
                     relayTasksStarted = json.optLong("relayTasksStarted", 0),
                     relayTasksEnded = json.optLong("relayTasksEnded", 0),
                     connectedAtMs = json.optLong("connectedAtMs", 0),

@@ -11,10 +11,12 @@ class BatteryProfilerTest {
             networkKind: String = "wifi",
             peerSharing: Boolean = false,
             batterySaver: Boolean = false,
+            screenOn: Boolean = true,
+            doze: Boolean = false,
     ) = SampleContext(
             idle = idle,
-            screenOn = true,
-            doze = false,
+            screenOn = screenOn,
+            doze = doze,
             powerSave = false,
             peerSharing = peerSharing,
             activeRelays = 0,
@@ -32,6 +34,7 @@ class BatteryProfilerTest {
             chargeUah: Long? = 4_000_000,
             charging: Boolean = false,
             processCpuMs: Long = 0,
+            threadCpuMs: Map<String, Long> = emptyMap(),
             wakeups: WakeupCounts = WakeupCounts(),
             context: SampleContext = context(),
     ) = BatterySample(
@@ -41,7 +44,7 @@ class BatteryProfilerTest {
             capacityPct = 80,
             charging = charging,
             processCpuMs = processCpuMs,
-            threadCpuMs = emptyMap(),
+            threadCpuMs = threadCpuMs,
             wakeups = wakeups,
             context = context,
     )
@@ -87,10 +90,23 @@ class BatteryProfilerTest {
     }
 
     @Test
-    fun mahPerHour_counterRiseWhileDischargingReportsZero() {
+    fun mahPerHour_counterRiseWhileDischargingIsUnmeasurable() {
+        // The counter rose while discharging (weak charger / status
+        // lag): the drain that hour is unmeasurable, not zero.
         val samples = listOf(
                 sample(atMs = 0, chargeUah = 4_000_000),
                 sample(atMs = 3_600_000, chargeUah = 4_001_000),
+        )
+        assertNull(BatteryProfileMath.mahPerHour(samples))
+    }
+
+    @Test
+    fun mahPerHour_flatCounterWhileDischargingIsZero() {
+        // Counter exactly flat while discharging is a real measured
+        // 0.0 — distinct from the unmeasurable (null) case above.
+        val samples = listOf(
+                sample(atMs = 0, chargeUah = 4_000_000),
+                sample(atMs = 3_600_000, chargeUah = 4_000_000),
         )
         assertEquals(0.0, BatteryProfileMath.mahPerHour(samples)!!, 0.001)
     }
@@ -121,6 +137,111 @@ class BatteryProfilerTest {
         )
         // (144 + 288 + 120) over 1 h = 552/h.
         assertEquals(552.0, BatteryProfileMath.wakeupsPerHour(samples)!!, 0.001)
+    }
+
+    @Test
+    fun wakeupRatesBySource_splitsPerField() {
+        val samples = listOf(
+                sample(
+                        atMs = 0,
+                        wakeups = WakeupCounts(heartbeatPings = 10, supervisorRedials = 0),
+                ),
+                sample(
+                        atMs = 3_600_000,
+                        wakeups = WakeupCounts(
+                                heartbeatPings = 154,
+                                quicPings = 288,
+                                snapshotSerializations = 120,
+                                supervisorRedials = 180,
+                        ),
+                ),
+        )
+        val rates = BatteryProfileMath.wakeupRatesBySource(samples)
+        assertEquals(144.0, rates["heartbeatPings"]!!, 0.001)
+        assertEquals(288.0, rates["quicPings"]!!, 0.001)
+        assertEquals(120.0, rates["snapshotSerializations"]!!, 0.001)
+        assertEquals(180.0, rates["supervisorRedials"]!!, 0.001)
+        assertEquals(0.0, rates["networkCallbacks"]!!, 0.001)
+        // The total is the sum of the per-source rates.
+        assertEquals(732.0, rates.values.sum(), 0.001)
+        assertEquals(732.0, BatteryProfileMath.wakeupsPerHour(samples)!!, 0.001)
+    }
+
+    @Test
+    fun threadCpuMsPerHour_splitsPerThread() {
+        val samples = listOf(
+                sample(
+                        atMs = 0,
+                        threadCpuMs = mapOf(
+                                "bonded-session-monitor" to 1_000L,
+                                "tokio-runtime-worker" to 5_000L,
+                        ),
+                ),
+                sample(
+                        atMs = 3_600_000,
+                        threadCpuMs = mapOf(
+                                "bonded-session-monitor" to 4_000L,
+                                "tokio-runtime-worker" to 6_000L,
+                                "bonded-peer-window" to 500L,
+                        ),
+                ),
+        )
+        val rates = BatteryProfileMath.threadCpuMsPerHour(samples)
+        assertEquals(3000.0, rates["bonded-session-monitor"]!!, 0.001)
+        assertEquals(1000.0, rates["tokio-runtime-worker"]!!, 0.001)
+        // A thread that appeared mid-span counts from zero.
+        assertEquals(500.0, rates["bonded-peer-window"]!!, 0.001)
+    }
+
+    @Test
+    fun aggregateHour_persistsPerSourceAndPerThread() {
+        val samples = listOf(
+                sample(
+                        atMs = 0,
+                        chargeUah = 4_000_000,
+                        processCpuMs = 0,
+                        threadCpuMs = mapOf("bonded-session-monitor" to 1_000L),
+                        wakeups = WakeupCounts(heartbeatPings = 10),
+                        context = context(screenOn = true, doze = false),
+                ),
+                sample(
+                        atMs = 1_800_000,
+                        chargeUah = 3_970_000,
+                        processCpuMs = 3_000,
+                        threadCpuMs = mapOf("bonded-session-monitor" to 2_500L),
+                        wakeups = WakeupCounts(heartbeatPings = 82),
+                        context = context(screenOn = true, doze = false),
+                ),
+                sample(
+                        atMs = 1_800_000,
+                        chargeUah = 3_970_000,
+                        processCpuMs = 3_000,
+                        threadCpuMs = mapOf("bonded-session-monitor" to 2_500L),
+                        wakeups = WakeupCounts(heartbeatPings = 82),
+                        context = context(screenOn = false, doze = true),
+                ),
+                sample(
+                        atMs = 3_600_000,
+                        chargeUah = 3_900_000,
+                        processCpuMs = 6_000,
+                        threadCpuMs = mapOf("bonded-session-monitor" to 4_000L),
+                        wakeups = WakeupCounts(
+                                heartbeatPings = 154,
+                                supervisorRedials = 180,
+                        ),
+                        context = context(screenOn = false, doze = true),
+                ),
+        )
+        val agg = BatteryProfileMath.aggregateHour(samples, 0L)
+        assertEquals(144.0, agg.wakeupsBySource["heartbeatPings"]!!, 0.001)
+        assertEquals(180.0, agg.wakeupsBySource["supervisorRedials"]!!, 0.001)
+        assertEquals(3000.0, agg.threadCpuMsPerHour["bonded-session-monitor"]!!, 0.001)
+        // Screen-on half drained 30 mAh over 0.5 h = 60 mAh/h;
+        // screen-off half drained 70 mAh over 0.5 h = 140 mAh/h.
+        assertEquals(60.0, agg.segments["screenOn"]!!, 0.001)
+        assertEquals(140.0, agg.segments["screenOff"]!!, 0.001)
+        assertEquals(140.0, agg.segments["doze"]!!, 0.001)
+        assertEquals(60.0, agg.segments["notDoze"]!!, 0.001)
     }
 
     @Test
@@ -234,6 +355,13 @@ class BatteryProfilerTest {
                         cpuMsPerHour = 4500.0,
                         wakeupsPerHour = 88.0,
                         segments = mapOf("idle" to 9.0, "wifi" to 11.0),
+                        wakeupsBySource = mapOf(
+                                "heartbeatPings" to 144.0,
+                                "supervisorRedials" to 180.0,
+                        ),
+                        threadCpuMsPerHour = mapOf(
+                                "bonded-session-monitor" to 3000.0,
+                        ),
                 ),
                 HourAggregate(
                         hourStartMs = 1_700_003_600_000,
@@ -252,8 +380,49 @@ class BatteryProfilerTest {
         assertEquals(12.5, decoded[0].mahPerHour!!, 0.001)
         assertEquals(9.0, decoded[0].segments["idle"]!!, 0.001)
         assertEquals(11.0, decoded[0].segments["wifi"]!!, 0.001)
+        assertEquals(144.0, decoded[0].wakeupsBySource["heartbeatPings"]!!, 0.001)
+        assertEquals(180.0, decoded[0].wakeupsBySource["supervisorRedials"]!!, 0.001)
+        assertEquals(
+                3000.0,
+                decoded[0].threadCpuMsPerHour["bonded-session-monitor"]!!,
+                0.001,
+        )
         assertNull(decoded[1].mahPerHour)
         assertTrue(decoded[1].segments.isEmpty())
+        assertTrue(decoded[1].wakeupsBySource.isEmpty())
+        assertTrue(decoded[1].threadCpuMsPerHour.isEmpty())
+    }
+
+    @Test
+    fun aggregatesCodec_decodesOldFormatLines() {
+        // Aggregates written before the per-source / per-thread maps
+        // existed decode with empty maps, not a dropped line.
+        val oldLine =
+                "{\"hour\":1700000000000,\"samples\":120,\"mah\":12.5," +
+                        "\"cpu\":4500.0,\"wakeups\":88.0," +
+                        "\"segments\":{\"idle\":9.0}}"
+        val decoded = BatteryAggregatesCodec.decode(oldLine)
+        assertEquals(1, decoded.size)
+        assertEquals(9.0, decoded[0].segments["idle"]!!, 0.001)
+        assertTrue(decoded[0].wakeupsBySource.isEmpty())
+        assertTrue(decoded[0].threadCpuMsPerHour.isEmpty())
+    }
+
+    @Test
+    fun processCpu_readsProcSelfStat() {
+        // pid (comm) state ppid ... utime=100 stime=50 => 1500 ms.
+        val dir = kotlin.io.path.createTempDirectory("bonded-proc-cpu-test").toFile()
+        try {
+            val stat = java.io.File(dir, "stat")
+            stat.writeText(
+                    "1234 (bonded) S 1 1234 1234 0 -1 4194304 " +
+                            "100 0 0 0 100 50 0 0 20 0 1 0 100 1000000 1000"
+            )
+            assertEquals(1500L, ThreadCpuReader.readProcessCpuMs(stat))
+            assertNull(ThreadCpuReader.readProcessCpuMs(java.io.File(dir, "missing")))
+        } finally {
+            dir.deleteRecursively()
+        }
     }
 
     @Test

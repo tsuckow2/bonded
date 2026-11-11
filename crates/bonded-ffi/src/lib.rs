@@ -509,11 +509,19 @@ struct AndroidSessionHandle {
 /// via `WireStats::ping_frames_tx`; relay task counts live on
 /// [`PeerShareRelayStats`]. A fresh instance is created per session
 /// start, so the counters are per-session like the relayed bytes.
-#[cfg(any(target_os = "android", test))]
+/// Not cfg-gated (unlike the Android snapshot machinery around it):
+/// the path supervisor — compiled on every target — increments the
+/// re-dial counter, so the type must exist on all targets.
 #[derive(Debug, Default)]
-struct SessionWakeupStats {
+pub(crate) struct SessionWakeupStats {
     /// Session heartbeat PING frames sent (all paths, all ticks).
-    pub heartbeat_pings_sent: AtomicU64,
+    pub heartbeat_pings_sent: std::sync::atomic::AtomicU64,
+    /// Path-supervisor re-dial attempts (one per due path per
+    /// supervisor wakeup). Incremented by the supervisor task, read
+    /// live at snapshot serialization like the heartbeat count, so
+    /// the profiler can attribute the re-dial loop's share of the
+    /// wakeups (battery investigation §5(b)/§9).
+    pub supervisor_redial_attempts: std::sync::atomic::AtomicU64,
 }
 
 #[cfg(any(target_os = "android", test))]
@@ -838,7 +846,7 @@ fn snapshot_json(snapshot: &AndroidSessionSnapshot) -> String {
         .join(",");
 
     format!(
-        "{{\"state\":\"{}\",\"serverAddress\":\"{}\",\"activeTransport\":\"{}\",\"transportCount\":{},\"peerRelayCount\":{},\"outboundPackets\":{},\"inboundPackets\":{},\"outboundBytes\":{},\"inboundBytes\":{},\"relayedUpBytes\":{},\"relayedDownBytes\":{},\"heartbeatPingsSent\":{},\"relayTasksStarted\":{},\"relayTasksEnded\":{},\"connectedAtMs\":{},\"lastError\":{},\"peerShareError\":{},\"interception\":{},\"paths\":[{}]}}",
+        "{{\"state\":\"{}\",\"serverAddress\":\"{}\",\"activeTransport\":\"{}\",\"transportCount\":{},\"peerRelayCount\":{},\"outboundPackets\":{},\"inboundPackets\":{},\"outboundBytes\":{},\"inboundBytes\":{},\"relayedUpBytes\":{},\"relayedDownBytes\":{},\"heartbeatPingsSent\":{},\"supervisorRedialAttempts\":{},\"relayTasksStarted\":{},\"relayTasksEnded\":{},\"connectedAtMs\":{},\"lastError\":{},\"peerShareError\":{},\"interception\":{},\"paths\":[{}]}}",
         escape_json(&snapshot.state),
         escape_json(&snapshot.server_address),
         escape_json(&snapshot.active_transport),
@@ -859,6 +867,10 @@ fn snapshot_json(snapshot: &AndroidSessionSnapshot) -> String {
         snapshot
             .wakeup_stats
             .heartbeat_pings_sent
+            .load(Ordering::Relaxed),
+        snapshot
+            .wakeup_stats
+            .supervisor_redial_attempts
             .load(Ordering::Relaxed),
         snapshot
             .relay_stats
@@ -2026,6 +2038,7 @@ fn start_android_session(
                     path_addresses.clone(),
                     redial_outcome_tx.clone(),
                     supervisor_log.clone(),
+                    Arc::clone(&wakeup_stats),
                 ))
             } else {
                 None
@@ -2363,6 +2376,7 @@ fn start_android_session(
                                                     path_addresses.clone(),
                                                     redial_outcome_tx.clone(),
                                                     supervisor_log.clone(),
+                                                    Arc::clone(&wakeup_stats),
                                                 );
                                                 supervisor_present = true;
                                                 let _ = supervisor_paths_tx.send(
@@ -4209,6 +4223,9 @@ mod tests {
         wakeup_stats
             .heartbeat_pings_sent
             .fetch_add(42, super::Ordering::Relaxed);
+        wakeup_stats
+            .supervisor_redial_attempts
+            .fetch_add(5, super::Ordering::Relaxed);
         let snapshot = AndroidSessionSnapshot {
             state: "connected".to_owned(),
             server_address: "example.test:443".to_owned(),
@@ -4267,6 +4284,10 @@ mod tests {
         assert!(
             json.contains("\"heartbeatPingsSent\":42"),
             "heartbeat pings missing: {json}"
+        );
+        assert!(
+            json.contains("\"supervisorRedialAttempts\":5"),
+            "supervisor re-dial attempts missing: {json}"
         );
         assert!(
             json.contains("\"relayTasksStarted\":2"),

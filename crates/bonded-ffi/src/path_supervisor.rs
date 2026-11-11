@@ -23,6 +23,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use bonded_client::{
@@ -35,6 +36,8 @@ use bonded_core::session::{
 use bytes::Bytes;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+
+use crate::SessionWakeupStats;
 
 /// Delay between a path being reported lost and the first re-dial.
 /// Loss detection (heartbeat eviction) already lags the real death by
@@ -495,6 +498,7 @@ pub fn spawn_path_supervisor(
     path_addresses: Arc<std::sync::RwLock<HashMap<usize, String>>>,
     outcome_tx: mpsc::UnboundedSender<RedialOutcome>,
     log: Arc<dyn Fn(String) + Send + Sync>,
+    wakeup_stats: Arc<SessionWakeupStats>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut state =
@@ -555,6 +559,13 @@ pub fn spawn_path_supervisor(
                         if cancel_token.is_cancelled() {
                             return;
                         }
+                        // Profiler (§5(b)): count every re-dial
+                        // attempt, success or failure, so the
+                        // hourly aggregates can attribute the
+                        // re-dial loop's share of the wakeups.
+                        wakeup_stats
+                            .supervisor_redial_attempts
+                            .fetch_add(1, Ordering::Relaxed);
                         match attempt_redial(
                             &config,
                             path,
