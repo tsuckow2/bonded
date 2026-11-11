@@ -376,6 +376,11 @@ struct PeerLegTracker {
     legs: HashMap<String, usize>,
     generations: HashMap<String, u64>,
     expires_at: HashMap<String, u64>,
+    // Direction of the peer's NEWEST leg: true when it arrived via
+    // a reversed introduction (4.66). Renewal follows the newest
+    // leg's direction, so a reversed leg renews in reverse instead
+    // of re-dialing forward into the hotspot case.
+    reversed: HashMap<String, bool>,
 }
 
 impl PeerLegTracker {
@@ -387,10 +392,17 @@ impl PeerLegTracker {
         self.legs.get(peer_id).copied().unwrap_or(0)
     }
 
+    /// Whether the peer's newest leg arrived via a reversed
+    /// introduction. False for forward legs and unknown peers.
+    fn is_reversed(&self, peer_id: &str) -> bool {
+        self.reversed.get(peer_id).copied().unwrap_or(false)
+    }
+
     /// Record a freshly dialed leg; returns its renewal generation.
-    fn note_dial(&mut self, peer_id: &str, expires_at: u64) -> u64 {
+    fn note_dial(&mut self, peer_id: &str, expires_at: u64, reversed: bool) -> u64 {
         *self.legs.entry(peer_id.to_owned()).or_default() += 1;
         self.expires_at.insert(peer_id.to_owned(), expires_at);
+        self.reversed.insert(peer_id.to_owned(), reversed);
         let generation = self.generations.entry(peer_id.to_owned()).or_default();
         *generation += 1;
         *generation
@@ -459,27 +471,55 @@ fn schedule_renewal_retry(
 /// refused with `no_path` and the provider never opens an upstream
 /// for a leg the consumer would drop; the browse loop is the second
 /// layer and drops a reversed leg that arrives anyway (see
-/// [`note_reversed_leg`]).
+/// [`note_reversed_leg`]). The second set tracks peers whose
+/// reversed leg is mid-renewal (4.66): the browse loop marks a peer
+/// while requesting a fresh reversed introduction, and both dedup
+/// layers admit the replacement leg while the old one is still
+/// live, so make-before-break holds in the reverse direction too.
 #[derive(Clone, Default)]
-struct ConnectedPeers(Arc<std::sync::Mutex<HashSet<String>>>);
+struct ConnectedPeers {
+    connected: Arc<std::sync::Mutex<HashSet<String>>>,
+    reversed_renewal_pending: Arc<std::sync::Mutex<HashSet<String>>>,
+}
 
 impl ConnectedPeers {
     fn mark_connected(&self, peer_id: &str) {
-        self.0
+        self.connected
             .lock()
             .expect("connected peers lock poisoned")
             .insert(peer_id.to_owned());
     }
 
     fn mark_disconnected(&self, peer_id: &str) {
-        self.0
+        self.connected
             .lock()
             .expect("connected peers lock poisoned")
             .remove(peer_id);
     }
 
     fn is_connected(&self, peer_id: &str) -> bool {
-        self.0
+        self.connected
+            .lock()
+            .expect("connected peers lock poisoned")
+            .contains(peer_id)
+    }
+
+    fn mark_reversed_renewal_pending(&self, peer_id: &str) {
+        self.reversed_renewal_pending
+            .lock()
+            .expect("connected peers lock poisoned")
+            .insert(peer_id.to_owned());
+    }
+
+    fn clear_reversed_renewal_pending(&self, peer_id: &str) {
+        self.reversed_renewal_pending
+            .lock()
+            .expect("connected peers lock poisoned")
+            .remove(peer_id);
+    }
+
+    fn is_reversed_renewal_pending(&self, peer_id: &str) -> bool {
+        self.reversed_renewal_pending
             .lock()
             .expect("connected peers lock poisoned")
             .contains(peer_id)
@@ -507,6 +547,12 @@ struct ReversedLeg {
 /// shared by the forward accept loop and the dial-back handler, so
 /// at most one leg exists per (peer, provider path) in either
 /// direction.
+///
+/// Exception (4.66): when a reversed renewal is pending for the
+/// peer, the incoming leg is the replacement for the still-live leg,
+/// not a duplicate — it is accepted (the renewal overlap), and the
+/// pending mark is cleared. The old leg's close later drops the
+/// count back to one.
 fn note_reversed_leg(
     legs: &mut PeerLegTracker,
     connected: &ConnectedPeers,
@@ -514,10 +560,13 @@ fn note_reversed_leg(
     expires_at: u64,
 ) -> Option<u64> {
     if legs.is_connected(peer_id) || connected.is_connected(peer_id) {
-        return None;
+        if !connected.is_reversed_renewal_pending(peer_id) {
+            return None;
+        }
     }
-    let generation = legs.note_dial(peer_id, expires_at);
+    let generation = legs.note_dial(peer_id, expires_at, true);
     connected.mark_connected(peer_id);
+    connected.clear_reversed_renewal_pending(peer_id);
     Some(generation)
 }
 
@@ -939,7 +988,9 @@ async fn run_peer_accept_loop(
         // runtime has no consumer side and rejects the leg; a
         // duplicate (this device already holds a leg for the peer)
         // is refused with no_path, which is the dial-back handler's
-        // stop signal.
+        // stop signal. Exception (4.66): when a reversed renewal is
+        // pending for the peer, the leg is the replacement for the
+        // still-live leg, not a duplicate, so it is accepted.
         if introduction.introduction.is_reverse() {
             let provider_key = introduction
                 .introduction
@@ -957,7 +1008,9 @@ async fn run_peer_accept_loop(
                 }
                 continue;
             };
-            if connected_peers.is_connected(&peer_id) {
+            if connected_peers.is_connected(&peer_id)
+                && !connected_peers.is_reversed_renewal_pending(&peer_id)
+            {
                 warn!(peer = %peer_id, "reversed relay refused: duplicate leg for already-connected peer");
                 emit_peer_share_event(
                     logger.as_ref(),
@@ -1532,6 +1585,12 @@ pub async fn start_peer_share_runtime(
                     Some(peer_id) = closed_peer_rx.recv() => {
                         if legs.note_close(&peer_id) {
                             browse_connected_peers.mark_disconnected(&peer_id);
+                            // A dead renewal is dead: the replacement
+                            // leg never arrived, so no pending
+                            // renewal may admit a later leg for this
+                            // peer (the redial below re-drives it).
+                            browse_connected_peers
+                                .clear_reversed_renewal_pending(&peer_id);
                             info!(peer = %peer_id, "peer-share path closed; allowing rediscovery");
                             emit_peer_share_event(
                                 browse_logger.as_ref(),
@@ -1626,6 +1685,58 @@ pub async fn start_peer_share_runtime(
                                     browse_logger.as_ref(),
                                     format!("relay renewal due for peer={peer_id}"),
                                 );
+                                if legs.is_reversed(&peer_id) && browse_dial_back.is_some() {
+                                    // Reverse-aware renewal (4.66): the
+                                    // live leg arrived via a reversed
+                                    // introduction, so the forward dial
+                                    // below would fail in the hotspot
+                                    // case — the provider's forward
+                                    // addresses are unreachable from
+                                    // here. Request a fresh
+                                    // introduction with dial-back
+                                    // instead; the server mints a
+                                    // reversed introduction and pushes
+                                    // a dial-back notification, and the
+                                    // provider dials the replacement
+                                    // leg to this device's listener.
+                                    // The pending mark admits that leg
+                                    // while the old one is still live
+                                    // (make-before-break); the retry
+                                    // notice is the backstop when the
+                                    // dial-back never arrives. A
+                                    // consumer-only runtime has no
+                                    // dial-back params and can never
+                                    // hold a reversed leg, so the
+                                    // forward path below is only a
+                                    // defensive fallback there.
+                                    browse_connected_peers
+                                        .mark_reversed_renewal_pending(&peer_id);
+                                    match request_peer_share_introduction(
+                                        &browse_config,
+                                        &browse_device_keypair,
+                                        &advertisement,
+                                        browse_dial_back.as_ref(),
+                                    )
+                                    .await
+                                    {
+                                        Ok(_) => {
+                                            info!(peer = %peer_id, "peer-share reversed relay renewal requested; awaiting dial-back");
+                                            emit_peer_share_event(
+                                                browse_logger.as_ref(),
+                                                format!("reversed relay renewal requested for peer={peer_id}; awaiting dial-back"),
+                                            );
+                                        }
+                                        Err(err) => {
+                                            warn!(error = %err, peer = %peer_id, "peer-share reversed renewal introduction request failed");
+                                            emit_peer_share_event(
+                                                browse_logger.as_ref(),
+                                                format!("reversed renewal introduction request failed for peer={peer_id}: {err}"),
+                                            );
+                                        }
+                                    }
+                                    schedule_renewal_retry(&legs, &renewal_tx, &peer_id);
+                                    continue;
+                                }
                                 (advertisement.clone(), false, true)
                             }
                             None => continue,
@@ -1748,7 +1859,7 @@ pub async fn start_peer_share_runtime(
                             break;
                         }
                         legs_dialed += 1;
-                        generation = legs.note_dial(&peer_id, relay_expires_at);
+                        generation = legs.note_dial(&peer_id, relay_expires_at, false);
                         browse_connected_peers.mark_connected(&peer_id);
                     }
                     Ok(PeerRelayDial::NoPath) => {
@@ -2508,12 +2619,12 @@ mod tests {
 
         // First dial: connected with one leg; rediscovery signal only
         // fires when the LAST leg closes.
-        tracker.note_dial("peer-a", 1_000);
+        tracker.note_dial("peer-a", 1_000, false);
         assert!(tracker.is_connected("peer-a"));
         assert_eq!(tracker.leg_count("peer-a"), 1);
 
         // Renewal overlap: a second leg for the same peer.
-        tracker.note_dial("peer-a", 1_240);
+        tracker.note_dial("peer-a", 1_240, false);
         assert_eq!(tracker.leg_count("peer-a"), 2);
         assert!(!tracker.note_close("peer-a"));
         assert!(tracker.is_connected("peer-a"));
@@ -2569,12 +2680,12 @@ mod tests {
     #[test]
     fn leg_tracker_generations_invalidate_stale_renewal_notices() {
         let mut tracker = PeerLegTracker::default();
-        let first = tracker.note_dial("peer-a", 1_000);
+        let first = tracker.note_dial("peer-a", 1_000, false);
         assert!(tracker.is_current_generation("peer-a", first));
         assert_eq!(tracker.current_expires_at("peer-a"), Some(1_000));
 
         // A renewal dial supersedes the first dial's schedule.
-        let second = tracker.note_dial("peer-a", 1_240);
+        let second = tracker.note_dial("peer-a", 1_240, false);
         assert_ne!(first, second);
         assert!(!tracker.is_current_generation("peer-a", first));
         assert!(tracker.is_current_generation("peer-a", second));
@@ -3373,7 +3484,7 @@ mod tests {
         // accept check and the handoff).
         let mut legs = PeerLegTracker::default();
         let connected = ConnectedPeers::default();
-        legs.note_dial("peer-a:nonce-1", 1_000);
+        legs.note_dial("peer-a:nonce-1", 1_000, false);
         connected.mark_connected("peer-a:nonce-1");
         assert_eq!(
             note_reversed_leg(&mut legs, &connected, "peer-a:nonce-1", 1_000),
@@ -3393,6 +3504,65 @@ mod tests {
         connected.mark_disconnected("peer-a:nonce-1");
         assert!(note_reversed_leg(&mut legs, &connected, "peer-a:nonce-1", 1_300).is_some());
         assert!(legs.is_connected("peer-a:nonce-1"));
+    }
+
+    #[test]
+    fn leg_tracker_records_direction_of_newest_leg() {
+        // Renewal direction selection (4.66): the tracker remembers
+        // how the peer's NEWEST leg was established, so a reversed
+        // leg renews in reverse and a forward leg renews forward.
+        let mut tracker = PeerLegTracker::default();
+        assert!(!tracker.is_reversed("peer-a"));
+
+        tracker.note_dial("peer-a", 1_000, false);
+        assert!(!tracker.is_reversed("peer-a"));
+
+        // A reversed leg supersedes the forward one (renewal
+        // overlap): the newest leg governs the next renewal.
+        tracker.note_dial("peer-a", 1_240, true);
+        assert!(tracker.is_reversed("peer-a"));
+
+        // And a later forward leg flips it back.
+        tracker.note_dial("peer-a", 1_480, false);
+        assert!(!tracker.is_reversed("peer-a"));
+    }
+
+    #[test]
+    fn reversed_leg_accepted_as_renewal_replacement_while_connected() {
+        // Reverse-aware renewal (4.66): the consumer holds a live
+        // leg for the peer and a reversed renewal is pending, so the
+        // incoming reversed leg is the replacement, not a duplicate
+        // — it is accepted with a fresh renewal generation, the
+        // pending mark is cleared, and the leg count briefly holds
+        // both legs (make-before-break); the old leg's close drops
+        // it back to one.
+        let mut legs = PeerLegTracker::default();
+        let connected = ConnectedPeers::default();
+        legs.note_dial("peer-a:nonce-1", 1_000, true);
+        connected.mark_connected("peer-a:nonce-1");
+        assert!(legs.is_reversed("peer-a:nonce-1"));
+
+        connected.mark_reversed_renewal_pending("peer-a:nonce-1");
+        let generation =
+            note_reversed_leg(&mut legs, &connected, "peer-a:nonce-1", 1_300)
+                .expect("renewal replacement should be accepted");
+        assert_eq!(generation, 2);
+        assert_eq!(legs.leg_count("peer-a:nonce-1"), 2);
+        assert!(legs.is_reversed("peer-a:nonce-1"));
+        assert!(!connected.is_reversed_renewal_pending("peer-a:nonce-1"));
+
+        // The old leg closing leaves the replacement standing.
+        assert!(!legs.note_close("peer-a:nonce-1"));
+        assert!(legs.is_connected("peer-a:nonce-1"));
+        assert_eq!(legs.leg_count("peer-a:nonce-1"), 1);
+
+        // Without a pending renewal the same situation is still a
+        // duplicate: the next reversed leg is dropped.
+        assert_eq!(
+            note_reversed_leg(&mut legs, &connected, "peer-a:nonce-1", 1_600),
+            None
+        );
+        assert_eq!(legs.leg_count("peer-a:nonce-1"), 1);
     }
 
     #[test]
