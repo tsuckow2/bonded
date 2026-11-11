@@ -377,7 +377,7 @@ struct PeerLegTracker {
     generations: HashMap<String, u64>,
     expires_at: HashMap<String, u64>,
     // Direction of the peer's NEWEST leg: true when it arrived via
-    // a reversed introduction (4.66). Renewal follows the newest
+    // a reversed introduction (4.67). Renewal follows the newest
     // leg's direction, so a reversed leg renews in reverse instead
     // of re-dialing forward into the hotspot case.
     reversed: HashMap<String, bool>,
@@ -472,7 +472,7 @@ fn schedule_renewal_retry(
 /// for a leg the consumer would drop; the browse loop is the second
 /// layer and drops a reversed leg that arrives anyway (see
 /// [`note_reversed_leg`]). The second set tracks peers whose
-/// reversed leg is mid-renewal (4.66): the browse loop marks a peer
+/// reversed leg is mid-renewal (4.67): the browse loop marks a peer
 /// while requesting a fresh reversed introduction, and both dedup
 /// layers admit the replacement leg while the old one is still
 /// live, so make-before-break holds in the reverse direction too.
@@ -548,7 +548,7 @@ struct ReversedLeg {
 /// at most one leg exists per (peer, provider path) in either
 /// direction.
 ///
-/// Exception (4.66): when a reversed renewal is pending for the
+/// Exception (4.67): when a reversed renewal is pending for the
 /// peer, the incoming leg is the replacement for the still-live leg,
 /// not a duplicate — it is accepted (the renewal overlap), and the
 /// pending mark is cleared. The old leg's close later drops the
@@ -988,7 +988,7 @@ async fn run_peer_accept_loop(
         // runtime has no consumer side and rejects the leg; a
         // duplicate (this device already holds a leg for the peer)
         // is refused with no_path, which is the dial-back handler's
-        // stop signal. Exception (4.66): when a reversed renewal is
+        // stop signal. Exception (4.67): when a reversed renewal is
         // pending for the peer, the leg is the replacement for the
         // still-live leg, not a duplicate, so it is accepted.
         if introduction.introduction.is_reverse() {
@@ -1333,7 +1333,7 @@ pub async fn start_peer_share_runtime(
     // the advertise watcher only ever re-registers the advertisement
     // (never re-binds). The certificate is embedded in the endpoint;
     // the raw DER is persisted next to the device keypair, so the
-    // listener fingerprint survives a runtime restart (4.66).
+    // listener fingerprint survives a runtime restart (4.68).
     let (
         listener_endpoint,
         listener_identity,
@@ -1343,7 +1343,7 @@ pub async fn start_peer_share_runtime(
         listener_port,
     ) = if is_provider {
         let (endpoint, identity, adv, advertise_ips, port) =
-            build_listener_runtime(config, &device_keypair, provider_paths.as_ref())?;
+            build_listener_runtime(config, &device_keypair, provider_paths.as_ref()).await?;
         let advertiser = PeerShareAdvertiser::start(&adv)?;
         (
             Some(endpoint),
@@ -1687,7 +1687,7 @@ pub async fn start_peer_share_runtime(
                                     format!("relay renewal due for peer={peer_id}"),
                                 );
                                 if legs.is_reversed(&peer_id) && browse_dial_back.is_some() {
-                                    // Reverse-aware renewal (4.66): the
+                                    // Reverse-aware renewal (4.67): the
                                     // live leg arrived via a reversed
                                     // introduction, so the forward dial
                                     // below would fail in the hotspot
@@ -2037,24 +2037,95 @@ async fn establish_peer_upstream_paths(
         .collect())
 }
 
+/// Maximum bind attempts for the peer-share listener when the port
+/// is already held (4.69): a second session worker starting while the
+/// first still holds 0.0.0.0:54443 retries instead of dropping
+/// peer-share on the first EADDRINUSE. The race is transient — the
+/// previous worker's runtime drop releases the socket — so a short
+/// bounded retry recovers it; a genuinely duplicate session (first
+/// worker still alive) exhausts the budget and the error propagates
+/// to the caller instead of spinning forever.
+const PEER_LISTENER_BIND_MAX_ATTEMPTS: usize = 10;
+
+/// Backoff between peer-share listener bind attempts (4.69): 100 ms,
+/// doubling to a 500 ms cap. The whole retry budget is ~3.7 s — long
+/// enough for a previous worker's runtime to drop and release the
+/// port, short enough that session start is not stalled by a port a
+/// live duplicate session will never release.
+fn peer_listener_bind_retry_delay(attempt: usize) -> Duration {
+    Duration::from_millis(100u64.saturating_mul(2u64.saturating_pow(attempt as u32)).min(500))
+}
+
+/// Retry a bind closure while it fails with `AddrInUse` (4.69).
+/// Only address-in-use is retried: any other failure (permission,
+/// invalid address, …) is not transient and returns immediately, as
+/// does an `AddrInUse` once the attempt budget is spent. The delay
+/// is injected so tests can run the loop with a zero delay and no
+/// real sockets.
+async fn retry_bind_on_addr_in_use<T>(
+    mut bind: impl FnMut() -> std::io::Result<T>,
+    delay_for_attempt: impl Fn(usize) -> Duration,
+) -> std::io::Result<T> {
+    let mut attempt = 0;
+    loop {
+        match bind() {
+            Ok(value) => return Ok(value),
+            Err(err)
+                if err.kind() == std::io::ErrorKind::AddrInUse
+                    && attempt + 1 < PEER_LISTENER_BIND_MAX_ATTEMPTS =>
+            {
+                let delay = delay_for_attempt(attempt);
+                warn!(
+                    attempt = attempt + 1,
+                    max_attempts = PEER_LISTENER_BIND_MAX_ATTEMPTS,
+                    delay_ms = delay.as_millis(),
+                    "peer-share listener bind address in use; retrying"
+                );
+                sleep(delay).await;
+                attempt += 1;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
 /// Bind a peer-share QUIC listener endpoint with an existing certificate.
+
 /// The cert is the persisted pair from `load_or_create_peer_listener_cert`,
 /// so the listener fingerprint peers pin never changes across re-binds
-/// or runtime restarts (4.66).
-fn bind_peer_listener_endpoint(
+/// or runtime restarts (4.68).
+async fn bind_peer_listener_endpoint(
+
     cert_der: Vec<u8>,
     key_der: Vec<u8>,
     bind_addr: SocketAddr,
     socket_protect: Option<&SocketProtectFn>,
 ) -> anyhow::Result<quinn::Endpoint> {
+    let socket = retry_bind_on_addr_in_use(
+        || std::net::UdpSocket::bind(bind_addr),
+        peer_listener_bind_retry_delay,
+    )
+    .await
+    .map_err(|err| anyhow::anyhow!("failed to bind peer-share listener on {bind_addr}: {err}"))?;
+    #[cfg(unix)]
+    if let Some(protect) = socket_protect {
+        use std::os::unix::io::AsRawFd;
+        let fd = socket.as_raw_fd();
+        if !protect.0(fd) {
+            anyhow::bail!(
+                "failed to protect peer-share listener socket from VPN capture (fd={fd})"
+            );
+        }
+    }
     quinn::Endpoint::new(
         Default::default(),
         Some(build_peer_server_config(cert_der, key_der)),
-        bind_peer_listener_socket(bind_addr, socket_protect)?,
+        socket,
         Arc::new(quinn::TokioRuntime),
     )
     .map_err(|err| anyhow::anyhow!("failed to bind peer-share listener on {bind_addr}: {err}"))
 }
+
 
 /// File names for the persisted peer-share listener certificate, kept
 /// next to the device keypair (the same storage dir on Android, the
@@ -2064,7 +2135,7 @@ const PEER_LISTENER_CERT_FILE: &str = "peer-listener-cert.der";
 const PEER_LISTENER_KEY_FILE: &str = "peer-listener-key.der";
 
 /// Load the peer-share listener certificate, creating and persisting
-/// one on first run (4.66).
+/// one on first run (4.68).
 ///
 /// Diagnosis (2026-11-11 morning window, OnePlus on vc265 as
 /// consumer, 6a dialing back): the listener certificate was minted
@@ -2145,7 +2216,7 @@ fn persist_peer_listener_cert(
     Ok(())
 }
 
-fn build_listener_runtime(
+async fn build_listener_runtime(
     config: &ClientConfig,
     device_keypair: &DeviceKeypair,
     provider_paths: Option<&ProviderPathSource>,
@@ -2156,7 +2227,7 @@ fn build_listener_runtime(
     Vec<IpAddr>,
     u16,
 )> {
-    // The listener certificate is loaded-or-created from disk (4.66):
+    // The listener certificate is loaded-or-created from disk (4.68):
     // it is the identity peers pin, so it must survive a peer-runtime
     // restart. A fresh cert per start (the old behaviour) invalidated
     // every in-flight introduction — forward and reversed — the moment
@@ -2215,7 +2286,8 @@ fn build_listener_runtime(
         key_der.clone(),
         listener_bind_addr,
         config.socket_protect.as_ref(),
-    )?;
+    )
+    .await?;
     let listen_addr = endpoint.local_addr()?;
     let instance_nonce = create_auth_challenge();
     let listener_identity = PeerListenerIdentity {
@@ -2242,25 +2314,6 @@ fn build_listener_runtime(
         advertise_ips,
         listen_addr.port(),
     ))
-}
-
-fn bind_peer_listener_socket(
-    bind_addr: SocketAddr,
-    socket_protect: Option<&SocketProtectFn>,
-) -> anyhow::Result<std::net::UdpSocket> {
-    let socket = std::net::UdpSocket::bind(bind_addr)?;
-    #[cfg(unix)]
-    if let Some(protect) = socket_protect {
-        use std::os::unix::io::AsRawFd;
-        let fd = socket.as_raw_fd();
-        if !protect.0(fd) {
-            anyhow::bail!(
-                "failed to protect peer-share listener socket from VPN capture (fd={fd})"
-            );
-        }
-    }
-
-    Ok(socket)
 }
 
 /// Whether a signed peer-share introduction has passed its expiry
@@ -2700,11 +2753,14 @@ mod tests {
     use super::{
         advertisable_ips_from_pairs, build_peer_introduction_request, forward_dial_back_frame,
         introduction_expired, is_advertisable_ip, is_tunnel_interface,
-        load_or_create_peer_listener_cert, note_reversed_leg, peer_share_peer_id, plan_dial_back,
-        prefer_path_subnet_candidate, renewal_delay, resolve_advertise_ips, select_advertise_ip,
+        load_or_create_peer_listener_cert, note_reversed_leg, peer_listener_bind_retry_delay,
+        peer_share_peer_id, plan_dial_back, prefer_path_subnet_candidate, renewal_delay,
+        resolve_advertise_ips, retry_bind_on_addr_in_use, select_advertise_ip,
         select_advertise_ip_for_binds, should_accept_discovered_peer, ConnectedPeers,
         DialBackParams, PeerLegTracker, RedialQueue, RelayPathClaims,
-        PEER_REDISCOVERY_MAX_ATTEMPTS, PEER_RELAY_RENEWAL_LEAD_SECS, PEER_RELAY_RENEWAL_MIN_DELAY,
+        PEER_LISTENER_BIND_MAX_ATTEMPTS, PEER_REDISCOVERY_MAX_ATTEMPTS,
+        PEER_RELAY_RENEWAL_LEAD_SECS, PEER_RELAY_RENEWAL_MIN_DELAY,
+
     };
     use bonded_core::auth::DeviceKeypair;
     use bonded_core::config::{ClientConfig, PeerShareMode};
@@ -2716,7 +2772,9 @@ mod tests {
     use bytes::Bytes;
     use pnet_datalink::NetworkInterface;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     #[test]
     fn leg_tracker_counts_overlapping_legs_per_peer() {
@@ -3614,7 +3672,7 @@ mod tests {
 
     #[test]
     fn leg_tracker_records_direction_of_newest_leg() {
-        // Renewal direction selection (4.66): the tracker remembers
+        // Renewal direction selection (4.67): the tracker remembers
         // how the peer's NEWEST leg was established, so a reversed
         // leg renews in reverse and a forward leg renews forward.
         let mut tracker = PeerLegTracker::default();
@@ -3635,7 +3693,7 @@ mod tests {
 
     #[test]
     fn reversed_leg_accepted_as_renewal_replacement_while_connected() {
-        // Reverse-aware renewal (4.66): the consumer holds a live
+        // Reverse-aware renewal (4.67): the consumer holds a live
         // leg for the peer and a reversed renewal is pending, so the
         // incoming reversed leg is the replacement, not a duplicate
         // — it is accepted with a fresh renewal generation, the
@@ -3734,6 +3792,7 @@ mod tests {
         assert!(forward_dial_back_frame(&garbage, &None));
     }
 
+
     /// Fresh temp dir per listener-cert test, unique across the
     /// parallel test threads in one process.
     fn listener_cert_test_dir(name: &str) -> std::path::PathBuf {
@@ -3757,7 +3816,7 @@ mod tests {
 
     #[test]
     fn listener_cert_fingerprint_is_stable_across_rebuilds() {
-        // 4.66: the whole point of persisting the listener cert is
+        // 4.68: the whole point of persisting the listener cert is
         // that a second runtime start presents the same fingerprint
         // — an introduction minted before a restart still verifies
         // after it. Two loads from the same storage dir must return
@@ -3822,5 +3881,98 @@ mod tests {
             load_or_create_peer_listener_cert(&config).expect("regenerated pair should load");
         assert_eq!(cert_b, cert_c);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn peer_listener_bind_retry_delay_backs_off_and_caps() {
+        // 100 ms, doubling, capped at 500 ms (4.69).
+        assert_eq!(
+            peer_listener_bind_retry_delay(0),
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            peer_listener_bind_retry_delay(1),
+            Duration::from_millis(200)
+        );
+        assert_eq!(
+            peer_listener_bind_retry_delay(2),
+            Duration::from_millis(400)
+        );
+        assert_eq!(
+            peer_listener_bind_retry_delay(3),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            peer_listener_bind_retry_delay(10),
+            Duration::from_millis(500)
+        );
+    }
+
+    #[tokio::test]
+    async fn listener_bind_retries_addr_in_use_then_succeeds() {
+        // The 4.69 race: a second worker binds while the first still
+        // holds the port, then the first releases it. No real socket
+        // is involved — the closure stands in for the bind — so this
+        // runs in the UDP-blocked sandbox.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_clone = Arc::clone(&calls);
+        let result = retry_bind_on_addr_in_use(
+            move || {
+                let n = calls_clone.fetch_add(1, Ordering::SeqCst);
+                if n < 2 {
+                    Err(std::io::Error::from(std::io::ErrorKind::AddrInUse))
+                } else {
+                    Ok(42u32)
+                }
+            },
+            |_| Duration::from_millis(0),
+        )
+        .await;
+        assert_eq!(result.unwrap(), 42);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn listener_bind_gives_up_after_max_attempts() {
+        // A genuinely duplicate session (first worker still alive)
+        // never releases the port: the retry is bounded, not a spin.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_clone = Arc::clone(&calls);
+        let result = retry_bind_on_addr_in_use(
+            move || {
+                calls_clone.fetch_add(1, Ordering::SeqCst);
+                Err::<u32, _>(std::io::Error::from(std::io::ErrorKind::AddrInUse))
+            },
+            |_| Duration::from_millis(0),
+        )
+        .await;
+        let err = result.expect_err("exhausted retry should fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            PEER_LISTENER_BIND_MAX_ATTEMPTS
+        );
+    }
+
+    #[tokio::test]
+    async fn listener_bind_does_not_retry_other_errors() {
+        // Only AddrInUse is transient: a permission failure returns
+        // on the first attempt instead of burning the budget.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_clone = Arc::clone(&calls);
+        let result = retry_bind_on_addr_in_use(
+            move || {
+                calls_clone.fetch_add(1, Ordering::SeqCst);
+                Err::<u32, _>(std::io::Error::from(
+                    std::io::ErrorKind::PermissionDenied,
+                ))
+            },
+            |_| Duration::from_millis(0),
+        )
+        .await;
+        let err = result.expect_err("permission failure should fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
     }
 }
