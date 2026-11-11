@@ -8,8 +8,8 @@ use anyhow::Context;
 use bonded_core::auth::{create_auth_challenge, sign_bytes, DeviceKeypair};
 use bonded_core::config::{PeerShareMode, SocketProtectFn};
 use bonded_core::peer_share::{
-    PeerShareAdvertisement, PeerShareDialBackNotification, PeerShareIntroductionRequest,
-    SignedPeerShareIntroduction,
+    is_advertisable_ip, PeerShareAdvertisement, PeerShareDialBackNotification,
+    PeerShareIntroductionRequest, SignedPeerShareIntroduction,
 };
 use bonded_core::session::{SessionFrame, FLAG_PEER_DIAL_BACK};
 use bonded_core::transport::QuicTransport;
@@ -2269,9 +2269,17 @@ async fn build_listener_runtime(
     // An unspecified bind listens on the wildcard of the primary's
     // address family, so every advertised address is dialable. A
     // pinned bind listens on that one address only, and the list is
-    // a single element holding it (see resolve_advertise_ips).
+    // a single element holding it (see resolve_advertise_ips) — but
+    // only when the pinned address is itself in the advertised list.
+    // A pin the allow-list dropped from the advertisement (e.g. a
+    // public cellular bind) must not be bound either: the listener
+    // would serve no advertised address. In that case bind the
+    // wildcard of the primary's family instead, so the advertised
+    // addresses are the ones actually served.
     let primary_ip = advertise_ips[0];
-    let listener_bind_addr = if bind_addr.ip().is_unspecified() {
+    let listener_bind_addr = if bind_addr.ip().is_unspecified()
+        || !advertise_ips.contains(&bind_addr.ip())
+    {
         let wildcard = if primary_ip.is_ipv4() {
             IpAddr::V4(Ipv4Addr::UNSPECIFIED)
         } else {
@@ -2459,31 +2467,6 @@ fn should_accept_discovered_peer(
 const TUNNEL_CLIENT_IPV4: Ipv4Addr = Ipv4Addr::new(10, 8, 0, 2);
 const TUNNEL_CLIENT_IPV6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0x10, 0x8, 0, 0, 0, 0, 2);
 
-/// Whether an address may be advertised as a peer-share endpoint: it
-/// must be in a non-routable/private block — 10.0.0.0/8, 172.16.0.0/12,
-/// 192.168.0.0/16, or link-local 169.254.0.0/16. A LAN peer can only
-/// dial addresses on a local network, so a public address (notably the
-/// cellular address, e.g. 192.0.0.4) must never leak into the
-/// advertisement — a consumer reading only the mDNS A record would
-/// dial an unreachable address. The check is on the address itself,
-/// not the interface name: interface naming varies by vendor
-/// (Qualcomm `rmnet*`, MediaTek `ccmni*`, `v4-rmnet1`, …) and a
-/// prefix list misses new names. A carrier-assigned private address
-/// on a cellular interface rides along (accepted: that edge case is
-/// out of scope). IPv6 addresses are not advertised.
-fn is_advertisable_ip(ip: &IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(ip) => {
-            let octets = ip.octets();
-            octets[0] == 10
-                || (octets[0] == 172 && (octets[1] & 0xf0) == 0x10)
-                || (octets[0] == 192 && octets[1] == 168)
-                || (octets[0] == 169 && octets[1] == 254)
-        }
-        IpAddr::V6(_) => false,
-    }
-}
-
 /// Whether an interface is the VPN tunnel: its name is the configured
 /// tun device (Linux `bonded0`) or a `tun*` device (Android VpnService
 /// creates tun0/tun1/…), or its address is one of the client's own
@@ -2547,13 +2530,16 @@ fn advertisable_interface_ips(
 /// Resolve ALL addresses to advertise for the peer-share listener.
 /// An explicit `peer_share_advertise_ip` pins a single address (as
 /// before); a pinned bind address likewise advertises only itself
-/// (the listener only serves that address). Otherwise every
-/// private/link-local, non-tunnel bindable address is advertised, primary
-/// first (the existing path-subnet preference), so a consumer can
-/// fall through to any address it can actually reach. The list is
-/// scoped to the primary's address family: the listener binds the
-/// wildcard of that family, so an address of the other family would
-/// not be dialable.
+/// (the listener only serves that address) — but only when the
+/// pinned address passes the allow-list (`is_advertisable_ip`); an
+/// unadvertisable pin is ignored with a warning and the enumeration
+/// below decides, so a stale pin can never advertise a public
+/// address. Otherwise every private/link-local, non-tunnel bindable
+/// address is advertised, primary first (the existing path-subnet
+/// preference), so a consumer can fall through to any address it can
+/// actually reach. The list is scoped to the primary's address
+/// family: the listener binds the wildcard of that family, so an
+/// address of the other family would not be dialable.
 fn resolve_advertise_ips(
     explicit_ip: &str,
     listen_addr: SocketAddr,
@@ -2561,15 +2547,49 @@ fn resolve_advertise_ips(
     interfaces: &[NetworkInterface],
     tun_name: &str,
 ) -> anyhow::Result<Vec<IpAddr>> {
+    // A pinned value is still subject to the allow-list: the pins
+    // are persisted per paired server and settable from an adb-pair
+    // intent or a deep link, so a stale pin naming a public address
+    // (e.g. a cellular 192.0.0.4 recorded before 4.59) would
+    // otherwise bypass the filter entirely and advertise an
+    // unreachable address. An unadvertisable pin is ignored with a
+    // warning and the filtered enumeration below decides instead —
+    // the provider keeps working on its reachable addresses. (The
+    // listener bind follows the same rule in
+    // `build_listener_runtime`: a pin that is not itself advertised
+    // is not bound.)
     if !explicit_ip.trim().is_empty() {
-        return Ok(vec![explicit_ip
+        let parsed: IpAddr = explicit_ip
             .parse()
-            .with_context(|| format!("invalid peer_share_advertise_ip: {explicit_ip}"))?]);
+            .with_context(|| format!("invalid peer_share_advertise_ip: {explicit_ip}"))?;
+        if is_advertisable_ip(&parsed) {
+            return Ok(vec![parsed]);
+        }
+        warn!(
+            explicit_ip = %explicit_ip,
+            "peer_share_advertise_ip is not a private/link-local address; ignoring the pin"
+        );
     }
 
     match listen_addr.ip() {
-        IpAddr::V4(ip) if !ip.is_unspecified() => return Ok(vec![IpAddr::V4(ip)]),
-        IpAddr::V6(ip) if !ip.is_unspecified() => return Ok(vec![IpAddr::V6(ip)]),
+        IpAddr::V4(ip) if !ip.is_unspecified() => {
+            if is_advertisable_ip(&IpAddr::V4(ip)) {
+                return Ok(vec![IpAddr::V4(ip)]);
+            }
+            warn!(
+                listen_addr = %listen_addr,
+                "peer_share_bind_address is not a private/link-local address; ignoring the pin for advertisement"
+            );
+        }
+        IpAddr::V6(ip) if !ip.is_unspecified() => {
+            if is_advertisable_ip(&IpAddr::V6(ip)) {
+                return Ok(vec![IpAddr::V6(ip)]);
+            }
+            warn!(
+                listen_addr = %listen_addr,
+                "peer_share_bind_address is not a private/link-local address; ignoring the pin for advertisement"
+            );
+        }
         _ => {}
     }
 
@@ -2752,7 +2772,8 @@ mod tests {
 
     use super::{
         advertisable_ips_from_pairs, build_peer_introduction_request, forward_dial_back_frame,
-        introduction_expired, is_advertisable_ip, is_tunnel_interface,
+
+        introduction_expired, is_tunnel_interface,
         load_or_create_peer_listener_cert, note_reversed_leg, peer_listener_bind_retry_delay,
         peer_share_peer_id, plan_dial_back, prefer_path_subnet_candidate, renewal_delay,
         resolve_advertise_ips, retry_bind_on_addr_in_use, select_advertise_ip,
@@ -2760,6 +2781,7 @@ mod tests {
         DialBackParams, PeerLegTracker, RedialQueue, RelayPathClaims,
         PEER_LISTENER_BIND_MAX_ATTEMPTS, PEER_REDISCOVERY_MAX_ATTEMPTS,
         PEER_RELAY_RENEWAL_LEAD_SECS, PEER_RELAY_RENEWAL_MIN_DELAY,
+
 
     };
     use bonded_core::auth::DeviceKeypair;
@@ -3079,15 +3101,23 @@ mod tests {
 
     #[test]
     fn advertise_ips_uses_explicit_override() {
+        // An explicit advertise pin wins over enumeration (empty
+        // interfaces still resolve) — the pinned address itself must
+        // be advertisable; an unadvertisable pin is ignored instead
+        // (see advertise_ips_ignores_unadvertisable_explicit_ip_pin),
+        // so the override here pins a LAN address.
         let ips = resolve_advertise_ips(
-            "127.0.0.1",
+            "192.168.1.99",
             SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 54443),
             &[],
             &Vec::<NetworkInterface>::new(),
             "bonded0",
         )
         .expect("override should parse");
-        assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]);
+        assert_eq!(
+            ips,
+            vec![IpAddr::V4(Ipv4Addr::new(192, 168, 1, 99))]
+        );
     }
 
     #[test]
@@ -3127,35 +3157,6 @@ mod tests {
             advertisable_ips_from_pairs(&pairs, "bonded0"),
             vec![IpAddr::V4(Ipv4Addr::new(192, 168, 43, 1))]
         );
-    }
-
-    #[test]
-    fn advertisable_ip_allow_list_is_private_and_link_local_only() {
-        // The allow-list is the address, not the interface name:
-        // every private block and link-local is kept, every public
-        // address is dropped, whatever the interface is called.
-        assert!(is_advertisable_ip(&IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5))));
-        assert!(is_advertisable_ip(&IpAddr::V4(Ipv4Addr::new(
-            172, 20, 72, 22
-        ))));
-        assert!(is_advertisable_ip(&IpAddr::V4(Ipv4Addr::new(
-            192, 168, 1, 140
-        ))));
-        assert!(is_advertisable_ip(&IpAddr::V4(Ipv4Addr::new(
-            169, 254, 1, 2
-        ))));
-        assert!(!is_advertisable_ip(&IpAddr::V4(Ipv4Addr::new(
-            192, 0, 0, 4
-        ))));
-        assert!(!is_advertisable_ip(&IpAddr::V4(Ipv4Addr::new(
-            100, 64, 1, 2
-        ))));
-        assert!(!is_advertisable_ip(&IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
-        assert!(!is_advertisable_ip(&IpAddr::V4(Ipv4Addr::LOCALHOST)));
-        assert!(!is_advertisable_ip(&IpAddr::V4(Ipv4Addr::UNSPECIFIED)));
-        assert!(!is_advertisable_ip(&IpAddr::V6(Ipv6Addr::new(
-            0x2001, 0xdb8, 0, 0, 0, 0, 0, 1
-        ))));
     }
 
     #[test]
@@ -3258,6 +3259,47 @@ mod tests {
         )
         .expect_err("no dialable address should fail");
         assert!(err.to_string().contains("non-loopback"));
+    }
+
+    #[test]
+    fn advertise_ips_ignores_unadvertisable_explicit_ip_pin() {
+        // A pinned peer_share_advertise_ip naming a public address
+        // (e.g. a cellular 192.0.0.4 recorded in the paired-server
+        // record before 4.59) must not bypass the allow-list: the pin
+        // is ignored and the filtered enumeration decides instead.
+        let interfaces = vec![test_interface("wlan0", Ipv4Addr::new(192, 168, 1, 140))];
+        let ips = resolve_advertise_ips(
+            "192.0.0.4",
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 54443),
+            &[],
+            &interfaces,
+            "bonded0",
+        )
+        .expect("list should resolve from enumeration");
+        assert_eq!(
+            ips,
+            vec![IpAddr::V4(Ipv4Addr::new(192, 168, 1, 140))]
+        );
+    }
+
+    #[test]
+    fn advertise_ips_ignores_unadvertisable_pinned_bind() {
+        // Same bypass through a pinned peer_share_bind_address: a
+        // public bind address is ignored for advertisement and the
+        // filtered enumeration decides instead.
+        let interfaces = vec![test_interface("wlan0", Ipv4Addr::new(192, 168, 1, 140))];
+        let ips = resolve_advertise_ips(
+            "",
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 0, 4)), 54443),
+            &[],
+            &interfaces,
+            "bonded0",
+        )
+        .expect("list should resolve from enumeration");
+        assert_eq!(
+            ips,
+            vec![IpAddr::V4(Ipv4Addr::new(192, 168, 1, 140))]
+        );
     }
 
     fn test_interface(name: &str, ip: Ipv4Addr) -> NetworkInterface {

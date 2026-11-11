@@ -1,14 +1,14 @@
 use anyhow::Context;
-use bonded_core::peer_share::PeerShareAdvertisement;
+use bonded_core::peer_share::{is_advertisable_ip, PeerShareAdvertisement};
 use mdns_sd::{Receiver, ResolvedService, ServiceDaemon, ServiceEvent, ServiceInfo};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
-
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::time::sleep;
 use tracing::{debug, warn};
+
 
 
 pub const PEER_SHARE_SERVICE_TYPE: &str = "_bonded-peer._udp.local.";
@@ -357,19 +357,39 @@ fn advertisement_from_resolved_service(
     }
 
     if !records.contains_key("endpoint") {
-        let address = resolved
+        // The mDNS A record is the fallback when a provider carries
+        // no TXT endpoint: prefer a reachable (allow-listed) address
+        // over an arbitrary one — get_addresses() is a HashSet, so
+        // .next() would pick nondeterministically, and a public
+        // cellular A record would send the consumer at an
+        // unreachable address. Sorted, so the choice is stable.
+        let mut addresses: Vec<IpAddr> = resolved
             .get_addresses()
             .iter()
-            .next()
-            .map(|address| address.to_string())
-            .context("resolved peer-share service did not include an address")?;
+            .map(|address| address.to_ip_addr())
+            .collect();
+        addresses.sort();
+        let address = addresses
+            .iter()
+            .copied()
+            .find(|address| is_advertisable_ip(address))
+            .context("resolved peer-share service advertised no reachable address")?;
         records.insert(
             "endpoint".to_owned(),
             format!("{address}:{}", resolved.get_port()),
         );
     }
 
-    PeerShareAdvertisement::from_txt_record_map(&records)
+    let mut advertisement = PeerShareAdvertisement::from_txt_record_map(&records)?;
+    // TXT records are untrusted input: drop any public address an
+    // old or misconfigured provider listed, so the dial path never
+    // sees it. Nothing reachable left means the peer is not
+    // dialable — report it instead of burning dial timeouts on a
+    // dead address.
+    if !advertisement.sanitize_advertised_endpoints() {
+        anyhow::bail!("resolved peer-share service advertised no reachable address");
+    }
+    Ok(advertisement)
 }
 
 #[cfg(test)]
@@ -403,6 +423,80 @@ mod tests {
             .expect("advertisement should parse from resolved service");
 
         assert_eq!(parsed, advertisement);
+    }
+
+    #[test]
+    fn resolved_service_drops_public_cellular_address_from_txt_list() {
+        // Record selection: a provider whose TXT list still names
+        // its public cellular address (old build, stale pin) must
+        // not make the consumer dial it — the parsed advertisement
+        // keeps only the reachable addresses, primary reset to the
+        // first survivor.
+        let advertisement = PeerShareAdvertisement {
+            version: 1,
+            device_public_key: "consumer".to_owned(),
+            server_public_key: "server".to_owned(),
+            instance_nonce: "nonce-1".to_owned(),
+            endpoint: "192.0.0.4:54443".to_owned(),
+            endpoints: vec![
+                "192.0.0.4:54443".to_owned(),
+                "192.168.1.20:54443".to_owned(),
+            ],
+            listener_cert_fingerprint: "sha256:abcd".to_owned(),
+            capabilities: vec!["relay".to_owned(), "quic".to_owned()],
+        };
+
+        let resolved = service_info_from_advertisement(&advertisement)
+            .expect("service info should build")
+            .as_resolved_service();
+        let parsed = advertisement_from_resolved_service(&resolved)
+            .expect("advertisement should parse from resolved service");
+
+        assert_eq!(parsed.endpoint, "192.168.1.20:54443");
+        assert_eq!(
+            parsed.endpoints,
+            vec!["192.168.1.20:54443".to_owned()]
+        );
+    }
+
+    #[test]
+    fn resolved_service_a_record_fallback_prefers_reachable_address() {
+        // Record selection, A-record fallback: with no TXT endpoint
+        // the consumer falls back to the mDNS A records — it must
+        // pick a reachable one, not an arbitrary (HashSet-ordered)
+        // address, so a public cellular A record never becomes the
+        // dial target when a LAN address is present.
+        use mdns_sd::ServiceInfo;
+        use std::collections::HashMap;
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let mut txt: HashMap<String, String> = HashMap::new();
+        txt.insert("version".to_owned(), "1".to_owned());
+        txt.insert("device_key".to_owned(), "consumer".to_owned());
+        txt.insert("server_key".to_owned(), "server".to_owned());
+        txt.insert("instance_nonce".to_owned(), "nonce-1".to_owned());
+        txt.insert("cert_fingerprint".to_owned(), "sha256:abcd".to_owned());
+        txt.insert("capabilities".to_owned(), "relay,quic".to_owned());
+        let service_info = ServiceInfo::new(
+            super::PEER_SHARE_SERVICE_TYPE,
+            "bonded-test",
+            "bonded-test.local.",
+            &[
+                IpAddr::V4(Ipv4Addr::new(192, 0, 0, 4)),
+                IpAddr::V4(Ipv4Addr::new(192, 168, 1, 20)),
+            ] as &[IpAddr],
+            54443,
+            txt,
+        )
+        .expect("service info should build");
+        let parsed = advertisement_from_resolved_service(&service_info.as_resolved_service())
+            .expect("advertisement should parse from resolved service");
+
+        assert_eq!(parsed.endpoint, "192.168.1.20:54443");
+        assert_eq!(
+            parsed.endpoints,
+            vec!["192.168.1.20:54443".to_owned()]
+        );
     }
 
     #[test]

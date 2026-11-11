@@ -17,6 +17,37 @@ const TXT_ENDPOINTS_KEY: &str = "endpoints";
 const TXT_CAPABILITIES_KEY: &str = "capabilities";
 const TXT_CERT_FINGERPRINT_KEY: &str = "cert_fingerprint";
 
+/// Whether an address may be advertised as a peer-share endpoint: it
+/// must be in a non-routable/private block — 10.0.0.0/8, 172.16.0.0/12,
+/// 192.168.0.0/16, or link-local 169.254.0.0/16. A LAN peer can only
+/// dial addresses on a local network, so a public address (notably the
+/// cellular address, e.g. 192.0.0.4) must never leak into an
+/// advertisement — a consumer reading only the mDNS A record would
+/// dial an unreachable address. The check is on the address itself,
+/// not the interface name: interface naming varies by vendor
+/// (Qualcomm `rmnet*`, MediaTek `ccmni*`, `v4-rmnet1`, …) and a
+/// prefix list misses new names. A carrier-assigned private address
+/// on a cellular interface rides along (accepted: that edge case is
+/// out of scope). IPv6 addresses are not advertised. This is the one
+/// shared definition: the provider's advertisement builder and the
+/// mDNS consumer's record selection both filter through it, so no
+/// path can reintroduce a public address into an advertisement. (The
+/// dial path deliberately does NOT filter: the allow-list governs
+/// what may be advertised, not what may be dialed — loopback
+/// listeners are legitimate dial targets.)
+pub fn is_advertisable_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            let octets = ip.octets();
+            octets[0] == 10
+                || (octets[0] == 172 && (octets[1] & 0xf0) == 0x10)
+                || (octets[0] == 192 && octets[1] == 168)
+                || (octets[0] == 169 && octets[1] == 254)
+        }
+        IpAddr::V6(_) => false,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PeerShareIntroductionRequest {
     pub consumer_device_public_key: String,
@@ -153,28 +184,62 @@ impl PeerShareIntroductionClaims {
 impl PeerShareAdvertisement {
     /// (Re)build the endpoint fields from an IP list and port: `endpoint`
     /// is the primary (first) address for old single-endpoint readers,
-    /// `endpoints` is the full list in dial order.
+    /// `endpoints` is the full list in dial order. Non-advertisable
+    /// addresses (see `is_advertisable_ip`) are dropped here — this is
+    /// the last line of defence, so no caller, pinned config value
+    /// included, can put a public address into an advertisement. A list
+    /// that filters to empty leaves `endpoint` empty, which fails
+    /// loudly at mDNS registration instead of advertising an
+    /// unreachable address.
     pub fn set_endpoints(&mut self, ips: &[IpAddr], port: u16) {
         let endpoints: Vec<String> = ips
             .iter()
+            .filter(|ip| is_advertisable_ip(ip))
             .map(|ip| SocketAddr::new(*ip, port).to_string())
             .collect();
         self.endpoint = endpoints.first().cloned().unwrap_or_default();
         self.endpoints = endpoints;
     }
 
+    /// Drop every non-advertisable address from an advertisement
+    /// received over the wire (mDNS TXT records are untrusted input:
+    /// an old or misconfigured provider can advertise a public
+    /// cellular address). `endpoint` is reset to the first surviving
+    /// entry so the primary and the list never disagree. Returns
+    /// whether any usable address remains; false means the
+    /// advertisement names nothing this consumer can dial.
+    pub fn sanitize_advertised_endpoints(&mut self) -> bool {
+        self.endpoints.retain(|endpoint| {
+            endpoint
+                .parse::<SocketAddr>()
+                .map(|addr| is_advertisable_ip(&addr.ip()))
+                .unwrap_or(false)
+        });
+        self.endpoint = self.endpoints.first().cloned().unwrap_or_default();
+        !self.endpoints.is_empty()
+    }
+
     /// Dialable addresses in order: the full advertised list, or the
     /// single primary endpoint for old advertisements without a list.
     /// Unparseable entries are skipped; an empty result means the
-    /// advertisement carries no usable address at all.
+    /// advertisement carries no usable address at all. Public
+    /// addresses are dropped even when the advertisement lists them:
+    /// a consumer must never burn a dial timeout on an address it
+    /// cannot reach.
     pub fn endpoint_addrs(&self) -> Vec<SocketAddr> {
         let addrs: Vec<SocketAddr> = self
             .endpoints
             .iter()
             .filter_map(|endpoint| endpoint.parse().ok())
+            .filter(|addr: &SocketAddr| is_advertisable_ip(&addr.ip()))
             .collect();
         if addrs.is_empty() {
-            self.endpoint.parse().ok().into_iter().collect()
+            self.endpoint
+                .parse()
+                .ok()
+                .filter(|addr: &SocketAddr| is_advertisable_ip(&addr.ip()))
+                .into_iter()
+                .collect()
         } else {
             addrs
         }
@@ -304,8 +369,9 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        PeerRelayRegistration, PeerShareAdvertisement, PeerShareDialBackNotification,
-        PeerShareIntroductionClaims, PeerShareIntroductionRequest, SignedPeerShareIntroduction,
+        is_advertisable_ip, PeerRelayRegistration, PeerShareAdvertisement,
+        PeerShareDialBackNotification, PeerShareIntroductionClaims,
+        PeerShareIntroductionRequest, SignedPeerShareIntroduction,
     };
 
     #[test]
@@ -595,5 +661,114 @@ mod tests {
             .into_control_frame()
             .expect("registration frame should serialize");
         assert!(PeerShareDialBackNotification::from_control_frame(&relay_frame).is_err());
+    }
+
+    #[test]
+    fn advertisable_ip_allow_list_is_private_and_link_local_only() {
+        // The allow-list is the address, not the interface name:
+        // every private block and link-local is kept, every public
+        // address is dropped, whatever the interface is called.
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+        assert!(is_advertisable_ip(&IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5))));
+        assert!(is_advertisable_ip(&IpAddr::V4(Ipv4Addr::new(
+            172, 20, 72, 22
+        ))));
+        assert!(is_advertisable_ip(&IpAddr::V4(Ipv4Addr::new(
+            192, 168, 1, 140
+        ))));
+        assert!(is_advertisable_ip(&IpAddr::V4(Ipv4Addr::new(
+            169, 254, 1, 2
+        ))));
+        assert!(!is_advertisable_ip(&IpAddr::V4(Ipv4Addr::new(
+            192, 0, 0, 4
+        ))));
+        assert!(!is_advertisable_ip(&IpAddr::V4(Ipv4Addr::new(
+            100, 64, 1, 2
+        ))));
+        assert!(!is_advertisable_ip(&IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
+        assert!(!is_advertisable_ip(&IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert!(!is_advertisable_ip(&IpAddr::V4(Ipv4Addr::UNSPECIFIED)));
+        assert!(!is_advertisable_ip(&IpAddr::V6(Ipv6Addr::new(
+            0x2001, 0xdb8, 0, 0, 0, 0, 0, 1
+        ))));
+    }
+
+    #[test]
+    fn set_endpoints_drops_public_cellular_address() {
+        // The 6a regression, second half: even if a public address
+        // reaches set_endpoints (pinned config, future caller), it
+        // must not land in the advertisement — the primary becomes
+        // the first surviving private address.
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let mut advertisement = sample_advertisement();
+        advertisement.set_endpoints(
+            &[
+                IpAddr::V4(Ipv4Addr::new(192, 0, 0, 4)),
+                IpAddr::V4(Ipv4Addr::new(192, 168, 1, 140)),
+                IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            ],
+            54443,
+        );
+        assert_eq!(advertisement.endpoint, "192.168.1.140:54443");
+        assert_eq!(
+            advertisement.endpoints,
+            vec!["192.168.1.140:54443".to_owned()]
+        );
+    }
+
+    #[test]
+    fn endpoint_addrs_and_sanitize_drop_public_addresses() {
+        // A wire advertisement listing a public cellular address
+        // (old provider, pinned config, or a stale record) must not
+        // make the consumer dial it: endpoint_addrs drops it, and
+        // sanitize resets the primary to the first surviving entry.
+        let mut advertisement = sample_advertisement();
+        advertisement.endpoint = "192.0.0.4:54443".to_owned();
+        advertisement.endpoints = vec![
+            "192.0.0.4:54443".to_owned(),
+            "192.168.1.20:54443".to_owned(),
+            "100.64.1.2:54443".to_owned(),
+            "10.0.0.5:54443".to_owned(),
+        ];
+        assert_eq!(
+            advertisement.endpoint_addrs(),
+            vec![
+                "192.168.1.20:54443".parse().unwrap(),
+                "10.0.0.5:54443".parse().unwrap(),
+            ]
+        );
+        assert!(advertisement.sanitize_advertised_endpoints());
+        assert_eq!(advertisement.endpoint, "192.168.1.20:54443");
+        assert_eq!(
+            advertisement.endpoints,
+            vec![
+                "192.168.1.20:54443".to_owned(),
+                "10.0.0.5:54443".to_owned(),
+            ]
+        );
+
+        // Nothing reachable left: sanitize reports it and the
+        // advertisement carries no primary at all.
+        advertisement.endpoint = "192.0.0.4:54443".to_owned();
+        advertisement.endpoints = vec!["192.0.0.4:54443".to_owned()];
+        assert!(!advertisement.sanitize_advertised_endpoints());
+        assert_eq!(advertisement.endpoint, "");
+        assert!(advertisement.endpoints.is_empty());
+        assert!(advertisement.endpoint_addrs().is_empty());
+    }
+
+    fn sample_advertisement() -> PeerShareAdvertisement {
+        PeerShareAdvertisement {
+            version: 1,
+            device_public_key: "consumer".to_owned(),
+            server_public_key: "server".to_owned(),
+            instance_nonce: "nonce-1".to_owned(),
+            endpoint: String::new(),
+            endpoints: Vec::new(),
+            listener_cert_fingerprint: "sha256:abcd".to_owned(),
+            capabilities: vec!["relay".to_owned(), "quic".to_owned()],
+        }
     }
 }

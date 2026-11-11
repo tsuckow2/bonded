@@ -248,7 +248,12 @@ async fn dial_peer_relay(
     // address: the same introduction authorizes a leg on any
     // advertised address. Try each address until the QUIC handshake
     // succeeds; each attempt is one dial and its error is only kept if
-    // every address fails.
+    // every address fails. No allow-list filter here: the list
+    // governs what may be ADVERTISED (enforced at advertisement
+    // build and at mDNS parse), not what may be dialed — loopback
+    // listeners are legitimate dial targets for local setups and
+    // tests, and every production address reaching this point has
+    // already passed the advertisement filter.
     let mut last_error = None;
     let mut connection = None;
     for endpoint in candidates {
