@@ -1332,7 +1332,8 @@ pub async fn start_peer_share_runtime(
     // family, so one accept loop serves every advertised address and
     // the advertise watcher only ever re-registers the advertisement
     // (never re-binds). The certificate is embedded in the endpoint;
-    // the raw DER is not needed past construction.
+    // the raw DER is persisted next to the device keypair, so the
+    // listener fingerprint survives a runtime restart (4.66).
     let (
         listener_endpoint,
         listener_identity,
@@ -2037,8 +2038,9 @@ async fn establish_peer_upstream_paths(
 }
 
 /// Bind a peer-share QUIC listener endpoint with an existing certificate.
-/// Re-binds reuse the original cert, so the listener fingerprint consumers
-/// pin never changes across re-advertises.
+/// The cert is the persisted pair from `load_or_create_peer_listener_cert`,
+/// so the listener fingerprint peers pin never changes across re-binds
+/// or runtime restarts (4.66).
 fn bind_peer_listener_endpoint(
     cert_der: Vec<u8>,
     key_der: Vec<u8>,
@@ -2054,6 +2056,95 @@ fn bind_peer_listener_endpoint(
     .map_err(|err| anyhow::anyhow!("failed to bind peer-share listener on {bind_addr}: {err}"))
 }
 
+/// File names for the persisted peer-share listener certificate, kept
+/// next to the device keypair (the same storage dir on Android, the
+/// same `~/.local/share/bonded` dir on Linux). DER bytes, not PEM:
+/// the loader hands them straight to rustls with no parsing step.
+const PEER_LISTENER_CERT_FILE: &str = "peer-listener-cert.der";
+const PEER_LISTENER_KEY_FILE: &str = "peer-listener-key.der";
+
+/// Load the peer-share listener certificate, creating and persisting
+/// one on first run (4.66).
+///
+/// Diagnosis (2026-11-11 morning window, OnePlus on vc265 as
+/// consumer, 6a dialing back): the listener certificate was minted
+/// fresh on every `start_peer_share_runtime` call, so its SHA-256
+/// fingerprint — the value peers pin in mDNS advertisements,
+/// `DialBackParams`, and server-minted introductions — changed on
+/// every session-worker restart. A restart between an introduction
+/// being minted and the provider dialing it left the dialer pinning
+/// the old fingerprint while the listener presented the new cert,
+/// and the handshake died with `server-identity-mismatch: TLS
+/// certificate fingerprint mismatch` (37 such failures in the 07:xx
+/// window; the same mismatch had already shown once in the 11-08
+/// bench test). Nothing in the dial path can recover: the provider
+/// has no channel to learn the consumer's new fingerprint except the
+/// consumer's next introduction request, and in a restart storm each
+/// new request is stale again by dial time. Persisting the cert
+/// makes the fingerprint stable for the life of the device — an
+/// introduction minted before a restart still verifies after it —
+/// which fixes the reversed leg and the forward leg (stale cached
+/// `last_seen` advertisement) the same way. Deleting the two files
+/// rotates the identity, exactly like deleting the device keypair.
+/// A write failure degrades to the old ephemeral behaviour (fresh
+/// in-memory cert, warning logged) rather than failing the runtime:
+/// peer-share is an enhancement, not the session itself.
+fn load_or_create_peer_listener_cert(config: &ClientConfig) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+    let dir = crate::expand_home_path(&config.client.private_key_path)
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_default();
+    let cert_path = dir.join(PEER_LISTENER_CERT_FILE);
+    let key_path = dir.join(PEER_LISTENER_KEY_FILE);
+    if let Ok(pair) = read_peer_listener_cert(&cert_path, &key_path) {
+        return Ok(pair);
+    }
+    // No usable persisted pair: first run, or a corrupt/truncated
+    // file (or a key that does not match the cert). Mint a fresh one.
+    let cert = generate_simple_self_signed(vec!["127.0.0.1".to_owned()])
+        .context("failed to generate peer-share listener certificate")?;
+    let cert_der = cert.cert.der().to_vec();
+    let key_der = cert.key_pair.serialize_der();
+    if let Err(err) = persist_peer_listener_cert(&cert_path, &key_path, &cert_der, &key_der) {
+        warn!(error = %err, "peer-share listener certificate not persisted; its fingerprint will rotate on the next runtime restart");
+    }
+    Ok((cert_der, key_der))
+}
+
+/// Read a persisted listener cert/key pair, validating that the key
+/// matches the cert by building the server config the listener will
+/// serve. Any failure (missing file, bad DER, key/cert mismatch) is
+/// an error so the caller mints a fresh pair.
+fn read_peer_listener_cert(
+    cert_path: &std::path::Path,
+    key_path: &std::path::Path,
+) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+    let cert_der = std::fs::read(cert_path)?;
+    let key_der = std::fs::read(key_path)?;
+    try_build_peer_server_config(cert_der.clone(), key_der.clone())?;
+    Ok((cert_der, key_der))
+}
+
+/// Write a listener cert/key pair to disk. The key goes first: a
+/// crash between the writes leaves either no pair or a key with no
+/// cert, both of which the loader regenerates — never a cert whose
+/// key is missing.
+fn persist_peer_listener_cert(
+    cert_path: &std::path::Path,
+    key_path: &std::path::Path,
+    cert_der: &[u8],
+    key_der: &[u8],
+) -> anyhow::Result<()> {
+    if let Some(parent) = cert_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    std::fs::write(key_path, key_der)?;
+    std::fs::write(cert_path, cert_der)?;
+    Ok(())
+}
+
 fn build_listener_runtime(
     config: &ClientConfig,
     device_keypair: &DeviceKeypair,
@@ -2065,10 +2156,13 @@ fn build_listener_runtime(
     Vec<IpAddr>,
     u16,
 )> {
-    let cert = generate_simple_self_signed(vec!["127.0.0.1".to_owned()])
-        .context("failed to generate peer-share listener certificate")?;
-    let cert_der = cert.cert.der().to_vec();
-    let key_der = cert.key_pair.serialize_der();
+    // The listener certificate is loaded-or-created from disk (4.66):
+    // it is the identity peers pin, so it must survive a peer-runtime
+    // restart. A fresh cert per start (the old behaviour) invalidated
+    // every in-flight introduction — forward and reversed — the moment
+    // the session worker restarted, and the dialer then failed the
+    // handshake with a pinned-fingerprint mismatch.
+    let (cert_der, key_der) = load_or_create_peer_listener_cert(config)?;
     let fingerprint = cert_proof::compute_fingerprint(&cert_der);
     let bind_addr: SocketAddr =
         config
@@ -2561,12 +2655,24 @@ fn select_advertise_ip(candidates: &[IpAddr]) -> Option<IpAddr> {
 }
 
 fn build_peer_server_config(cert_der: Vec<u8>, key_der: Vec<u8>) -> quinn::ServerConfig {
+    try_build_peer_server_config(cert_der, key_der).expect("valid peer listener certificate")
+}
+
+/// Fallible form of `build_peer_server_config`: the listener-cert
+/// loader uses it to validate a persisted pair (a key that does not
+/// match its cert, or bad DER, is an error so the pair is regenerated
+/// instead of served).
+fn try_build_peer_server_config(
+    cert_der: Vec<u8>,
+    key_der: Vec<u8>,
+) -> anyhow::Result<quinn::ServerConfig> {
     let cert = CertificateDer::from(cert_der);
-    let key = PrivateKeyDer::try_from(key_der).expect("valid private key DER");
+    let key = PrivateKeyDer::try_from(key_der)
+        .map_err(|err| anyhow::anyhow!("invalid peer listener private key: {err}"))?;
     let mut tls_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(vec![cert], key)
-        .expect("server TLS config should build");
+        .map_err(|err| anyhow::anyhow!("invalid peer listener certificate: {err}"))?;
     tls_config.alpn_protocols = vec![b"bonded-peer".to_vec()];
 
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
@@ -2584,7 +2690,7 @@ fn build_peer_server_config(cert_der: Vec<u8>, key_der: Vec<u8>) -> quinn::Serve
     // on demand without a fresh handshake.
     transport.keep_alive_interval(Some(Duration::from_secs(25)));
     server_config.transport_config(Arc::new(transport));
-    server_config
+    Ok(server_config)
 }
 
 #[cfg(test)]
@@ -2593,12 +2699,12 @@ mod tests {
 
     use super::{
         advertisable_ips_from_pairs, build_peer_introduction_request, forward_dial_back_frame,
-        introduction_expired, is_advertisable_ip, is_tunnel_interface, note_reversed_leg,
-        peer_share_peer_id, plan_dial_back, prefer_path_subnet_candidate, renewal_delay,
-        resolve_advertise_ips, select_advertise_ip, select_advertise_ip_for_binds,
-        should_accept_discovered_peer, ConnectedPeers, DialBackParams, PeerLegTracker,
-        RedialQueue, RelayPathClaims, PEER_REDISCOVERY_MAX_ATTEMPTS,
-        PEER_RELAY_RENEWAL_LEAD_SECS, PEER_RELAY_RENEWAL_MIN_DELAY,
+        introduction_expired, is_advertisable_ip, is_tunnel_interface,
+        load_or_create_peer_listener_cert, note_reversed_leg, peer_share_peer_id, plan_dial_back,
+        prefer_path_subnet_candidate, renewal_delay, resolve_advertise_ips, select_advertise_ip,
+        select_advertise_ip_for_binds, should_accept_discovered_peer, ConnectedPeers,
+        DialBackParams, PeerLegTracker, RedialQueue, RelayPathClaims,
+        PEER_REDISCOVERY_MAX_ATTEMPTS, PEER_RELAY_RENEWAL_LEAD_SECS, PEER_RELAY_RENEWAL_MIN_DELAY,
     };
     use bonded_core::auth::DeviceKeypair;
     use bonded_core::config::{ClientConfig, PeerShareMode};
@@ -3626,5 +3732,95 @@ mod tests {
             payload: Bytes::from_static(b"{not json"),
         };
         assert!(forward_dial_back_frame(&garbage, &None));
+    }
+
+    /// Fresh temp dir per listener-cert test, unique across the
+    /// parallel test threads in one process.
+    fn listener_cert_test_dir(name: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "bonded-listener-cert-{name}-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed),
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("test dir should create");
+        dir
+    }
+
+    fn listener_cert_test_config(dir: &std::path::Path) -> ClientConfig {
+        let mut config = ClientConfig::default();
+        config.client.private_key_path = dir.join("bonded-device-key.pem").display().to_string();
+        config
+    }
+
+    #[test]
+    fn listener_cert_fingerprint_is_stable_across_rebuilds() {
+        // 4.66: the whole point of persisting the listener cert is
+        // that a second runtime start presents the same fingerprint
+        // — an introduction minted before a restart still verifies
+        // after it. Two loads from the same storage dir must return
+        // byte-identical cert and key.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = listener_cert_test_dir("stable");
+        let config = listener_cert_test_config(&dir);
+        let (cert_a, key_a) =
+            load_or_create_peer_listener_cert(&config).expect("first load should mint a pair");
+        let (cert_b, key_b) =
+            load_or_create_peer_listener_cert(&config).expect("second load should reuse it");
+        assert_eq!(cert_a, cert_b);
+        assert_eq!(key_a, key_b);
+        assert_eq!(
+            crate::cert_proof::compute_fingerprint(&cert_a),
+            crate::cert_proof::compute_fingerprint(&cert_b),
+        );
+        assert!(dir.join("peer-listener-cert.der").exists());
+        assert!(dir.join("peer-listener-key.der").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn listener_cert_regenerates_from_corrupt_key_and_stabilises() {
+        // A truncated/corrupt key file must not wedge the runtime:
+        // the loader mints a fresh pair, and the fresh pair is then
+        // stable across loads.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = listener_cert_test_dir("corrupt");
+        let config = listener_cert_test_config(&dir);
+        let (cert_a, _) =
+            load_or_create_peer_listener_cert(&config).expect("first load should mint a pair");
+        let fingerprint_a = crate::cert_proof::compute_fingerprint(&cert_a);
+        std::fs::write(dir.join("peer-listener-key.der"), b"not a der key")
+            .expect("corrupt key should write");
+        let (cert_b, _) =
+            load_or_create_peer_listener_cert(&config).expect("corrupt key should regenerate");
+        assert_ne!(
+            crate::cert_proof::compute_fingerprint(&cert_b),
+            fingerprint_a,
+            "a regenerated pair must not reuse the corrupt pair's fingerprint"
+        );
+        let (cert_c, _) =
+            load_or_create_peer_listener_cert(&config).expect("regenerated pair should load");
+        assert_eq!(cert_b, cert_c);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn listener_cert_regenerates_when_cert_file_is_missing() {
+        // Half a pair (key present, cert deleted) is not a usable
+        // pair: the loader mints a fresh one and the fresh one is
+        // stable afterwards.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = listener_cert_test_dir("missing-cert");
+        let config = listener_cert_test_config(&dir);
+        load_or_create_peer_listener_cert(&config).expect("first load should mint a pair");
+        std::fs::remove_file(dir.join("peer-listener-cert.der")).expect("cert file should delete");
+        let (cert_b, _) =
+            load_or_create_peer_listener_cert(&config).expect("missing cert should regenerate");
+        let (cert_c, _) =
+            load_or_create_peer_listener_cert(&config).expect("regenerated pair should load");
+        assert_eq!(cert_b, cert_c);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
