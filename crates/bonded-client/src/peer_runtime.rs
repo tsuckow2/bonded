@@ -1365,9 +1365,17 @@ pub async fn start_peer_share_runtime(
     };
 
     if let (Some(adv), Some(identity)) = (advertisement.as_ref(), listener_identity.as_ref()) {
+        // Log the listener fingerprint at startup (4.68): it is the
+        // identity peers pin, so a live logcat read shows directly
+        // whether the persisted cert is being served (same fingerprint
+        // across restarts) or a fresh ephemeral one is minted per
+        // start (fingerprint changes). Without this the only signal
+        // is the dialer's mismatch error, which names the peer's
+        // cert and is easy to attribute to the wrong device.
         info!(
             endpoints = %adv.endpoints.join(","),
             nonce = %identity.instance_nonce,
+            listener_cert_fingerprint = %identity.listener_cert_fingerprint,
             "peer-share runtime started"
         );
         emit_peer_share_event(
@@ -2217,17 +2225,34 @@ fn persist_peer_listener_cert(
     Ok(())
 }
 
-async fn build_listener_runtime(
+/// The parts of a peer-share listener that do not depend on the bound
+/// UDP socket: the loaded-or-created certificate, its fingerprint, the
+/// listener identity, and the advertisement (endpoints unset — the
+/// caller fills them once the socket is bound and the listen port is
+/// known). Extracted from `build_listener_runtime` so the
+/// fingerprint-stability contract (4.68) is testable without binding
+/// UDP: the sandbox blocks UDP sockets outright, and the live
+/// listener fingerprint must be the persisted one, not a fresh
+/// ephemeral cert per restart. The identity and advertisement carry
+/// the fingerprint peers pin, so they are built here from the same
+/// loaded cert the endpoint will serve — if the wiring ever regresses
+/// to a fresh cert, the fingerprint these carry will differ from the
+/// persisted file's and the stability test below fails.
+struct PreparedListenerIdentity {
+    cert_der: Vec<u8>,
+    key_der: Vec<u8>,
+    fingerprint: String,
+    identity: PeerListenerIdentity,
+    advertisement: PeerShareAdvertisement,
+    advertise_ips: Vec<IpAddr>,
+    listener_bind_addr: SocketAddr,
+}
+
+fn prepare_listener_identity(
     config: &ClientConfig,
     device_keypair: &DeviceKeypair,
     provider_paths: Option<&ProviderPathSource>,
-) -> anyhow::Result<(
-    quinn::Endpoint,
-    PeerListenerIdentity,
-    PeerShareAdvertisement,
-    Vec<IpAddr>,
-    u16,
-)> {
+) -> anyhow::Result<PreparedListenerIdentity> {
     // The listener certificate is loaded-or-created from disk (4.68):
     // it is the identity peers pin, so it must survive a peer-runtime
     // restart. A fresh cert per start (the old behaviour) invalidated
@@ -2290,14 +2315,6 @@ async fn build_listener_runtime(
     } else {
         bind_addr
     };
-    let endpoint = bind_peer_listener_endpoint(
-        cert_der.clone(),
-        key_der.clone(),
-        listener_bind_addr,
-        config.socket_protect.as_ref(),
-    )
-    .await?;
-    let listen_addr = endpoint.local_addr()?;
     let instance_nonce = create_auth_challenge();
     let listener_identity = PeerListenerIdentity {
         provider_device_public_key: device_keypair.public_key_b64.clone(),
@@ -2305,22 +2322,54 @@ async fn build_listener_runtime(
         listener_transport: "quic".to_owned(),
         listener_cert_fingerprint: fingerprint.clone(),
     };
-    let mut advertisement = PeerShareAdvertisement {
+    let advertisement = PeerShareAdvertisement {
         version: 1,
         device_public_key: device_keypair.public_key_b64.clone(),
         server_public_key: config.client.server_public_key.clone(),
         instance_nonce,
         endpoint: String::new(),
         endpoints: Vec::new(),
-        listener_cert_fingerprint: fingerprint,
+        listener_cert_fingerprint: fingerprint.clone(),
         capabilities: vec!["relay".to_owned(), "quic".to_owned()],
     };
-    advertisement.set_endpoints(&advertise_ips, listen_addr.port());
-    Ok((
-        endpoint,
-        listener_identity,
+    Ok(PreparedListenerIdentity {
+        cert_der,
+        key_der,
+        fingerprint,
+        identity: listener_identity,
         advertisement,
         advertise_ips,
+        listener_bind_addr,
+    })
+}
+
+async fn build_listener_runtime(
+    config: &ClientConfig,
+    device_keypair: &DeviceKeypair,
+    provider_paths: Option<&ProviderPathSource>,
+) -> anyhow::Result<(
+    quinn::Endpoint,
+    PeerListenerIdentity,
+    PeerShareAdvertisement,
+    Vec<IpAddr>,
+    u16,
+)> {
+    let prepared = prepare_listener_identity(config, device_keypair, provider_paths)?;
+    let endpoint = bind_peer_listener_endpoint(
+        prepared.cert_der.clone(),
+        prepared.key_der.clone(),
+        prepared.listener_bind_addr,
+        config.socket_protect.as_ref(),
+    )
+    .await?;
+    let listen_addr = endpoint.local_addr()?;
+    let mut advertisement = prepared.advertisement;
+    advertisement.set_endpoints(&prepared.advertise_ips, listen_addr.port());
+    Ok((
+        endpoint,
+        prepared.identity,
+        advertisement,
+        prepared.advertise_ips,
         listen_addr.port(),
     ))
 }
@@ -2786,8 +2835,7 @@ mod tests {
         DialBackParams, PeerLegTracker, RedialQueue, RelayPathClaims,
         PEER_LISTENER_BIND_MAX_ATTEMPTS, PEER_REDISCOVERY_MAX_ATTEMPTS,
         PEER_RELAY_RENEWAL_LEAD_SECS, PEER_RELAY_RENEWAL_MIN_DELAY,
-
-
+        prepare_listener_identity,
     };
     use bonded_core::auth::DeviceKeypair;
     use bonded_core::config::{ClientConfig, PeerShareMode};
@@ -3927,6 +3975,53 @@ mod tests {
         let (cert_c, _) =
             load_or_create_peer_listener_cert(&config).expect("regenerated pair should load");
         assert_eq!(cert_b, cert_c);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn listener_runtime_fingerprint_is_stable_across_rebuilds() {
+        // 4.68 (real fix): building the listener runtime twice from
+        // the same storage dir must present the same certificate
+        // fingerprint — the listener must serve the persisted cert,
+        // not mint a fresh ephemeral one per restart. The loader-only
+        // tests above pin that `load_or_create_peer_listener_cert`
+        // returns the same bytes twice, but they do not pin the
+        // wiring: that `build_listener_runtime`'s identity and
+        // advertisement actually carry the loaded cert's fingerprint.
+        // This test pins the wiring via `prepare_listener_identity`
+        // (the non-UDP half of `build_listener_runtime`), so a
+        // regression to a fresh cert per start fails here instead of
+        // only showing up as a live dial-back mismatch. The pinned
+        // advertise IP keeps `resolve_advertise_ips` off interface
+        // enumeration, so the test needs no UDP socket and no network.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = listener_cert_test_dir("runtime-stable");
+        let mut config = listener_cert_test_config(&dir);
+        config.client.peer_share_advertise_ip = "192.168.1.50".to_owned();
+        let device_keypair = DeviceKeypair::generate();
+        let first = prepare_listener_identity(&config, &device_keypair, None)
+            .expect("first listener prepare should succeed");
+        let second = prepare_listener_identity(&config, &device_keypair, None)
+            .expect("second listener prepare should succeed");
+        assert_eq!(first.cert_der, second.cert_der);
+        assert_eq!(first.key_der, second.key_der);
+        assert_eq!(first.fingerprint, second.fingerprint);
+        assert_eq!(
+            first.identity.listener_cert_fingerprint,
+            second.identity.listener_cert_fingerprint,
+        );
+        assert_eq!(
+            first.advertisement.listener_cert_fingerprint,
+            second.advertisement.listener_cert_fingerprint,
+        );
+        // The fingerprint is the persisted file's fingerprint, not a
+        // fresh in-memory cert's: the listener serves what is on disk.
+        let cert_on_disk = std::fs::read(dir.join("peer-listener-cert.der"))
+            .expect("persisted cert should exist");
+        assert_eq!(
+            first.fingerprint,
+            crate::cert_proof::compute_fingerprint(&cert_on_disk),
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

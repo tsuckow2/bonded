@@ -2,6 +2,7 @@ package com.bonded.bonded_app
 
 import android.app.Activity
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.net.VpnService
 import android.os.Build
@@ -42,6 +43,20 @@ class MainActivity : FlutterActivity() {
         private const val EXTRA_PEER_SHARE_ADVERTISE_IP = "peer_share_advertise_ip"
         private const val EXTRA_DIAGNOSTICS_UPLOAD_ENABLED = "diagnostics_upload_enabled"
         private const val EXTRA_DIAGNOSTICS_UPLOAD_PERIOD_SECS = "diagnostics_upload_period_secs"
+
+        // Non-launcher apps offered in the per-app VPN exclusion picker
+        // even though queryIntentActivities(CATEGORY_LAUNCHER) never
+        // returns them. Android Auto (com.google.android.projection.gearhead)
+        // has no launcher activity — it activates when the phone connects
+        // to a car — yet VpnService.Builder.addDisallowedApplication
+        // accepts any installed package, so exclusion works once the
+        // package is listed. Add future non-launcher excludable packages
+        // here; each one also needs a <package> entry in the manifest
+        // <queries> block so getApplicationInfo can see it on API 30+.
+        private val NON_LAUNCHER_EXCLUDABLE_APPS = listOf(
+                "com.google.android.projection.gearhead", // Android Auto
+        )
+
         private var nativeLoaded = false
 
         init {
@@ -799,12 +814,14 @@ class MainActivity : FlutterActivity() {
                         // queries need no QUERY_ALL_PACKAGES permission, and
                         // our own package is never listed (it can never be
                         // excluded: its control-plane traffic must stay
-                        // routable through the VPN).
+                        // routable through the VPN). Non-launcher apps from
+                        // NON_LAUNCHER_EXCLUDABLE_APPS are probed directly
+                        // and appended below.
                         "getLaunchableApps" -> {
                             val intent =
                                     Intent(Intent.ACTION_MAIN)
                                             .addCategory(Intent.CATEGORY_LAUNCHER)
-                            val apps =
+                            val launcherApps =
                                     packageManager
                                             .queryIntentActivities(intent, 0)
                                             .mapNotNull { info ->
@@ -818,6 +835,36 @@ class MainActivity : FlutterActivity() {
                                                                         .toString(),
                                                 )
                                             }
+                            // Non-launcher excludable apps (e.g. Android
+                            // Auto): looked up directly by package name.
+                            // getApplicationInfo throws NameNotFoundException
+                            // when a package is not installed, so a missing
+                            // one is skipped silently and never fails the
+                            // whole list. Deduplicated against the launcher
+                            // results in case a future version gains a
+                            // launcher activity.
+                            val seenPackages =
+                                    launcherApps.map { it["packageName"] }.toSet()
+                            val extraApps =
+                                    NON_LAUNCHER_EXCLUDABLE_APPS
+                                            .filter { it != packageName && it !in seenPackages }
+                                            .mapNotNull { pkg ->
+                                                try {
+                                                    val appInfo =
+                                                            packageManager.getApplicationInfo(pkg, 0)
+                                                    mapOf<String, Any?>(
+                                                            "packageName" to pkg,
+                                                            "label" to
+                                                                    appInfo
+                                                                            .loadLabel(packageManager)
+                                                                            .toString(),
+                                                    )
+                                                } catch (_: PackageManager.NameNotFoundException) {
+                                                    null
+                                                }
+                                            }
+                            val apps =
+                                    (launcherApps + extraApps)
                                             .sortedBy { (it["label"] as? String)?.lowercase() }
                             result.success(apps)
                         }

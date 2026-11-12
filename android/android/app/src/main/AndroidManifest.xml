@@ -182,5 +182,10 @@
             <action android:name="android.intent.action.PROCESS_TEXT"/>
             <data android:mimeType="text/plain"/>
         </intent>
+        <!-- Android Auto has no launcher activity, so it is added to the
+             exclusion picker by direct package lookup (see
+             NON_LAUNCHER_EXCLUDABLE_APPS in MainActivity). On API 30+ that
+             lookup can only see the package when it is declared here. -->
+        <package android:name="com.google.android.projection.gearhead" />
     </queries>
 </manifest>
