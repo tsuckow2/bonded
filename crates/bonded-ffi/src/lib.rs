@@ -601,7 +601,7 @@ struct AndroidPathStat {
     wire_tx_bytes: Option<u64>,
     wire_rx_bytes: Option<u64>,
     /// QUIC PING frames sent on this path's connection (quinn
-    /// `frame_tx.ping`, cumulative): the 25 s keepalive PINGs are
+    /// `frame_tx.ping`, cumulative): the 60 s keepalive PINGs are
     /// the transport's steady wakeup source. `None` when the
     /// transport cannot observe them (same rule as the wire bytes).
     /// Read live from the transport like the wire bytes.
@@ -1063,7 +1063,7 @@ fn prefer_wireguard_first(protocols: &mut Vec<String>) {
 ///
 /// What auto-pause does NOT do: it stops data spreading and (with the
 /// idle heartbeat policy) session heartbeats on the parked path, but
-/// the cellular QUIC connection's 25 s keepalive PINGs continue —
+/// the cellular QUIC connection's 60 s keepalive PINGs continue —
 /// quinn fixes keepalive at connect time and offers no runtime toggle
 /// per connection. Full radio sleep would need tearing the cellular
 /// transport down and re-dialing on demand, which is a larger
@@ -1290,7 +1290,7 @@ fn desired_suppressed_paths(
 /// changes — exactly as the heartbeat tick does, but immediately.
 /// Called when the live path set changes (a transport is lost), so a
 /// lost non-cellular path resumes cellular at once instead of waiting
-/// up to 25 s for the next tick. A path loss is itself a transport
+/// up to 60 s for the next tick. A path loss is itself a transport
 /// change, so callers pass `idle` computed after updating
 /// `last_transport_change`; the recompute then clears parking. The
 /// parking rule itself is unchanged (see `compute_auto_paused`).
@@ -2133,11 +2133,11 @@ fn start_android_session(
                 std::collections::HashMap::new();
             let mut last_transport_count = transports.len();
             // Adaptive heartbeat (battery): 10 s while traffic flows,
-            // 25 s on the active path only while idle — see
+            // 60 s on the active path only while idle — see
             // bonded_core::heartbeat for the policy. The 10 s active
             // cadence is kept deliberately: the server reaps any
-            // transport it receives nothing on for 30 s, so a 25 s
-            // cadence leaves only 5 s of slack and a single
+            // transport it receives nothing on for 90 s, so a 60 s
+            // cadence leaves 30 s of slack and a single
             // doze/scheduler stall kills every idle standby path
             // (measured 2026-10-18: median direct-transport lifetime
             // 276 s in production logs). While idle that risk is
@@ -3331,13 +3331,13 @@ fn start_android_session(
                         alog_info!("Sending heartbeat ping seq={}", ping_sequence);
                         // While active, ping EVERY path, not just the
                         // active one: the server closes any transport
-                        // it receives nothing on for 30s, so an
+                        // it receives nothing on for 90s, so an
                         // active-path-only heartbeat lets every idle
                         // path be torn down and re-dialed in a loop,
                         // leaving the session single-path in practice.
                         // While idle, ping only the active path (see
                         // bonded_core::heartbeat): standby paths go
-                        // silent and the server reaps them after 30s;
+                        // silent and the server reaps them after 90s;
                         // they are re-pinged — and evicted if dead,
                         // then re-dialed by the supervisor — when
                         // traffic resumes and the fast cadence restarts.

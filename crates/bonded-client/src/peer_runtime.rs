@@ -7,6 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::Context;
 use bonded_core::auth::{create_auth_challenge, sign_bytes, DeviceKeypair};
 use bonded_core::config::{PeerShareMode, SocketProtectFn};
+use bonded_core::heartbeat::{QUIC_KEEPALIVE_INTERVAL, QUIC_MAX_IDLE_TIMEOUT};
 use bonded_core::peer_share::{
     is_advertisable_ip, PeerShareAdvertisement, PeerShareDialBackNotification,
     PeerShareIntroductionRequest, SignedPeerShareIntroduction,
@@ -2757,11 +2758,15 @@ fn try_build_peer_server_config(
     // Peer relays are standby failover paths: they sit idle until the primary
     // path fails. Quinn's default 30s max idle timeout would silently kill an
     // idle relay, so send periodic PINGs to keep the QUIC connection alive.
-    // 25 s is the longest cadence that still stays under that 30 s
-    // timeout (and under typical NAT timeouts); it matches the
-    // session-level idle heartbeat, so a parked relay can be re-pinged
-    // on demand without a fresh handshake.
-    transport.keep_alive_interval(Some(Duration::from_secs(25)));
+    // 60 s matches the session-level idle heartbeat (4.72), and the max
+    // idle timeout is raised to 120 s on both endpoints so a single
+    // missed keepalive cannot kill the relay; a parked relay can then
+    // be re-pinged on demand without a fresh handshake.
+    transport.keep_alive_interval(Some(QUIC_KEEPALIVE_INTERVAL));
+    transport.max_idle_timeout(Some(
+        quinn::IdleTimeout::try_from(QUIC_MAX_IDLE_TIMEOUT)
+            .expect("120 s idle timeout is in range"),
+    ));
     server_config.transport_config(Arc::new(transport));
     Ok(server_config)
 }

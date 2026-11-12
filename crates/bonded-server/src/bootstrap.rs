@@ -24,6 +24,7 @@ use bonded_core::diagnostics::{
     diagnostics_device_dir_name, DiagnosticsUploadRequest, DIAGNOSTICS_FILES_PER_DEVICE,
     MAX_DIAGNOSTICS_LOG_BYTES,
 };
+use bonded_core::heartbeat::SERVER_TRANSPORT_RECV_TIMEOUT;
 use bonded_core::peer_share::{
     PeerShareDialBackNotification, PeerShareIntroductionClaims, PeerShareIntroductionRequest,
     SignedPeerShareIntroduction,
@@ -1265,11 +1266,11 @@ async fn handle_transport_session<T: Transport>(
                     break;
                 }
             }
-            recv_result = tokio::time::timeout(std::time::Duration::from_secs(30), transport.recv()) => {
+            recv_result = tokio::time::timeout(SERVER_TRANSPORT_RECV_TIMEOUT, transport.recv()) => {
                 let recv_result = match recv_result {
                     Ok(r) => r,
                     Err(_) => {
-                        warn!(peer = %peer, session_id = handle.session_id, "transport recv timeout (30s), closing dead connection");
+                        warn!(peer = %peer, session_id = handle.session_id, timeout_secs = SERVER_TRANSPORT_RECV_TIMEOUT.as_secs(), "transport recv timeout, closing dead connection");
                         break;
                     }
                 };

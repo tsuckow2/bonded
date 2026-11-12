@@ -21,6 +21,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::Context;
 use base64::Engine as _;
 use bonded_core::config::DEFAULT_WIREGUARD_PEER_LEASE_SECS;
+use bonded_core::heartbeat::WG_KEEPALIVE_INTERVAL;
 use bonded_core::session::{
     is_answerable_ping, parse_session_epoch, SessionFrame, SessionHeader, FLAG_PING, FLAG_PONG,
 };
@@ -385,11 +386,15 @@ impl WireGuardPeerRuntime {
         socket: Arc<UdpSocket>,
     ) -> anyhow::Result<Self> {
         let peer_public_key = decode_peer_public_key(&peer.wg_public_key)?;
+        // Persistent keepalive matched to the idle heartbeat (4.72):
+        // the server-side keepalive packet wakes the client's radio
+        // too, so it must run at the same 60 s cadence, not 25 s.
+        // The 60 s session heartbeat also refreshes the NAT mapping.
         let tunn = Tunn::new(
             keypair.secret.clone(),
             peer_public_key,
             None,
-            Some(25),
+            Some(WG_KEEPALIVE_INTERVAL.as_secs() as u16),
             session_id as u32,
             None,
         );

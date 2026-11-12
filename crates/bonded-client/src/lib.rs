@@ -2,7 +2,9 @@ use anyhow::Context;
 use async_trait::async_trait;
 use bonded_core::auth::{sign_auth_challenge, DeviceKeypair};
 use bonded_core::config::ClientConfig;
-use bonded_core::heartbeat::{is_idle, pong_silence_timeout, IDLE_INTERVAL};
+use bonded_core::heartbeat::{
+    is_idle, pong_silence_timeout, IDLE_INTERVAL, QUIC_KEEPALIVE_INTERVAL, QUIC_MAX_IDLE_TIMEOUT,
+};
 #[cfg(target_os = "linux")]
 use bonded_core::peer_share::PeerShareDialBackNotification;
 #[cfg(target_os = "linux")]
@@ -2182,13 +2184,21 @@ fn build_quic_client_config(
             .map_err(|e| anyhow::anyhow!("QUIC crypto config error: {e}"))?,
     ));
     let mut transport = quinn::TransportConfig::default();
-    // 25 s, not 10: quinn applies this at connection setup and offers
+    // 60 s, not 10: quinn applies this at connection setup and offers
     // no dynamic adjustment, so this is the idle cadence as well as
-    // the active one. 25 s is the WireGuard-recommended keepalive —
-    // just under the server's 30 s transport reap and the shortest
-    // common NAT timeout — and session-level heartbeats (5 s active,
-    // 25 s idle) provide the faster liveness detection while active.
-    transport.keep_alive_interval(Some(std::time::Duration::from_secs(25)));
+    // the active one. Matched to the session idle heartbeat (4.72):
+    // a 60 s keepalive stays comfortably under the server's 90 s
+    // transport reap, and session-level heartbeats (10 s active,
+    // 60 s idle) provide the faster liveness detection while active.
+    // The max idle timeout must stay above the keepalive (4.72):
+    // quinn's default is 30 s, which would kill an idle connection
+    // before its first 60 s keepalive. The server sets the same
+    // value; the effective timeout is the minimum of the two.
+    transport.keep_alive_interval(Some(QUIC_KEEPALIVE_INTERVAL));
+    transport.max_idle_timeout(Some(
+        quinn::IdleTimeout::try_from(QUIC_MAX_IDLE_TIMEOUT)
+            .expect("120 s idle timeout is in range"),
+    ));
     client_config.transport_config(Arc::new(transport));
     Ok(client_config)
 }
@@ -2980,9 +2990,9 @@ async fn run_linux_packet_loop(
                 }
                 // While active, PING every path, not just the active
                 // one: the server reaps transports it receives nothing
-                // on for 30s. While idle, ping only the active path —
+                // on for 90s. While idle, ping only the active path —
                 // standby paths go silent and the server reaps them
-                // after 30s; they are re-pinged (and evicted if dead,
+                // after 90s; they are re-pinged (and evicted if dead,
                 // then re-dialed by the supervisor) when traffic
                 // resumes and the fast cadence restarts. See
                 // bonded_core::heartbeat for the full tradeoff.

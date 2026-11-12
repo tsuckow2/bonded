@@ -76,6 +76,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PrependedStream<S> {
     }
 }
 
+use crate::heartbeat::WG_KEEPALIVE_INTERVAL;
 use crate::session::SessionFrame;
 
 const MIN_SESSION_FRAME_LEN: usize = 16;
@@ -114,7 +115,7 @@ pub struct WireStats {
     pub tx_bytes: u64,
     pub rx_bytes: u64,
     /// QUIC PING frames sent on this connection (quinn `frame_tx.ping`),
-    /// cumulative like the byte counters. The 25 s keepalive PINGs are
+    /// cumulative like the byte counters. The 60 s keepalive PINGs are
     /// the transport's steady wakeup source; the battery profiler reads
     /// this per path. Zero for non-QUIC transports (TCP/WireGuard have
     /// no PING frames; session heartbeat PINGs are counted separately
@@ -1070,7 +1071,10 @@ impl WireGuardTransport {
             local_keypair.secret,
             peer_public_key,
             None,     // no preshared key
-            Some(25), // 25-second persistent keepalive interval
+            // Persistent keepalive matched to the idle heartbeat
+            // (4.72): a 25 s keepalive would wake the radio more
+            // often than the 60 s heartbeat it is meant to serve.
+            Some(WG_KEEPALIVE_INTERVAL.as_secs() as u16),
             session_index,
             None, // no rate limiter
         );

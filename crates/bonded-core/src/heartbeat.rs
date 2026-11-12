@@ -12,18 +12,32 @@
 //! at [`IDLE_INTERVAL`] — standby paths are not pinged until traffic
 //! resumes.
 //!
+//! Shared idle-cadence contract (4.72): the idle heartbeat, the QUIC
+//! keepalive, and the WireGuard persistent keepalive all run at
+//! [`IDLE_INTERVAL`] (60 s), and the server reaps a silent transport
+//! at [`SERVER_TRANSPORT_RECV_TIMEOUT`] (90 s). The heartbeat stays
+//! comfortably below the reap so a live session is never reaped:
+//! 60 s vs 90 s leaves 30 s of slack for a Doze/scheduler stall (the
+//! old 25 s vs 30 s left only 5 s). The QUIC keepalive must stay
+//! below quinn's max idle timeout, so both endpoints set
+//! [`QUIC_MAX_IDLE_TIMEOUT`] (120 s) — the effective timeout is the
+//! minimum of the two, so one side alone is not enough. A single
+//! missed keepalive therefore cannot kill a connection.
+//!
 //! Detection-lag tradeoff, stated openly:
 //! * The server closes any transport it receives no session frame on
-//!   for 30 s (`bootstrap.rs`, transport recv timeout). An idle
-//!   25 s ping on the active path leaves only 5 s of slack, so a
-//!   Doze/scheduler stall past the deadline can kill even the active
-//!   path; the session then has to re-establish. 25 s is the
-//!   WireGuard-recommended keepalive for the same reason (just under
-//!   the shortest common NAT timeout, ~30 s) — it is the longest
-//!   cadence that still keeps the mapping and the server transport
-//!   alive, not a comfortable one.
+//!   for 90 s (`bootstrap.rs`, transport recv timeout). An idle
+//!   60 s ping on the active path leaves 30 s of slack, so a
+//!   Doze/scheduler stall past the deadline can still kill even the
+//!   active path; the session then has to re-establish. 60 s exceeds
+//!   the shortest common NAT UDP timeouts (~30 s), so a mapping may
+//!   expire between heartbeats — but the client re-creates it on each
+//!   heartbeat, and in idle mode the server sends nothing unsolicited
+//!   (only PONG replies, which follow the heartbeat), so an expired
+//!   mapping costs a re-created mapping, not a dead session. While
+//!   active the cadence is 10 s, well under any NAT timeout.
 //! * Standby paths go silent while idle, so the server reaps them
-//!   after 30 s. They stay in the client's transport list as
+//!   after 90 s. They stay in the client's transport list as
 //!   unverified until traffic resumes, when the fast cadence restarts
 //!   and the existing eviction logic (consecutive ping failures /
 //!   pong silence) removes the dead ones and the path supervisor
@@ -31,9 +45,14 @@
 //!   briefly try a reaped standby; the send/recv failure paths
 //!   already remove a failed candidate and try the next one, so this
 //!   costs one failed attempt, not a blackhole. QUIC transport
-//!   keepalives (also 25 s) keep the underlying QUIC connections
+//!   keepalives (also 60 s) keep the underlying QUIC connections
 //!   themselves alive while idle, so a standby can be re-pinged on
 //!   demand without a fresh handshake.
+//! * Dead sessions linger longer on the server: a dead transport is
+//!   reaped after 90 s instead of 30 s, so the server holds
+//!   per-session state up to 3x as long. Bounded and acceptable —
+//!   the per-session state is small, and the dial-back push limiter
+//!   (4.66) already caps the churn a flapping consumer can cause.
 
 use std::time::{Duration, Instant};
 
@@ -56,9 +75,53 @@ pub const HEARTBEAT_IDLE_AFTER: Duration = Duration::from_secs(180);
 /// sustained traffic spans two or more.
 const HEARTBEAT_ACTIVE_TICKS: u32 = 2;
 
-/// Heartbeat interval while idle. Deliberately 25 s, not longer: see
-/// the module docs — the server reaps a silent transport at 30 s.
-pub const IDLE_INTERVAL: Duration = Duration::from_secs(25);
+/// Heartbeat interval while idle (4.72). 60 s, not 25 s: the server
+/// reaps a silent transport at [`SERVER_TRANSPORT_RECV_TIMEOUT`]
+/// (90 s), so a 60 s ping leaves 30 s of slack for a
+/// Doze/scheduler stall (the old 25 s vs 30 s left only 5 s).
+/// The QUIC keepalive ([`QUIC_KEEPALIVE_INTERVAL`]) and the
+/// WireGuard persistent keepalive ([`WG_KEEPALIVE_INTERVAL`]) run at
+/// the same cadence, so no transport wakes the radio more often than
+/// the heartbeat itself.
+pub const IDLE_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Server-side transport reap (4.72): a transport the server
+/// receives no session frame on for this long is closed. Raised from
+/// 30 s to 90 s so the idle heartbeat ([`IDLE_INTERVAL`], 60 s)
+/// keeps a 30 s margin. Dead sessions linger at most 90 s —
+/// bounded, and the server's per-session state is small. Used by
+/// `bootstrap.rs` (websocket session loop); QUIC transports are
+/// reaped by quinn's max idle timeout ([`QUIC_MAX_IDLE_TIMEOUT`])
+/// instead, and TCP/WireGuard loops have no recv timeout of their
+/// own.
+pub const SERVER_TRANSPORT_RECV_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// QUIC keepalive interval (4.72). Matched to [`IDLE_INTERVAL`]
+/// (60 s) so a QUIC connection wakes the radio no more often than
+/// the session heartbeat. Must stay below [`QUIC_MAX_IDLE_TIMEOUT`]
+/// on BOTH endpoints — quinn takes the minimum, so one side alone
+/// is not enough. Quinn applies this at connection setup and offers
+/// no dynamic adjustment, so this is the idle cadence as well as
+/// the active one.
+pub const QUIC_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Quinn max idle timeout (4.72). 120 s — twice the keepalive, so a
+/// single missed keepalive (or a scheduling stall up to 60 s) cannot
+/// kill a connection. Set explicitly on every quinn TransportConfig
+/// that carries a 60 s keepalive (client, server, peer-relay
+/// listener): the default is 30 s (RFC 9308 § 3.2), which would kill
+/// an idle connection before its first 60 s keepalive.
+pub const QUIC_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// WireGuard persistent keepalive interval (4.72). Matched to
+/// [`IDLE_INTERVAL`] (60 s) so a WireGuard transport wakes the radio
+/// no more often than the session heartbeat. 60 s exceeds the
+/// shortest NAT UDP timeouts (~30 s), so a mapping may expire
+/// between heartbeats — but the client re-creates it on each
+/// heartbeat, and in idle mode the server sends nothing unsolicited
+/// (only PONG replies, which follow the heartbeat), so an expired
+/// mapping costs a re-created mapping, not a dead session.
+pub const WG_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(60);
 
 /// True when the session has been idle long enough to back off:
 /// no user traffic since `last_traffic` and no transport added or
@@ -75,7 +138,7 @@ pub fn is_idle(last_traffic: Instant, last_transport_change: Instant, now: Insta
 /// churn-aware [`is_idle`]; only the heartbeat cadence uses this.
 ///
 /// - Go idle after [`HEARTBEAT_IDLE_AFTER`] of no user traffic.
-///   The active cadence (10 s) and idle cadence (25 s) are
+///   The active cadence (10 s) and idle cadence (60 s) are
 ///   unchanged; only WHEN the mode switches changes.
 /// - Go active only after sustained traffic: `traffic_ticks`
 ///   consecutive ticks with traffic observed (the worker counts a
@@ -96,7 +159,7 @@ pub fn next_heartbeat_idle(
 
 /// Pong-silence threshold for a heartbeat interval: three missed
 /// intervals means the path is blackholed (15 s at the 5 s cadence,
-/// 75 s at the 25 s idle cadence).
+/// 180 s at the 60 s idle cadence).
 pub fn pong_silence_timeout(interval: Duration) -> Duration {
     interval * 3
 }
@@ -129,8 +192,34 @@ mod tests {
         );
         assert_eq!(
             pong_silence_timeout(IDLE_INTERVAL),
-            Duration::from_secs(75)
+            Duration::from_secs(180)
         );
+    }
+
+    #[test]
+    fn idle_cadence_contract_is_consistent() {
+        // 4.72: the idle heartbeat must stay comfortably below the
+        // server reap, and the QUIC keepalive below the max idle
+        // timeout, so a live session is never reaped and a single
+        // missed keepalive cannot kill a QUIC connection. The
+        // WireGuard keepalive matches the heartbeat so no transport
+        // wakes the radio more often than the heartbeat itself.
+        // Exact values are pinned: changing any of them is a
+        // protocol decision, not a tune-up.
+        assert_eq!(IDLE_INTERVAL, Duration::from_secs(60));
+        assert_eq!(SERVER_TRANSPORT_RECV_TIMEOUT, Duration::from_secs(90));
+        assert_eq!(QUIC_KEEPALIVE_INTERVAL, Duration::from_secs(60));
+        assert_eq!(QUIC_MAX_IDLE_TIMEOUT, Duration::from_secs(120));
+        assert_eq!(WG_KEEPALIVE_INTERVAL, Duration::from_secs(60));
+        assert!(IDLE_INTERVAL < SERVER_TRANSPORT_RECV_TIMEOUT);
+        assert!(
+            SERVER_TRANSPORT_RECV_TIMEOUT - IDLE_INTERVAL >= Duration::from_secs(30),
+            "30 s of slack for a Doze/scheduler stall"
+        );
+        assert_eq!(QUIC_KEEPALIVE_INTERVAL, IDLE_INTERVAL);
+        assert!(QUIC_KEEPALIVE_INTERVAL < QUIC_MAX_IDLE_TIMEOUT);
+        assert!(QUIC_MAX_IDLE_TIMEOUT >= QUIC_KEEPALIVE_INTERVAL * 2);
+        assert_eq!(WG_KEEPALIVE_INTERVAL, IDLE_INTERVAL);
     }
 
     #[test]

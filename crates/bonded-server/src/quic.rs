@@ -24,6 +24,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, RwLock};
 
 use anyhow::Context as _;
+use bonded_core::heartbeat::QUIC_MAX_IDLE_TIMEOUT;
 use bonded_core::session::{
     decode_observed_address, encode_observed_address, is_answerable_ping, parse_session_epoch,
     SessionFrame, SessionHeader, FLAG_PATH_RETIRE, FLAG_PONG,
@@ -78,6 +79,16 @@ pub fn build_quic_server_config(
     // Allow some concurrent bidirectional streams per connection.
     let mut transport = quinn::TransportConfig::default();
     transport.max_concurrent_bidi_streams(4u32.into());
+    // Max idle timeout must stay above the client's 60 s QUIC
+    // keepalive (4.72): quinn's default is 30 s, which would kill an
+    // idle connection before its first 60 s keepalive. The effective
+    // timeout is the minimum of both endpoints, so the client sets
+    // the same value. 120 s is twice the keepalive, so a single
+    // missed keepalive cannot kill the connection.
+    transport.max_idle_timeout(Some(
+        quinn::IdleTimeout::try_from(QUIC_MAX_IDLE_TIMEOUT)
+            .expect("120 s idle timeout is in range"),
+    ));
     server_config.transport_config(Arc::new(transport));
 
     Ok(server_config)
