@@ -3,7 +3,8 @@ use async_trait::async_trait;
 use bonded_core::auth::{sign_auth_challenge, DeviceKeypair};
 use bonded_core::config::ClientConfig;
 use bonded_core::heartbeat::{
-    is_idle, pong_silence_timeout, IDLE_INTERVAL, QUIC_KEEPALIVE_INTERVAL, QUIC_MAX_IDLE_TIMEOUT,
+    is_idle, pong_silence_timeout, standby_ping_due, IDLE_INTERVAL, QUIC_KEEPALIVE_INTERVAL,
+    QUIC_MAX_IDLE_TIMEOUT, STANDBY_PING_INTERVAL,
 };
 #[cfg(target_os = "linux")]
 use bonded_core::peer_share::PeerShareDialBackNotification;
@@ -2839,6 +2840,11 @@ async fn run_linux_packet_loop(
     let mut last_traffic = Instant::now();
     let mut last_transport_change = Instant::now();
     let mut heartbeat_idle = false;
+    // Standby-ping timer (4.74): standbys are pinged every 60 s
+    // while active, not every 5 s tick. Seeded in the past so the
+    // first active tick pings every path and proves the set early,
+    // then every 60 s after.
+    let mut last_standby_ping = Instant::now() - STANDBY_PING_INTERVAL;
     // Traffic modes (4.51): the Linux CLI has no rule input in this
     // slice, so the loop below runs the default engine — today's
     // flow-hash spreading, unchanged.
@@ -2987,14 +2993,25 @@ async fn run_linux_packet_loop(
                         .collect();
                     last_transport_count = transports.len();
                     last_transport_change = Instant::now();
+                    // A changed transport set is pinged in full on
+                    // this tick so a newly added standby proves
+                    // itself promptly instead of waiting out a 60 s
+                    // standby cadence.
+                    last_standby_ping = Instant::now() - STANDBY_PING_INTERVAL;
                 }
-                // While active, PING every path, not just the active
-                // one: the server reaps transports it receives nothing
-                // on for 90s. While idle, ping only the active path —
-                // standby paths go silent and the server reaps them
-                // after 90s; they are re-pinged (and evicted if dead,
-                // then re-dialed by the supervisor) when traffic
-                // resumes and the fast cadence restarts. See
+                // While active, PING the active path every tick and
+                // each standby at the 60 s standby cadence (4.74),
+                // not every path every tick: the old all-paths ping
+                // multiplied the wakeup rate by the transport count
+                // (the Android overnight 2026-11-11/12 ran ~6 paths
+                // x 360 ticks/h = 2,128 pings/h). 60 s stays under
+                // the server's 90 s reap, so a live standby is never
+                // reaped for going quiet between standby pings.
+                // While idle, ping only the active path — standby
+                // paths go silent and the server reaps them after
+                // 90s; they are re-pinged (and evicted if dead, then
+                // re-dialed by the supervisor) when traffic resumes
+                // and the fast cadence restarts. See
                 // bonded_core::heartbeat for the full tradeoff.
                 let ping = SessionFrame {
                     header: SessionHeader {
@@ -3004,9 +3021,21 @@ async fn run_linux_packet_loop(
                     },
                     payload: Bytes::new(),
                 };
+                // Standbys are pinged on this tick only when active
+                // AND their 60 s cadence is due. The timer resets
+                // here so the cadence is measured from the last
+                // standby ping, not from session start — idle
+                // stretches (where standbys are not pinged at all)
+                // do not shift it.
+                let now = Instant::now();
+                let ping_standbys =
+                    !heartbeat_idle && standby_ping_due(last_standby_ping, now);
+                if ping_standbys {
+                    last_standby_ping = now;
+                }
                 let mut failed: Vec<usize> = Vec::new();
                 for index in 0..transports.len() {
-                    if heartbeat_idle && index != active_index {
+                    if index != active_index && !ping_standbys {
                         continue;
                     }
                     if let Err(err) = transports[index].send(ping.clone()).await {
@@ -3016,23 +3045,33 @@ async fn run_linux_packet_loop(
                 }
                 // A path whose PONG has been silent for three heartbeat
                 // intervals is blackholed even if its sends still
-                // succeed (15s at the 5s cadence, 75s while idle).
-                let pong_timeout = pong_silence_timeout(if heartbeat_idle {
-                    IDLE_INTERVAL
-                } else {
-                    HEARTBEAT_ACTIVE_INTERVAL
-                });
-                let now = Instant::now();
+                // succeed. The interval is per-path: the active path
+                // is pinged every 5 s while active (15 s timeout) and
+                // every 60 s while idle (180 s), but a standby is
+                // pinged every 60 s while active too (4.74), so its
+                // pong silence is judged against three standby
+                // intervals (180 s) — a healthy standby's last pong
+                // is up to 60 s old by design, and the old 15 s
+                // timeout would evict every standby.
                 for index in 0..transports.len() {
                     if failed.contains(&index) {
                         continue;
                     }
+                    let pong_timeout = if index == active_index {
+                        pong_silence_timeout(if heartbeat_idle {
+                            IDLE_INTERVAL
+                        } else {
+                            HEARTBEAT_ACTIVE_INTERVAL
+                        })
+                    } else {
+                        pong_silence_timeout(STANDBY_PING_INTERVAL)
+                    };
                     let silent = last_pong_by_index
                         .get(&index)
                         .map(|pong| now.duration_since(*pong) > pong_timeout)
                         .unwrap_or(false);
                     if silent {
-                        warn!(path = index, "heartbeat timeout: no PONG in 15s, dropping blackholed path");
+                        warn!(path = index, timeout_secs = pong_timeout.as_secs(), "heartbeat timeout: no PONG, dropping blackholed path");
                         failed.push(index);
                     }
                 }

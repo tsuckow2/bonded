@@ -12,6 +12,20 @@
 //! at [`IDLE_INTERVAL`] — standby paths are not pinged until traffic
 //! resumes.
 //!
+//! While ACTIVE, standby paths are pinged at the slower
+//! [`STANDBY_PING_INTERVAL`] (4.74), not on every 10 s tick: pinging
+//! every path every tick multiplies the wakeup rate by the transport
+//! count (overnight 2026-11-11/12: ~6 paths x 360 ticks/h = 2,128
+//! pings/h). The standby cadence is 60 s, just under the 90 s server
+//! reap, so a live standby is never reaped.
+//!
+//! The idle gate itself is traffic-based by default, but a session
+//! whose screen is off AND battery saver is on goes idle regardless
+//! of traffic (4.73): the 6a's own background traffic resets the
+//! 180 s timer constantly, so the traffic gate alone never fired
+//! overnight. Screen state is the honest idle signal; background
+//! system traffic is not user traffic.
+//!
 //! Shared idle-cadence contract (4.72): the idle heartbeat, the QUIC
 //! keepalive, and the WireGuard persistent keepalive all run at
 //! [`IDLE_INTERVAL`] (60 s), and the server reaps a silent transport
@@ -131,6 +145,27 @@ pub fn is_idle(last_traffic: Instant, last_transport_change: Instant, now: Insta
         && now.duration_since(last_transport_change) >= IDLE_AFTER
 }
 
+/// Standby-ping interval while active (4.74 / Fix B). 60 s — equal
+/// to [`IDLE_INTERVAL`] and just under
+/// [`SERVER_TRANSPORT_RECV_TIMEOUT`] (90 s), so a standby pinged at
+/// this cadence is never reaped by the server. While the session is
+/// active the active path is pinged every 10 s but each standby only
+/// every 60 s: with N transports the ping rate drops from 360*N/h
+/// to 360 + 60*(N-1)/h (N=6: 2,160/h → 660/h). The 30 s of slack
+/// covers a Doze/scheduler stall, exactly as the idle heartbeat does.
+pub const STANDBY_PING_INTERVAL: Duration = Duration::from_secs(60);
+
+/// True when a standby path is due its (slower) ping: at least
+/// [`STANDBY_PING_INTERVAL`] since its last ping. Pure, so the
+/// workers' standby-ping decision is unit-testable without a
+/// session. The workers reset the timer whenever standbys are
+/// pinged, and also when the transport set changes, so a newly
+/// added standby is pinged on the next tick instead of waiting out
+/// a full 60 s before proving itself.
+pub fn standby_ping_due(last_standby_ping: Instant, now: Instant) -> bool {
+    now.duration_since(last_standby_ping) >= STANDBY_PING_INTERVAL
+}
+
 /// Next heartbeat-idle state, with hysteresis (4.65). Pure, so the
 /// worker's cadence flip is unit-testable without a session. This is
 /// the heartbeat cadence's own idle gate — traffic-only, decoupled
@@ -144,12 +179,26 @@ pub fn is_idle(last_traffic: Instant, last_transport_change: Instant, now: Insta
 ///   consecutive ticks with traffic observed (the worker counts a
 ///   tick when `last_traffic` advanced since the previous tick).
 ///   A lone background packet does not re-arm the 10 s heartbeat.
+/// - Screen-off + battery saver (4.73 / Fix A) forces idle
+///   regardless of traffic, and keeps the heartbeat idle while it
+///   holds: `screen_off_and_saver` true => idle, full stop. The
+///   180 s traffic rule above is the fallback for the screen-on
+///   (or saver-off) case. When the screen turns back on (or saver
+///   goes off) the traffic rule resumes, and background traffic —
+///   which keeps `traffic_ticks` high — returns the heartbeat to
+///   the active cadence on the next tick.
 pub fn next_heartbeat_idle(
     currently_idle: bool,
     last_traffic: Instant,
     traffic_ticks: u32,
     now: Instant,
+    screen_off_and_saver: bool,
 ) -> bool {
+    // 4.73: screen off + battery saver is the honest idle signal —
+    // background traffic must not keep the 10 s cadence alive.
+    if screen_off_and_saver {
+        return true;
+    }
     if currently_idle {
         traffic_ticks < HEARTBEAT_ACTIVE_TICKS
     } else {
@@ -211,6 +260,14 @@ mod tests {
         assert_eq!(QUIC_KEEPALIVE_INTERVAL, Duration::from_secs(60));
         assert_eq!(QUIC_MAX_IDLE_TIMEOUT, Duration::from_secs(120));
         assert_eq!(WG_KEEPALIVE_INTERVAL, Duration::from_secs(60));
+        // 4.74: the standby ping cadence matches the idle heartbeat
+        // and stays below the server reap with the same 30 s slack.
+        assert_eq!(STANDBY_PING_INTERVAL, IDLE_INTERVAL);
+        assert!(STANDBY_PING_INTERVAL < SERVER_TRANSPORT_RECV_TIMEOUT);
+        assert!(
+            SERVER_TRANSPORT_RECV_TIMEOUT - STANDBY_PING_INTERVAL >= Duration::from_secs(30),
+            "30 s of slack for a Doze/scheduler stall"
+        );
         assert!(IDLE_INTERVAL < SERVER_TRANSPORT_RECV_TIMEOUT);
         assert!(
             SERVER_TRANSPORT_RECV_TIMEOUT - IDLE_INTERVAL >= Duration::from_secs(30),
@@ -228,20 +285,57 @@ mod tests {
         // Active -> idle needs 180 s of no traffic, not 60 s.
         let quiet_60 = now - Duration::from_secs(61);
         assert!(
-            !next_heartbeat_idle(false, quiet_60, 0, now),
+            !next_heartbeat_idle(false, quiet_60, 0, now, false),
             "60 s quiet is not idle for the heartbeat"
         );
         let quiet_180 = now - HEARTBEAT_IDLE_AFTER;
-        assert!(next_heartbeat_idle(false, quiet_180, 0, now));
+        assert!(next_heartbeat_idle(false, quiet_180, 0, now, false));
         // A single tick with traffic does not re-arm the heartbeat.
         assert!(
-            next_heartbeat_idle(true, now, 1, now),
+            next_heartbeat_idle(true, now, 1, now, false),
             "one traffic tick keeps the heartbeat idle"
         );
         // Sustained traffic (two consecutive ticks) goes active.
-        assert!(!next_heartbeat_idle(true, now, 2, now));
-        assert!(!next_heartbeat_idle(true, now, 5, now));
+        assert!(!next_heartbeat_idle(true, now, 2, now, false));
+        assert!(!next_heartbeat_idle(true, now, 5, now, false));
         // Idle with no traffic stays idle regardless of the count.
-        assert!(next_heartbeat_idle(true, quiet_180, 0, now));
+        assert!(next_heartbeat_idle(true, quiet_180, 0, now, false));
+    }
+
+    #[test]
+    fn screen_off_and_saver_forces_idle_despite_traffic() {
+        // 4.73: the overnight failure — background traffic flows
+        // constantly, so the 180 s traffic gate never fires. Screen
+        // off + battery saver must force idle even with fresh
+        // traffic on every tick.
+        let now = Instant::now();
+        // Active with traffic this very tick: forced idle.
+        assert!(next_heartbeat_idle(false, now, 5, now, true));
+        // Idle with sustained traffic: stays idle while the
+        // screen-off+saver condition holds.
+        assert!(next_heartbeat_idle(true, now, 5, now, true));
+        // Same inputs without the condition: traffic keeps it active.
+        assert!(!next_heartbeat_idle(false, now, 5, now, false));
+        assert!(!next_heartbeat_idle(true, now, 5, now, false));
+        // Screen on again (or saver off): the traffic gate resumes —
+        // an idle session with sustained traffic goes active on the
+        // next tick, which is how the heartbeat recovers when the
+        // user picks the phone up.
+        assert!(!next_heartbeat_idle(true, now, 2, now, false));
+    }
+
+    #[test]
+    fn standby_ping_due_at_sixty_second_cadence() {
+        // 4.74: standbys are pinged every 60 s while active, not
+        // every 10 s tick.
+        let now = Instant::now();
+        let pinged_59s_ago = now - Duration::from_secs(59);
+        assert!(!standby_ping_due(pinged_59s_ago, now));
+        let pinged_60s_ago = now - Duration::from_secs(60);
+        assert!(standby_ping_due(pinged_60s_ago, now));
+        let pinged_61s_ago = now - Duration::from_secs(61);
+        assert!(standby_ping_due(pinged_61s_ago, now));
+        // Just pinged: not due.
+        assert!(!standby_ping_due(now, now));
     }
 }

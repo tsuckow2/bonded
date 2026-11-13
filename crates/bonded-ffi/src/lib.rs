@@ -6,7 +6,9 @@ use bonded_client::{
 };
 #[cfg(any(target_os = "android", test))]
 use bonded_core::config::ClientConfig;
-use bonded_core::heartbeat::{is_idle, next_heartbeat_idle, IDLE_INTERVAL};
+use bonded_core::heartbeat::{
+    is_idle, next_heartbeat_idle, standby_ping_due, IDLE_INTERVAL, STANDBY_PING_INTERVAL,
+};
 #[cfg(target_os = "android")]
 use bonded_core::config::SocketNetworkBindFn;
 #[cfg(target_os = "android")]
@@ -2134,7 +2136,11 @@ fn start_android_session(
             let mut last_transport_count = transports.len();
             // Adaptive heartbeat (battery): 10 s while traffic flows,
             // 60 s on the active path only while idle — see
-            // bonded_core::heartbeat for the policy. The 10 s active
+            // bonded_core::heartbeat for the policy. While active,
+            // standby paths are pinged at the 60 s standby cadence
+            // (4.74), not every tick. While idle, the heartbeat goes
+            // idle when the screen is off AND battery saver is on,
+            // regardless of background traffic (4.73). The 10 s active
             // cadence is kept deliberately: the server reaps any
             // transport it receives nothing on for 90 s, so a 60 s
             // cadence leaves 30 s of slack and a single
@@ -2158,6 +2164,11 @@ fn start_android_session(
             // previous tick; any quiet tick resets the count.
             let mut heartbeat_traffic_ticks: u32 = 0;
             let mut prev_heartbeat_tick = Instant::now();
+            // Standby-ping timer (4.74): standbys are pinged every
+            // 60 s while active, not every 10 s tick. Seeded in the
+            // past so the first active tick pings every path and
+            // proves the set early, then every 60 s after.
+            let mut last_standby_ping = Instant::now() - STANDBY_PING_INTERVAL;
             // Consume the immediate first tick so the first ping fires after 10s, not instantly.
             heartbeat.tick().await;
 
@@ -3222,6 +3233,19 @@ fn start_android_session(
                             last_traffic,
                             heartbeat_traffic_ticks,
                             now,
+                            // 4.73: screen off + battery saver forces
+                            // the idle cadence regardless of background
+                            // traffic — the 180 s traffic gate alone
+                            // never fires overnight because the phone's
+                            // own background traffic resets it. The
+                            // screen state arrives via
+                            // PathControl::DisplayInteractive (pushed
+                            // by BondedVpnService on ACTION_SCREEN_ON /
+                            // OFF and at session start); battery saver
+                            // is the session config value. The 180 s
+                            // traffic rule stays the fallback for the
+                            // screen-on (or saver-off) case.
+                            !display_interactive && config.client.battery_saver,
                         );
                         // Adaptive cadence: flip the interval when the
                         // idle state changes, consuming the fresh
@@ -3329,13 +3353,16 @@ fn start_android_session(
                             payload: Bytes::new(),
                         };
                         alog_info!("Sending heartbeat ping seq={}", ping_sequence);
-                        // While active, ping EVERY path, not just the
-                        // active one: the server closes any transport
-                        // it receives nothing on for 90s, so an
-                        // active-path-only heartbeat lets every idle
-                        // path be torn down and re-dialed in a loop,
-                        // leaving the session single-path in practice.
-                        // While idle, ping only the active path (see
+                        // While active, ping the active path every tick
+                        // and each standby at the 60 s standby cadence
+                        // (4.74), not every path every tick: the old
+                        // all-paths-every-tick heartbeat multiplied the
+                        // wakeup rate by the transport count (overnight
+                        // 2026-11-11/12: ~6 paths x 360 ticks/h =
+                        // 2,128 pings/h). 60 s stays under the server's
+                        // 90 s reap, so a live standby is never reaped
+                        // for going quiet between standby pings. While
+                        // idle, ping only the active path (see
                         // bonded_core::heartbeat): standby paths go
                         // silent and the server reaps them after 90s;
                         // they are re-pinged — and evicted if dead,
@@ -3345,10 +3372,26 @@ fn start_android_session(
                             standby_ping_failures.clear();
                             last_transport_count = transports.len();
                             last_transport_change = Instant::now();
+                            // A changed transport set is pinged in
+                            // full on this tick so a newly added
+                            // standby proves itself promptly instead
+                            // of waiting out a 60 s standby cadence.
+                            last_standby_ping = now - STANDBY_PING_INTERVAL;
+                        }
+                        // Standbys are pinged on this tick only when
+                        // active AND their 60 s cadence is due. The
+                        // timer resets here so the cadence is measured
+                        // from the last standby ping, not from session
+                        // start — idle stretches (where standbys are
+                        // not pinged at all) do not shift it.
+                        let ping_standbys =
+                            !heartbeat_idle && standby_ping_due(last_standby_ping, now);
+                        if ping_standbys {
+                            last_standby_ping = now;
                         }
                         let mut any_sent = false;
                         for (path_index, transport) in transports.iter_mut().enumerate() {
-                            if heartbeat_idle && path_index != active_index {
+                            if path_index != active_index && !ping_standbys {
                                 continue;
                             }
                             match transport.send(ping.clone()).await {
@@ -3414,10 +3457,13 @@ fn start_android_session(
                             let connection_closed =
                                 transports[index].peer_relay_connection_closed();
                             // A standby whose heartbeat ping has
-                            // failed on two consecutive ticks is dead:
-                            // evict it so the snapshot stops counting it
-                            // and failover never promotes a corpse. (The
-                            // server reaps silently, so an un-evicted
+                            // failed on two consecutive standby pings
+                            // is dead: evict it so the snapshot stops
+                            // counting it and failover never promotes a
+                            // corpse. (Two standby pings span 120 s at
+                            // the 60 s standby cadence (4.74), not 20 s
+                            // as under the old every-tick pinging.)
+                            // (The server reaps silently, so an un-evicted
                             // zombie otherwise lingers indefinitely; the
                             // removal below also notifies the F4 path
                             // supervisor for direct paths, which re-dials
