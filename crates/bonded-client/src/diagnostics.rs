@@ -95,7 +95,16 @@ impl DiagnosticsUploader {
         if contents.is_empty() {
             return Ok(());
         }
-        let log_text = tail_cap_log(contents);
+        // Drop Tier 1 noise before the tail cap, so the 512 KiB cap
+        // retains relevant history instead of discarding older relevant
+        // lines to make room for noise. The local log ring is unchanged;
+        // only the upload payload is filtered.
+        let filtered = filter_diagnostics_noise(contents);
+        if filtered.trim().is_empty() {
+            // Nothing but routine noise: nothing worth uploading.
+            return Ok(());
+        }
+        let log_text = tail_cap_log(&filtered);
         let hash = content_hash(log_text.as_bytes());
         if self.last_uploaded_hash == Some(hash) {
             return Ok(());
@@ -137,6 +146,54 @@ impl DiagnosticsUploader {
             errors.join(" | ")
         )
     }
+}
+
+/// Drop Tier 1 noise lines from a diagnostic log before upload.
+///
+/// Tier 1 lines are high-frequency routine successes with no diagnostic
+/// value per line: one line per heartbeat ping and pong, and one
+/// success line per socket-protect / socket-bind call. A diagnostician
+/// needs the ping rate and RTT distribution, not one line per ping;
+/// and a success line per fd is pure debug chatter. Only the success
+/// variants are dropped — a failed protect/bind (`-> false`) is a real
+/// event and is kept. The local log ring is unchanged; only the upload
+/// payload is filtered.
+fn filter_diagnostics_noise(contents: &str) -> String {
+    let mut out = String::with_capacity(contents.len() / 2);
+    for line in contents.lines() {
+        if is_diagnostics_noise_line(line) {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// Whether one log-ring line is Tier 1 noise (see
+/// [`filter_diagnostics_noise`]).
+///
+/// Log-ring lines are `<epoch_ms> <level> <message>`; the match is on
+/// the message portion so a timestamp/level prefix can never cause a
+/// false positive. A line that does not parse as `<epoch_ms> <level>
+/// <message>` is kept (never dropped).
+fn is_diagnostics_noise_line(line: &str) -> bool {
+    let message = log_ring_message(line);
+    message.starts_with("Sending heartbeat ping seq=")
+        || message.starts_with("Heartbeat pong received: seq=")
+        || (message.starts_with("protect_fd(fd=")
+            && message.trim_end().ends_with("-> true"))
+        || (message.starts_with("bind_socket_to_network(fd=")
+            && message.trim_end().ends_with("-> true"))
+}
+
+/// The message portion of a log-ring line (`<epoch_ms> <level>
+/// <message>`). Returns the whole line when it has no such prefix.
+fn log_ring_message(line: &str) -> &str {
+    let mut parts = line.splitn(3, ' ');
+    let _epoch_ms = parts.next();
+    let _level = parts.next();
+    parts.next().unwrap_or(line)
 }
 
 /// Keep the newest bytes of the log within the server's size limit,
@@ -203,5 +260,69 @@ mod tests {
     fn content_hash_distinguishes_inputs() {
         assert_ne!(content_hash(b"one"), content_hash(b"two"));
         assert_eq!(content_hash(b"same"), content_hash(b"same"));
+    }
+
+    #[test]
+    fn diagnostics_noise_filter_drops_tier1_and_keeps_the_rest() {
+        let log = [
+            "1794483579223 4 Sending heartbeat ping seq=1544",
+            "1794483579329 4 Heartbeat pong received: seq=1544 rtt=107ms",
+            "1794483579329 4 Heartbeat pong received: seq=1545",
+            "1794483594934 4 protect_fd(fd=881) -> true",
+            "1794483595316 4 bind_socket_to_network(fd=980, bind_address=172.20.72.101) -> true",
+            // Failure variants are real events: kept.
+            "1794483594934 4 protect_fd(fd=881) -> false",
+            "1794483595316 4 bind_socket_to_network(fd=980, bind_address=172.20.72.101) -> false",
+            // Tier 2 / Tier 3 lines: kept.
+            "1794483594926 4 PeerShare: dialing back consumer=7ETk path=0",
+            "1794483594934 4 Relay dial failed: timeout",
+            "1794483594934 4 QUIC accept failed: cert mismatch",
+            // Unparseable lines are kept, never dropped.
+            "garbage line without a timestamp",
+            "1794483594934",
+        ]
+        .join("\n");
+        let filtered = filter_diagnostics_noise(&log);
+        // All five Tier 1 lines are gone.
+        assert!(!filtered.contains("Sending heartbeat ping"));
+        assert!(!filtered.contains("Heartbeat pong received"));
+        assert!(!filtered.contains("protect_fd(fd=881) -> true"));
+        assert!(
+            !filtered.contains(
+                "bind_socket_to_network(fd=980, bind_address=172.20.72.101) -> true"
+            )
+        );
+        // Failure variants and Tier 2/3 lines survive.
+        assert!(filtered.contains("protect_fd(fd=881) -> false"));
+        assert!(filtered.contains(
+            "bind_socket_to_network(fd=980, bind_address=172.20.72.101) -> false"
+        ));
+        assert!(filtered.contains("PeerShare: dialing back"));
+        assert!(filtered.contains("Relay dial failed"));
+        assert!(filtered.contains("QUIC accept failed"));
+        assert!(filtered.contains("garbage line without a timestamp"));
+        assert_eq!(filtered.lines().count(), 7);
+    }
+
+    #[test]
+    fn diagnostics_noise_filter_empty_when_all_noise() {
+        let log = "1794483579223 4 Sending heartbeat ping seq=1\n\
+                   1794483579329 4 Heartbeat pong received: seq=1 rtt=10ms\n";
+        assert!(filter_diagnostics_noise(log).trim().is_empty());
+    }
+
+    #[test]
+    fn diagnostics_noise_filter_matches_real_upload_lines() {
+        // Lines copied verbatim from a real OnePlus diagnostics upload
+        // (~/workspace/diag-content/f1.log): the filter must drop the
+        // Tier 1 lines and keep a Tier 2 line from the same file.
+        let log = "1794483579223 4 Sending heartbeat ping seq=1544\n\
+                   1794483579329 4 Heartbeat pong received: seq=1544 rtt=107ms\n\
+                   1794483594934 4 protect_fd(fd=881) -> true\n\
+                   1794483595316 4 bind_socket_to_network(fd=980, bind_address=172.20.72.101) -> true\n\
+                   1794483594926 4 PeerShare: dialing back consumer=7ETkjYV/PfsDew780IuI6ZV57nRaJIHmpdtWuOGMK2o= path=0\n";
+        let filtered = filter_diagnostics_noise(log);
+        assert_eq!(filtered.lines().count(), 1);
+        assert!(filtered.contains("PeerShare: dialing back"));
     }
 }
