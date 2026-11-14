@@ -597,6 +597,7 @@ async fn run_relay_task(
     relay_claims: Arc<std::sync::Mutex<RelayPathClaims>>,
     relay_count: Arc<AtomicUsize>,
     relay_stats: Arc<PeerShareRelayStats>,
+    relay_sticky: Arc<RelayUpstreamSticky>,
     bandwidth_kbps: u64,
     relay_logger: Option<PeerShareEventLogger>,
 ) {
@@ -636,8 +637,14 @@ async fn run_relay_task(
             // path retries until it returns or the leg is
             // evicted consumer-side). The unpinned slot
             // keeps the old single-upstream behavior.
-            let mut upstream =
-                match establish_relay_upstream(&relay_config, &relay_path_source, claimed_index).await {
+            let mut upstream = match establish_relay_upstream(
+                &relay_config,
+                &relay_path_source,
+                claimed_index,
+                &relay_sticky,
+            )
+            .await
+            {
                     Ok(upstream) => upstream,
                     Err(e) => {
                         tracing::warn!(error = %e, "provider: failed to establish relay upstream, retrying");
@@ -807,6 +814,7 @@ async fn run_dial_back_handler(
     path_claims: Arc<std::sync::Mutex<RelayPathClaims>>,
     active_relays: Arc<AtomicUsize>,
     relay_stats: Arc<PeerShareRelayStats>,
+    relay_sticky: Arc<RelayUpstreamSticky>,
     path_source: ProviderPathSource,
     bandwidth_kbps: u64,
     logger: Option<PeerShareEventLogger>,
@@ -889,6 +897,7 @@ async fn run_dial_back_handler(
                     path_claims.clone(),
                     active_relays.clone(),
                     relay_stats.clone(),
+                    relay_sticky.clone(),
                     bandwidth_kbps,
                     logger.clone(),
                 ));
@@ -944,6 +953,7 @@ async fn run_peer_accept_loop(
     path_claims: Arc<std::sync::Mutex<RelayPathClaims>>,
     active_relays: Arc<AtomicUsize>,
     relay_stats: Arc<PeerShareRelayStats>,
+    relay_sticky: Arc<RelayUpstreamSticky>,
     path_source: ProviderPathSource,
     config: ClientConfig,
     // Consumer-side handoff for reversed legs (4.57): None in
@@ -1136,6 +1146,7 @@ async fn run_peer_accept_loop(
             path_claims.clone(),
             active_relays.clone(),
             relay_stats.clone(),
+            relay_sticky.clone(),
             bandwidth_kbps,
             logger.clone(),
         ));
@@ -1399,6 +1410,14 @@ pub async fn start_peer_share_runtime(
     // always carries one; a consumer-only runtime stays at zero.
     let relay_stats = Arc::new(PeerShareRelayStats::default());
 
+    // Sticky per-path relay-upstream protocol memory (4.75): one
+    // instance for the whole provider runtime, shared by the forward
+    // accept loop and the dial-back handler, so legs from both
+    // directions teach the same memory. Created in all modes; a
+    // consumer-only runtime never establishes relay upstreams, so it
+    // stays empty.
+    let relay_upstream_sticky = Arc::new(RelayUpstreamSticky::default());
+
     // Provider-side shared state (4.57): ONE claim set for the whole
     // provider, shared by the forward accept loop and the dial-back
     // handler — the (peer, path) dedup lives here, so a forward and
@@ -1477,6 +1496,7 @@ pub async fn start_peer_share_runtime(
             path_claims.clone(),
             active_relays.clone(),
             relay_stats.clone(),
+            relay_upstream_sticky.clone(),
             path_source.clone(),
             config.clone(),
             accept_reversed_tx,
@@ -1514,6 +1534,7 @@ pub async fn start_peer_share_runtime(
             path_claims.clone(),
             active_relays.clone(),
             relay_stats.clone(),
+            relay_upstream_sticky.clone(),
             provider_path_source.clone(),
             config.client.peer_share_relay_bandwidth_kbps,
             event_logger.clone(),
@@ -1971,6 +1992,138 @@ pub async fn start_peer_share_runtime(
     })
 }
 
+/// Sticky per-path relay-upstream protocol selection (4.75,
+/// Investigation D, `~/workspace/investigation-d-bind-failures-2026-11-12.md`):
+/// the parallel protocol race in `establish_single_transport_path`
+/// opens a QUIC dial on EVERY relay-upstream establishment and throws
+/// it away whenever WSS wins on the slow path — ~30 wasted QUIC
+/// handshakes/h overnight, each reaching the server, completing auth,
+/// then being dropped before its first frame (the 336 overnight
+/// `failed to receive initial session frame` bind failures). The split
+/// is perfectly path-dependent (QUIC wins 649/649 on the 6a's
+/// direct-cellular egress, WSS wins 330/330 on the other egress), so
+/// remembering the last winning protocol per claimed provider path and
+/// trying ONLY it first removes the wasted dial entirely. A failure
+/// falls back to the full race, which re-learns the winner, and a
+/// memory older than one introduction cycle is re-raced from scratch
+/// so a path whose best protocol changed is re-learned instead of
+/// trusting a stale winner forever.
+///
+/// One instance is shared by the whole provider runtime (forward
+/// accept loop + dial-back handler), so legs from both directions
+/// teach the same memory. Keyed by claimed path index only — the
+/// unpinned slot has no path to key on and keeps the old race.
+#[derive(Debug, Default)]
+struct RelayUpstreamSticky {
+    entries: std::sync::Mutex<HashMap<usize, StickyEntry>>,
+}
+
+#[derive(Debug)]
+struct StickyEntry {
+    protocol: String,
+    won_at: std::time::Instant,
+}
+
+/// Re-probe interval: a sticky memory older than one introduction
+/// cycle (300 s) is re-raced from scratch. 300 s matches the
+/// introduction lifetime, so a relay task re-probes at most once per
+/// fresh leg, and a repeatedly-winning protocol refreshes its
+/// timestamp on every win and is never re-probed while it keeps
+/// winning.
+const RELAY_UPSTREAM_STICKY_REPROBE_AFTER: Duration = Duration::from_secs(300);
+
+/// A sticky entry is fresh while it is no older than the re-probe
+/// interval. Pure (time injected) so tests can check the boundary
+/// without waiting.
+fn sticky_entry_fresh(won_at: std::time::Instant, now: std::time::Instant) -> bool {
+    now.saturating_duration_since(won_at) <= RELAY_UPSTREAM_STICKY_REPROBE_AFTER
+}
+
+impl RelayUpstreamSticky {
+    /// The protocol to try first for `path_index`, if we remember a
+    /// fresh winner that is still in the configured relay list.
+    /// Returns the protocol name as recorded — it came from this
+    /// list, so the single-protocol dial spells it the same way.
+    fn preferred(&self, path_index: usize, protocols: &[String]) -> Option<String> {
+        self.preferred_at(path_index, protocols, std::time::Instant::now())
+    }
+
+    fn preferred_at(
+        &self,
+        path_index: usize,
+        protocols: &[String],
+        now: std::time::Instant,
+    ) -> Option<String> {
+        let entries = self
+            .entries
+            .lock()
+            .expect("relay upstream sticky lock poisoned");
+        let entry = entries.get(&path_index)?;
+        if !sticky_entry_fresh(entry.won_at, now) {
+            return None;
+        }
+        if protocols
+            .iter()
+            .any(|protocol| protocol.eq_ignore_ascii_case(&entry.protocol))
+        {
+            Some(entry.protocol.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Remember `protocol` as the last winner for `path_index`,
+    /// refreshing its timestamp so a repeatedly-winning protocol is
+    /// not re-probed while it keeps winning.
+    fn record(&self, path_index: usize, protocol: &str) {
+        self.record_at(path_index, protocol, std::time::Instant::now())
+    }
+
+    fn record_at(&self, path_index: usize, protocol: &str, now: std::time::Instant) {
+        self.entries
+            .lock()
+            .expect("relay upstream sticky lock poisoned")
+            .insert(
+                path_index,
+                StickyEntry {
+                    protocol: protocol.to_owned(),
+                    won_at: now,
+                },
+            );
+    }
+}
+
+/// The relay protocol name a won transport corresponds to, as spelled
+/// in the raced list: the race reports only the transport, and `h3`
+/// and `quic` (like `wss` and `websocket_tls`) dial the same
+/// transport, so the winner is recorded under whichever spelling the
+/// configuration actually raced. Returns None for transports the
+/// relay list never races (unreachable in practice — the relay list
+/// filters to wss/h3/quic only), in which case nothing is recorded
+/// and the next establishment races from scratch.
+fn relay_protocol_for_transport(
+    transport: &ClientTransport,
+    protocols: &[String],
+) -> Option<String> {
+    let candidates: &[&str] = match transport {
+        ClientTransport::Quic(_) => &["h3", "quic"],
+        ClientTransport::WebSocket(_) => &["wss", "websocket_tls"],
+        _ => return None,
+    };
+    pick_listed_protocol(candidates, protocols).map(str::to_owned)
+}
+
+/// First candidate present in `protocols` (case-insensitive),
+/// returned with the list's own spelling.
+fn pick_listed_protocol<'a>(candidates: &[&str], protocols: &'a [String]) -> Option<&'a str> {
+    candidates.iter().find_map(|candidate| {
+        protocols
+            .iter()
+            .find(|protocol| protocol.eq_ignore_ascii_case(candidate))
+            .map(String::as_str)
+    })
+}
+
 /// Upstream protocols for relay legs: QUIC/WebSocket only, no
 /// NaiveTCP (the old single-upstream restriction, kept for pinned
 /// upstreams too).
@@ -2000,10 +2153,19 @@ fn relay_upstream_protocols(config: &ClientConfig) -> Vec<String> {
 /// inside that dial (pre-flight), so the task's retry loop paces
 /// re-establishment instead of burning establish timeouts. The
 /// unpinned slot falls back to the old any-path upstream.
+///
+/// Sticky first (4.75, Investigation D): a remembered fresh winner
+/// for this path is tried ALONE — no second dial is opened at all —
+/// and only a failure falls through to the full race, which
+/// re-learns the winner. A stale sticky costs at most one extra
+/// attempt (bounded by the single-path establish timeout) before the
+/// race, never a lost leg: the race below is exactly today's
+/// behaviour.
 async fn establish_relay_upstream(
     config: &ClientConfig,
     paths: &ProviderPathSource,
     claimed_index: usize,
+    sticky: &RelayUpstreamSticky,
 ) -> anyhow::Result<ClientTransport> {
     if claimed_index == UNPINNED_PATH_INDEX {
         let mut upstreams = establish_peer_upstream_paths(config).await?;
@@ -2012,11 +2174,44 @@ async fn establish_relay_upstream(
             .next()
             .context("peer-share relay accept produced no upstream transport paths");
     }
-    let mut relay_config = config.clone();
-    relay_config.client.preferred_protocols = relay_upstream_protocols(config);
+    let protocols = relay_upstream_protocols(config);
     let Some(address) = paths.address_for(claimed_index) else {
         anyhow::bail!("claimed provider path {claimed_index} is no longer listed");
     };
+    if let Some(sticky_protocol) = sticky.preferred(claimed_index, &protocols) {
+        let mut sticky_config = config.clone();
+        sticky_config.client.preferred_protocols = vec![sticky_protocol.clone()];
+        let mut observer = |_: String| {};
+        match establish_single_transport_path(
+            &sticky_config,
+            claimed_index,
+            1,
+            Some(&address),
+            &mut observer,
+        )
+        .await?
+        {
+            SinglePathResult::Connected(transport) => {
+                sticky.record(claimed_index, &sticky_protocol);
+                info!(
+                    claimed_path = claimed_index,
+                    protocol = %sticky_protocol,
+                    "relay upstream established via sticky protocol"
+                );
+                return Ok(transport);
+            }
+            SinglePathResult::Failed(reason) => {
+                info!(
+                    claimed_path = claimed_index,
+                    protocol = %sticky_protocol,
+                    reason = %reason,
+                    "sticky relay upstream failed; falling back to the full protocol race"
+                );
+            }
+        }
+    }
+    let mut relay_config = config.clone();
+    relay_config.client.preferred_protocols = protocols.clone();
     let mut observer = |_: String| {};
     match establish_single_transport_path(
         &relay_config,
@@ -2027,7 +2222,12 @@ async fn establish_relay_upstream(
     )
     .await?
     {
-        SinglePathResult::Connected(transport) => Ok(transport),
+        SinglePathResult::Connected(transport) => {
+            if let Some(winner) = relay_protocol_for_transport(&transport, &protocols) {
+                sticky.record(claimed_index, &winner);
+            }
+            Ok(transport)
+        }
         SinglePathResult::Failed(reason) => Err(anyhow::anyhow!(
             "relay upstream for path {claimed_index} failed: {reason}"
         )),
@@ -2826,16 +3026,15 @@ mod tests {
 
     use super::{
         advertisable_ips_from_pairs, build_peer_introduction_request, forward_dial_back_frame,
-
-        introduction_expired, is_tunnel_interface,
-        load_or_create_peer_listener_cert, note_reversed_leg, peer_listener_bind_retry_delay,
-        peer_share_peer_id, plan_dial_back, prefer_path_subnet_candidate, renewal_delay,
-        resolve_advertise_ips, retry_bind_on_addr_in_use, select_advertise_ip,
-        select_advertise_ip_for_binds, should_accept_discovered_peer, ConnectedPeers,
-        DialBackParams, PeerLegTracker, RedialQueue, RelayPathClaims,
-        PEER_LISTENER_BIND_MAX_ATTEMPTS, PEER_REDISCOVERY_MAX_ATTEMPTS,
-        PEER_RELAY_RENEWAL_LEAD_SECS, PEER_RELAY_RENEWAL_MIN_DELAY,
-        prepare_listener_identity,
+        introduction_expired, is_tunnel_interface, load_or_create_peer_listener_cert,
+        note_reversed_leg, peer_listener_bind_retry_delay, peer_share_peer_id,
+        pick_listed_protocol, plan_dial_back, prefer_path_subnet_candidate,
+        prepare_listener_identity, renewal_delay, resolve_advertise_ips, retry_bind_on_addr_in_use,
+        select_advertise_ip, select_advertise_ip_for_binds, should_accept_discovered_peer,
+        sticky_entry_fresh, ConnectedPeers, DialBackParams, PeerLegTracker, RedialQueue,
+        RelayPathClaims, RelayUpstreamSticky, PEER_LISTENER_BIND_MAX_ATTEMPTS,
+        PEER_REDISCOVERY_MAX_ATTEMPTS, PEER_RELAY_RENEWAL_LEAD_SECS, PEER_RELAY_RENEWAL_MIN_DELAY,
+        RELAY_UPSTREAM_STICKY_REPROBE_AFTER,
     };
     use bonded_core::auth::DeviceKeypair;
     use bonded_core::config::{ClientConfig, PeerShareMode};
@@ -2849,7 +3048,122 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn relay_upstream_sticky_remembers_winner_per_path() {
+        let sticky = RelayUpstreamSticky::default();
+        let protocols = vec!["h3".to_owned(), "wss".to_owned()];
+        assert_eq!(sticky.preferred(0, &protocols), None);
+        assert_eq!(sticky.preferred(2, &protocols), None);
+
+        sticky.record(2, "wss");
+        sticky.record(0, "h3");
+        // Each path remembers its own winner; an unrecorded path
+        // still races from scratch.
+        assert_eq!(sticky.preferred(2, &protocols), Some("wss".to_owned()));
+        assert_eq!(sticky.preferred(0, &protocols), Some("h3".to_owned()));
+        assert_eq!(sticky.preferred(1, &protocols), None);
+        // A later win on the same path overwrites the old winner.
+        sticky.record(2, "h3");
+        assert_eq!(sticky.preferred(2, &protocols), Some("h3".to_owned()));
+    }
+
+    #[test]
+    fn relay_upstream_sticky_ignores_protocol_no_longer_listed() {
+        let sticky = RelayUpstreamSticky::default();
+        sticky.record(2, "wss");
+        // The recorded winner left the configured relay list (config
+        // change): no sticky, the next establishment races.
+        assert_eq!(sticky.preferred(2, &["h3".to_owned()]), None);
+        // Case-insensitive match: the recorded spelling is accepted
+        // when the list spells it differently.
+        assert_eq!(
+            sticky.preferred(2, &["WSS".to_owned()]),
+            Some("wss".to_owned())
+        );
+    }
+
+    #[test]
+    fn sticky_entry_fresh_boundary() {
+        let won_at = Instant::now();
+        assert!(sticky_entry_fresh(won_at, won_at));
+        assert!(sticky_entry_fresh(
+            won_at,
+            won_at + RELAY_UPSTREAM_STICKY_REPROBE_AFTER
+        ));
+        assert!(!sticky_entry_fresh(
+            won_at,
+            won_at + RELAY_UPSTREAM_STICKY_REPROBE_AFTER + Duration::from_nanos(1)
+        ));
+    }
+
+    #[test]
+    fn relay_upstream_sticky_entry_goes_stale_after_reprobe_interval() {
+        let sticky = RelayUpstreamSticky::default();
+        let protocols = vec!["h3".to_owned(), "wss".to_owned()];
+        let won_at = Instant::now();
+        sticky.record_at(2, "wss", won_at);
+        assert_eq!(
+            sticky.preferred_at(2, &protocols, won_at + Duration::from_secs(299)),
+            Some("wss".to_owned())
+        );
+        // Older than one introduction cycle: re-race from scratch,
+        // so a path whose best protocol changed is re-learned.
+        assert_eq!(
+            sticky.preferred_at(2, &protocols, won_at + Duration::from_secs(301)),
+            None
+        );
+    }
+
+    #[test]
+    fn relay_upstream_sticky_refreshes_timestamp_on_repeated_win() {
+        let sticky = RelayUpstreamSticky::default();
+        let protocols = vec!["h3".to_owned(), "wss".to_owned()];
+        let won_at = Instant::now();
+        sticky.record_at(2, "wss", won_at);
+        // A win 299 s later refreshes the memory: still fresh 299 s
+        // after the refresh (598 s after the first win), stale 301 s
+        // after the refresh.
+        sticky.record_at(2, "wss", won_at + Duration::from_secs(299));
+        assert_eq!(
+            sticky.preferred_at(2, &protocols, won_at + Duration::from_secs(598)),
+            Some("wss".to_owned())
+        );
+        assert_eq!(
+            sticky.preferred_at(2, &protocols, won_at + Duration::from_secs(601)),
+            None
+        );
+    }
+
+    #[test]
+    fn pick_listed_protocol_prefers_first_candidate_present() {
+        let protocols = vec!["quic".to_owned(), "wss".to_owned()];
+        // h3 and quic dial the same transport: record whichever
+        // spelling the configuration actually raced.
+        assert_eq!(
+            pick_listed_protocol(&["h3", "quic"], &protocols),
+            Some("quic")
+        );
+        let protocols = vec!["h3".to_owned(), "wss".to_owned()];
+        assert_eq!(
+            pick_listed_protocol(&["h3", "quic"], &protocols),
+            Some("h3")
+        );
+        let protocols = vec!["websocket_tls".to_owned()];
+        assert_eq!(
+            pick_listed_protocol(&["wss", "websocket_tls"], &protocols),
+            Some("websocket_tls")
+        );
+        // Case-insensitive, returned with the list's own spelling.
+        let protocols = vec!["WSS".to_owned()];
+        assert_eq!(
+            pick_listed_protocol(&["wss", "websocket_tls"], &protocols),
+            Some("WSS")
+        );
+        let protocols: Vec<String> = vec![];
+        assert_eq!(pick_listed_protocol(&["h3", "quic"], &protocols), None);
+    }
 
     #[test]
     fn leg_tracker_counts_overlapping_legs_per_peer() {
