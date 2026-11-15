@@ -15,6 +15,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::Hasher;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -39,11 +40,21 @@ const FIRST_UPLOAD_DELAY_SECS: u64 = 15;
 
 /// Spawn the periodic uploader. Returns immediately; the task runs
 /// until the runtime drops it (session end).
+///
+/// `dozing` (4.77) is the session worker's Doze flag, shared with
+/// the caller: while it is set, uploads are deferred — they are not
+/// time-critical, and a dozing device should not spend radio and
+/// battery on them (~31 MB/h at the 60 s cadence before the 4.76
+/// filter). The log ring is untouched, so the deferred content rides
+/// the next upload after wake, subject to the hash dedup and the
+/// Tier 1 filter. `None` (a caller with no Doze signal, e.g. the
+/// Linux CLI) never defers.
 pub fn spawn_diagnostics_uploader(
     config: ClientConfig,
     client_build: String,
     log_source: DiagnosticsLogSource,
     on_error: DiagnosticsErrorSink,
+    dozing: Option<Arc<AtomicBool>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let keypair = match load_or_create_device_keypair(
@@ -67,11 +78,18 @@ pub fn spawn_diagnostics_uploader(
             client_build,
             last_uploaded_hash: None,
         };
+        let dozing = dozing.unwrap_or_default();
         tokio::time::sleep(Duration::from_secs(FIRST_UPLOAD_DELAY_SECS)).await;
         loop {
-            if let Some(contents) = log_source() {
-                if let Err(err) = uploader.upload_if_changed(&contents).await {
-                    on_error(format!("Diagnostics upload failed: {err:#}"));
+            // 4.77: while dozing, skip the upload attempt entirely
+            // (no network, no hash update) and sleep out the period
+            // — the next iteration after wake uploads the deferred
+            // content. Silent by design, like a successful upload.
+            if !dozing.load(Ordering::Relaxed) {
+                if let Some(contents) = log_source() {
+                    if let Err(err) = uploader.upload_if_changed(&contents).await {
+                        on_error(format!("Diagnostics upload failed: {err:#}"));
+                    }
                 }
             }
             tokio::time::sleep(Duration::from_secs(period_secs)).await;

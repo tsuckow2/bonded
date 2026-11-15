@@ -260,6 +260,8 @@ impl ClientRuntime {
                     None,
                     // No screen on the CLI: never idle-paced.
                     None,
+                    // No Doze on the CLI: never dozing.
+                    None,
                 )
                 .await
                 {

@@ -818,8 +818,29 @@ async fn run_dial_back_handler(
     path_source: ProviderPathSource,
     bandwidth_kbps: u64,
     logger: Option<PeerShareEventLogger>,
+    dozing: Arc<AtomicBool>,
 ) {
     while let Some(notification) = rx.recv().await {
+        // 4.77: while dozing, do not dial anyone back — a dozing
+        // device is a poor provider, and the dial would wake the
+        // radio for a leg the consumer will re-request on the next
+        // introduction cycle anyway (the 4.66 limiter caps pushes
+        // to 1/30 s per pair, and the introduction lives 300 s).
+        // No path is claimed, so nothing needs releasing.
+        if dozing.load(Ordering::Relaxed) {
+            warn!(
+                consumer = %notification.consumer_device_public_key,
+                "dial-back deferred: device dozing"
+            );
+            emit_peer_share_event(
+                logger.as_ref(),
+                format!(
+                    "dial-back deferred for consumer={}: device dozing",
+                    notification.consumer_device_public_key
+                ),
+            );
+            continue;
+        }
         let consumer_key = notification.consumer_device_public_key.clone();
         let plan = {
             let mut claims = path_claims
@@ -1206,6 +1227,7 @@ async fn run_advertise_watcher(
     initial_advertiser: PeerShareAdvertiser,
     initial_loop: JoinHandle<()>,
     pacing_idle: Arc<AtomicBool>,
+    dozing: Arc<AtomicBool>,
 ) {
     let _accept_loop = AcceptLoop {
         handle: initial_loop,
@@ -1228,6 +1250,28 @@ async fn run_advertise_watcher(
         let now = now_unix_secs();
         let to_boundary = Duration::from_secs(60 - (now % 60));
         sleep(poll.min(to_boundary)).await;
+        // Doze (4.77): stop advertising as a provider while
+        // dozing — a dozing device is a poor provider, and the
+        // minute re-announce plus the advertiser's own refresh
+        // traffic are exactly the radio wakeups Doze exists to
+        // avoid. Shut the advertiser down (the accept loop on the
+        // listener endpoint is untouched, so existing legs are
+        // never disturbed) and skip the poll work below; on wake
+        // the advertiser is restarted with the current
+        // advertisement, and an address change that happened
+        // while dozing is picked up by the normal IP-change
+        // path on the next iteration.
+        if dozing.load(Ordering::Relaxed) {
+            if let Some(old) = advertiser.take() {
+                let _ = old.shutdown();
+                info!("peer-share advertising paused: device dozing");
+                emit_peer_share_event(
+                    logger.as_ref(),
+                    "advertising paused: device dozing".to_owned(),
+                );
+            }
+            continue;
+        }
         // Windowed discovery: re-announce at the start of each UTC
         // minute so a consumer whose lock is only held for the 10s
         // window still sees us. This runs every poll iteration,
@@ -1247,6 +1291,30 @@ async fn run_advertise_watcher(
             continue;
         };
         if desired == current_ips {
+            // Doze (4.77): the advertiser was shut down while
+            // dozing; restart it with the current advertisement
+            // now that the device is awake. No address change, so
+            // this is the only restart path on wake — when the
+            // addresses DID change, the re-advertise below restarts
+            // it with the new list instead.
+            if advertiser.is_none() {
+                match PeerShareAdvertiser::start(&current_advertisement) {
+                    Ok(new_adv) => {
+                        advertiser = Some(new_adv);
+                        info!(endpoints = %current_advertisement.endpoints.join(","), "peer-share advertising resumed after Doze");
+                        emit_peer_share_event(
+                            logger.as_ref(),
+                            format!(
+                                "advertising resumed endpoints={}",
+                                current_advertisement.endpoints.join(",")
+                            ),
+                        );
+                    }
+                    Err(err) => {
+                        warn!(error = %err, "peer-share advertising restart after Doze failed; next poll retries");
+                    }
+                }
+            }
             continue;
         }
         let mut new_advertisement = current_advertisement.clone();
@@ -1331,6 +1399,15 @@ pub async fn start_peer_share_runtime(
     // down while it is set. `None` (e.g. the Linux CLI, which has
     // no screen) means never paced.
     idle_pacing: Option<Arc<AtomicBool>>,
+    // Doze flag (4.77), shared with the session worker: set while
+    // the device is in Doze (`PowerManager.isDeviceIdleMode()`).
+    // Stronger than idle pacing — while dozing the advertise
+    // watcher stops advertising, the dial-back handler drops
+    // notifications without dialing, and the browse loop does not
+    // attempt new relay legs. Existing legs are never disturbed.
+    // `None` (e.g. the Linux CLI, which has no Doze) means never
+    // dozing.
+    dozing: Option<Arc<AtomicBool>>,
 ) -> anyhow::Result<PeerShareRuntime> {
     let private_key_path = crate::expand_home_path(&config.client.private_key_path);
     let public_key_path = crate::expand_home_path(&config.client.public_key_path);
@@ -1461,6 +1538,10 @@ pub async fn start_peer_share_runtime(
     // Linux CLI) paces nothing.
     let pacing_idle = idle_pacing.unwrap_or_default();
 
+    // Doze (4.77): same ownership pattern as the pacing flag — the
+    // session worker owns it, the runtime only reads it.
+    let dozing = dozing.unwrap_or_default();
+
     // Provider side: one accept loop on the wildcard listener, owned
     // by the advertise watcher. The watcher only re-registers the
     // advertisement when the address list changes; the loop is never
@@ -1512,6 +1593,7 @@ pub async fn start_peer_share_runtime(
             advertiser.expect("provider mode requires advertiser"),
             initial_handle,
             pacing_idle.clone(),
+            dozing.clone(),
         )))
     } else {
         None
@@ -1538,6 +1620,7 @@ pub async fn start_peer_share_runtime(
             provider_path_source.clone(),
             config.client.peer_share_relay_bandwidth_kbps,
             event_logger.clone(),
+            dozing.clone(),
         )))
     } else {
         None
@@ -1586,6 +1669,7 @@ pub async fn start_peer_share_runtime(
         // scheduler holds on the same clock (5 s while idle-paced,
         // still inside the window).
         let browse_pacing_idle = pacing_idle.clone();
+        let browse_dozing = dozing.clone();
         let mut last_window_minute = utc_minute(now_unix_secs());
         // Reversed legs (4.57) only arrive when this runtime also
         // provides (Both mode): the accept loop hands them over on
@@ -1792,6 +1876,19 @@ pub async fn start_peer_share_runtime(
                     }
                 }
             };
+
+            // 4.77: while dozing, do not attempt new relay legs —
+            // a dozing device is a poor consumer too (radio
+            // throttled, likely to disappear). Renewals and redials
+            // are skipped the same way; a discovery that arrives
+            // while dozing is dropped before caching, and is
+            // re-discovered on wake via the provider's minute
+            // re-announce. Reversed legs (inbound, already paid
+            // for) and close notices are handled in the select
+            // arms above and are unaffected.
+            if browse_dozing.load(Ordering::Relaxed) {
+                continue;
+            }
 
             if !should_accept_discovered_peer(&advertisement, &browse_server_key, &browse_self_key)
             {

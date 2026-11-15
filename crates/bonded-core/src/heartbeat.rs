@@ -187,16 +187,25 @@ pub fn standby_ping_due(last_standby_ping: Instant, now: Instant) -> bool {
 ///   goes off) the traffic rule resumes, and background traffic —
 ///   which keeps `traffic_ticks` high — returns the heartbeat to
 ///   the active cadence on the next tick.
+/// - Doze (4.77) forces idle the same way, and is the direct
+///   signal the 4.73 proxy approximates: `device_idle_mode` true
+///   => idle, full stop. Doze only engages with the screen off,
+///   the device stationary, and the charger unplugged, so it
+///   fires in fewer cases than the proxy — the proxy stays as the
+///   fallback for the screen-off + saver-on case when Doze has
+///   not (yet) engaged. Either signal alone forces idle.
 pub fn next_heartbeat_idle(
     currently_idle: bool,
     last_traffic: Instant,
     traffic_ticks: u32,
     now: Instant,
     screen_off_and_saver: bool,
+    device_idle_mode: bool,
 ) -> bool {
     // 4.73: screen off + battery saver is the honest idle signal —
     // background traffic must not keep the 10 s cadence alive.
-    if screen_off_and_saver {
+    // 4.77: Doze is the direct version of the same signal.
+    if screen_off_and_saver || device_idle_mode {
         return true;
     }
     if currently_idle {
@@ -285,21 +294,21 @@ mod tests {
         // Active -> idle needs 180 s of no traffic, not 60 s.
         let quiet_60 = now - Duration::from_secs(61);
         assert!(
-            !next_heartbeat_idle(false, quiet_60, 0, now, false),
+            !next_heartbeat_idle(false, quiet_60, 0, now, false, false),
             "60 s quiet is not idle for the heartbeat"
         );
         let quiet_180 = now - HEARTBEAT_IDLE_AFTER;
-        assert!(next_heartbeat_idle(false, quiet_180, 0, now, false));
+        assert!(next_heartbeat_idle(false, quiet_180, 0, now, false, false));
         // A single tick with traffic does not re-arm the heartbeat.
         assert!(
-            next_heartbeat_idle(true, now, 1, now, false),
+            next_heartbeat_idle(true, now, 1, now, false, false),
             "one traffic tick keeps the heartbeat idle"
         );
         // Sustained traffic (two consecutive ticks) goes active.
-        assert!(!next_heartbeat_idle(true, now, 2, now, false));
-        assert!(!next_heartbeat_idle(true, now, 5, now, false));
+        assert!(!next_heartbeat_idle(true, now, 2, now, false, false));
+        assert!(!next_heartbeat_idle(true, now, 5, now, false, false));
         // Idle with no traffic stays idle regardless of the count.
-        assert!(next_heartbeat_idle(true, quiet_180, 0, now, false));
+        assert!(next_heartbeat_idle(true, quiet_180, 0, now, false, false));
     }
 
     #[test]
@@ -310,18 +319,39 @@ mod tests {
         // traffic on every tick.
         let now = Instant::now();
         // Active with traffic this very tick: forced idle.
-        assert!(next_heartbeat_idle(false, now, 5, now, true));
+        assert!(next_heartbeat_idle(false, now, 5, now, true, false));
         // Idle with sustained traffic: stays idle while the
         // screen-off+saver condition holds.
-        assert!(next_heartbeat_idle(true, now, 5, now, true));
+        assert!(next_heartbeat_idle(true, now, 5, now, true, false));
         // Same inputs without the condition: traffic keeps it active.
-        assert!(!next_heartbeat_idle(false, now, 5, now, false));
-        assert!(!next_heartbeat_idle(true, now, 5, now, false));
+        assert!(!next_heartbeat_idle(false, now, 5, now, false, false));
+        assert!(!next_heartbeat_idle(true, now, 5, now, false, false));
         // Screen on again (or saver off): the traffic gate resumes —
         // an idle session with sustained traffic goes active on the
         // next tick, which is how the heartbeat recovers when the
         // user picks the phone up.
-        assert!(!next_heartbeat_idle(true, now, 2, now, false));
+        assert!(!next_heartbeat_idle(true, now, 2, now, false, false));
+    }
+
+    #[test]
+    fn device_idle_mode_forces_idle_despite_traffic() {
+        // 4.77: Doze is the direct idle signal — it forces the
+        // idle cadence exactly like the 4.73 screen-off+saver
+        // proxy, and independently of it (Doze can engage with
+        // saver off; the proxy can hold with Doze not yet
+        // engaged). Either signal alone forces idle.
+        let now = Instant::now();
+        // Active with traffic this very tick: forced idle by Doze.
+        assert!(next_heartbeat_idle(false, now, 5, now, false, true));
+        // Idle with sustained traffic: stays idle while dozing.
+        assert!(next_heartbeat_idle(true, now, 5, now, false, true));
+        // Both signals at once: still idle (no interaction).
+        assert!(next_heartbeat_idle(false, now, 5, now, true, true));
+        // Doze off again, proxy off: traffic keeps it active.
+        assert!(!next_heartbeat_idle(false, now, 5, now, false, false));
+        assert!(!next_heartbeat_idle(true, now, 5, now, false, false));
+        // Doze off, proxy on: the 4.73 fallback still forces idle.
+        assert!(next_heartbeat_idle(false, now, 5, now, true, false));
     }
 
     #[test]

@@ -997,6 +997,15 @@ enum PathControl {
     /// this only paces the peer-share browse/advertise loops.
     /// `interactive = true` means the screen is on.
     DisplayInteractive { interactive: bool },
+    /// Device idle mode (Doze) from the platform layer (4.77):
+    /// `PowerManager.isDeviceIdleMode()`. The worker combines it
+    /// with the heartbeat idle gate (Doze forces the idle cadence,
+    /// like the 4.73 screen-off + battery-saver proxy) and shares
+    /// it with the diagnostics uploader (uploads deferred while
+    /// dozing) and the peer runtime (advertising paused, relay
+    /// attempts deferred while dozing). No path is touched.
+    /// `idle = true` means the device is dozing.
+    DeviceIdleMode { idle: bool },
 }
 
 /// Demote paused paths to the end of an already mode-ordered
@@ -1631,6 +1640,15 @@ fn start_android_session(
 
         let catch_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             runtime.block_on(async move {
+            // Doze flag (4.77), shared with the diagnostics
+            // uploader (uploads deferred while dozing) and the
+            // peer runtime (advertising paused, relay attempts
+            // deferred while dozing). The worker owns it and flips
+            // it from `PathControl::DeviceIdleMode`; created here,
+            // ahead of the uploader spawn, so both consumers can
+            // share it. Created even when diagnostics uploads are
+            // disabled — the peer runtime still needs it.
+            let device_idle_mode_flag = Arc::new(AtomicBool::new(false));
             // Periodic diagnostics upload: silent on success by design;
             // only failures surface here as warnings (and those warnings
             // themselves land in the ring for the next upload).
@@ -1643,6 +1661,7 @@ fn start_android_session(
                     std::sync::Arc::new(|message: String| {
                         alog_warn!("{message}");
                     }),
+                    Some(device_idle_mode_flag.clone()),
                 );
             }
             alog_info!("Worker: establishing transport paths");
@@ -1802,6 +1821,13 @@ fn start_android_session(
             // start, so the runtime can share it.
             let peer_pacing_idle = Arc::new(AtomicBool::new(false));
             let mut display_interactive = true;
+            // Doze state (4.77): local mirror of
+            // `device_idle_mode_flag` for the heartbeat gate below;
+            // the shared flag feeds the diagnostics uploader and
+            // the peer runtime. Defaults to false (not dozing) —
+            // the platform layer re-pushes the current state at
+            // session start.
+            let mut device_idle_mode = false;
             let _peer_share_runtime = if config.client.peer_share_enabled {
                 let peer_snapshot = Arc::clone(&worker_snapshot);
                 let peer_logger = Arc::new(move |message: String| {
@@ -1825,6 +1851,7 @@ fn start_android_session(
                     Some(peer_logger),
                     Some(peer_runtime::ProviderPathSource::Live(path_addresses.clone())),
                     Some(peer_pacing_idle.clone()),
+                    Some(device_idle_mode_flag.clone()),
                 )
                 .await {
                     Ok(runtime) => {
@@ -2225,6 +2252,22 @@ fn start_android_session(
                                 alog_info!(
                                     "Worker: display interactive={interactive}"
                                 );
+                            }
+                            Some(PathControl::DeviceIdleMode { idle }) => {
+                                // Doze (4.77): the flag flips now, so
+                                // the next heartbeat tick, the next
+                                // diagnostics period, and the next
+                                // peer-runtime poll all see it
+                                // immediately — a wake restores full
+                                // cadence without waiting out a
+                                // period. The heartbeat gate reads
+                                // the local mirror; the uploader and
+                                // the peer runtime read the shared
+                                // flag.
+                                device_idle_mode = idle;
+                                device_idle_mode_flag
+                                    .store(idle, Ordering::Relaxed);
+                                alog_info!("Worker: device idle mode={idle}");
                             }
                             Some(PathControl::Reset { path_index }) => {
                                 if let Some(vec_index) =
@@ -3246,6 +3289,15 @@ fn start_android_session(
                             // traffic rule stays the fallback for the
                             // screen-on (or saver-off) case.
                             !display_interactive && config.client.battery_saver,
+                            // 4.77: Doze is the direct version of the
+                            // same signal — it forces the idle cadence
+                            // regardless of traffic, independently of
+                            // the 4.73 proxy. Arrives via
+                            // PathControl::DeviceIdleMode (pushed by
+                            // BondedVpnService on
+                            // ACTION_DEVICE_IDLE_MODE_CHANGED and at
+                            // session start).
+                            device_idle_mode,
                         );
                         // Adaptive cadence: flip the interval when the
                         // idle state changes, consuming the fresh
@@ -4147,6 +4199,33 @@ pub extern "system" fn Java_com_bonded_bonded_1app_BondedVpnService_nativeSetDis
                 .send(PathControl::DisplayInteractive {
                     interactive: interactive != 0,
                 })
+                .is_ok()
+        })
+        .unwrap_or(false) as jni::sys::jboolean
+}
+
+/// Device idle mode (Doze) from the platform layer (4.77): feeds
+/// `PathControl::DeviceIdleMode` to the running worker, which
+/// forces the heartbeat idle cadence, defers diagnostics uploads,
+/// and pauses peer-share advertising and relay attempts while
+/// dozing. Returns false when no session is running (the caller
+/// re-pushes the current state at session start). A missed update
+/// only costs idle precision, never connectivity.
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_bonded_bonded_1app_BondedVpnService_nativeSetDeviceIdleMode(
+    _env: jni::JNIEnv,
+    _obj: jni::objects::JObject,
+    idle: jni::sys::jboolean,
+) -> jni::sys::jboolean {
+    android_session_slot()
+        .lock()
+        .expect("android session slot lock poisoned")
+        .as_ref()
+        .map(|handle| {
+            handle
+                .path_control_tx
+                .send(PathControl::DeviceIdleMode { idle: idle != 0 })
                 .is_ok()
         })
         .unwrap_or(false) as jni::sys::jboolean

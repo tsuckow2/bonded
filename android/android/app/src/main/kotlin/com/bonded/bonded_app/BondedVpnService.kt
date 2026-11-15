@@ -263,6 +263,31 @@ class BondedVpnService : VpnService() {
         }
     }
 
+    // Device idle mode (Doze) for native idle behavior (4.77):
+    // the worker forces the heartbeat idle cadence, defers
+    // diagnostics uploads, and pauses peer-share advertising and
+    // relay attempts while dozing. ACTION_DEVICE_IDLE_MODE_CHANGED
+    // fires on Doze entry/exit; the current state is pushed at
+    // every session start from PowerManager, like the display
+    // state above. A missed push only costs idle precision, never
+    // connectivity.
+    private val dozeReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action == PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED) {
+                val powerManager =
+                        context?.getSystemService(Context.POWER_SERVICE) as? PowerManager
+                pushDeviceIdleMode(powerManager?.isDeviceIdleMode ?: false)
+            }
+        }
+    }
+
+    private fun pushDeviceIdleMode(idle: Boolean) {
+        try {
+            nativeSetDeviceIdleMode(idle)
+        } catch (_: UnsatisfiedLinkError) {
+        }
+    }
+
     override fun onCreate() {
         super.onCreate()
         activeInstance = this
@@ -279,6 +304,15 @@ class BondedVpnService : VpnService() {
             registerReceiver(displayReceiver, displayFilter, Context.RECEIVER_NOT_EXPORTED)
         } else {
             registerReceiver(displayReceiver, displayFilter)
+        }
+        // Doze changes are system-only too, so not-exported.
+        val dozeFilter = IntentFilter().apply {
+            addAction(PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(dozeReceiver, dozeFilter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            registerReceiver(dozeReceiver, dozeFilter)
         }
     }
 
@@ -1224,6 +1258,7 @@ class BondedVpnService : VpnService() {
     private external fun nativeResetPath(pathIndex: Int): Boolean
 
     private external fun nativeSetDisplayInteractive(interactive: Boolean): Boolean
+    private external fun nativeSetDeviceIdleMode(idle: Boolean): Boolean
 
     private external fun nativeUpdatePaths(
             bindAddressesJson: String,
@@ -1408,6 +1443,16 @@ class BondedVpnService : VpnService() {
                 val powerManager =
                         getSystemService(Context.POWER_SERVICE) as? PowerManager
                 pushDisplayInteractive(powerManager?.isInteractive ?: true)
+                // Doze (4.77): the receiver only fires on changes,
+                // so push the current state now — a session
+                // (re)started while already dozing must idle from
+                // the first tick. isDeviceIdleMode is API 23+; below
+                // that the device never dozes, so there is nothing
+                // to push (the receiver's broadcast does not exist
+                // there either).
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    pushDeviceIdleMode(powerManager?.isDeviceIdleMode ?: false)
+                }
                 flushPendingOutboundPackets(MAX_PENDING_FLUSH_ON_SESSION_START)
             }
             started
