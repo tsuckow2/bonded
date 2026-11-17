@@ -16,6 +16,10 @@ import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.os.PowerManager
 import android.os.SystemClock
+import android.system.ErrnoException
+import android.system.Os
+import android.system.OsConstants
+import android.system.StructPollfd
 import androidx.annotation.Keep
 import androidx.core.app.NotificationCompat
 import java.io.FileInputStream
@@ -734,8 +738,56 @@ class BondedVpnService : VpnService() {
                 thread(name = "bonded-vpn-outbound", start = true) {
                     val input = FileInputStream(pfd.fileDescriptor)
                     val buffer = ByteArray(32767)
+                    // Poll the TUN fd before each read. The fd is
+                    // non-blocking, so a bare read() returns at once
+                    // when no packet is queued and this loop spins at
+                    // a full core — the 2026-11-17 thread sampler
+                    // caught bonded-vpn-outb at 92–93% of the app's
+                    // CPU while the VPN carried ~20 MB in 11 h.
+                    // Os.poll() parks the thread in the kernel until
+                    // a packet is readable; the 1 s timeout bounds
+                    // the shutdown latency in case the fd stays open
+                    // after packetIoRunning flips. This is correct
+                    // whether the fd is non-blocking or read()
+                    // returns 0 spuriously: a spurious POLLIN just
+                    // costs one more poll, and a read after POLLIN
+                    // on a blocking fd cannot spin.
+                    val pollFd = StructPollfd()
+                    pollFd.fd = pfd.fileDescriptor
+                    pollFd.events = OsConstants.POLLIN.toShort()
                     try {
                         while (packetIoRunning) {
+                            val ready =
+                                    try {
+                                        Os.poll(
+                                                arrayOf(pollFd),
+                                                OUTBOUND_POLL_TIMEOUT_MS
+                                        )
+                                    } catch (e: ErrnoException) {
+                                        if (e.errno == OsConstants.EINTR) {
+                                            continue
+                                        }
+                                        android.util.Log.e(
+                                                "BondedVPN",
+                                                "VPN outbound poll failed: ${e.message}",
+                                                e
+                                        )
+                                        break
+                                    }
+                            if (ready <= 0) {
+                                // Timeout: re-check packetIoRunning.
+                                continue
+                            }
+                            if (isTunFdDead(pollFd.revents)) {
+                                android.util.Log.w(
+                                        "BondedVPN",
+                                        "VPN outbound poll: TUN fd closed (revents=${pollFd.revents})"
+                                )
+                                break
+                            }
+                            if ((pollFd.revents.toInt() and OsConstants.POLLIN) == 0) {
+                                continue
+                            }
                             val readBytes = input.read(buffer)
                             if (readBytes <= 0) {
                                 continue
@@ -1660,6 +1712,7 @@ class BondedVpnService : VpnService() {
         private const val NOTIFICATION_CHANNEL_ID = "bonded_vpn_background"
         private const val NOTIFICATION_ID = 1001
         private const val INBOUND_IDLE_SLEEP_MS = 1L
+        private const val OUTBOUND_POLL_TIMEOUT_MS = 1000
         private const val MAX_PENDING_OUTBOUND_PACKETS = 256
         private const val MAX_PENDING_FLUSH_PER_CYCLE = 16
         private const val MAX_PENDING_FLUSH_ON_SESSION_START = 128
@@ -1905,4 +1958,18 @@ class BondedVpnService : VpnService() {
             statusListener?.invoke(type, message)
         }
     }
+}
+
+// Poll revents classification for the outbound TUN loop (4.78):
+// POLLERR / POLLHUP / POLLNVAL mean the TUN fd is dead and the
+// loop must exit; anything else (POLLIN, or 0 on a spurious wake)
+// means the fd is still alive. The dead mask is a parameter
+// because the unit-test android.jar stubs OsConstants fields to 0 —
+// production passes the default (real OsConstants on device) and
+// the test passes the literal Linux poll(2) mask.
+internal fun isTunFdDead(
+        revents: Short,
+        deadMask: Int = OsConstants.POLLERR or OsConstants.POLLHUP or OsConstants.POLLNVAL
+): Boolean {
+    return (revents.toInt() and deadMask) != 0
 }
