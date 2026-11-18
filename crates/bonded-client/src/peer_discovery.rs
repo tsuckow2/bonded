@@ -13,6 +13,36 @@ use tracing::{debug, warn};
 
 pub const PEER_SHARE_SERVICE_TYPE: &str = "_bonded-peer._udp.local.";
 
+/// Guard that shuts a `ServiceDaemon` down when dropped.
+/// mdns-sd's `ServiceDaemon` has no `Drop` impl: dropping it
+/// without `shutdown()` leaks its `mDNS_daemon` thread (and its
+/// *:5353 socket) until process death. The guard makes the
+/// shutdown synchronous with the drop, so a drain task dropped
+/// unpolled during runtime teardown still queues the Exit
+/// command. `shutdown()` only queues the command (the daemon
+/// wakes on its signal socket), so it is safe to call from Drop;
+/// the status receiver is dropped and the daemon still exits.
+struct DaemonGuard(ServiceDaemon);
+
+impl std::ops::Deref for DaemonGuard {
+    type Target = ServiceDaemon;
+    fn deref(&self) -> &ServiceDaemon {
+        &self.0
+    }
+}
+
+impl Drop for DaemonGuard {
+    fn drop(&mut self) {
+        // Silent by design: this is the safety net for paths that
+        // never call shutdown() explicitly (a drain task dropped
+        // unpolled at runtime teardown). Explicit shutdown call
+        // sites log their own errors; a second shutdown here after
+        // an explicit one would only warn about an already-exited
+        // daemon, which is expected, not a leak.
+        let _ = self.0.shutdown();
+    }
+}
+
 /// How often each mDNS daemon re-checks interface IPs (4.58 idle
 /// pacing): the 5 s default wakes the daemon even when the session
 /// is idle and nothing is changing. 60 s is enough — the advertise
@@ -32,7 +62,7 @@ pub fn utc_minute(unix_secs: u64) -> u64 {
 }
 
 pub struct PeerShareAdvertiser {
-    daemon: ServiceDaemon,
+    daemon: DaemonGuard,
     service_info: ServiceInfo,
 }
 
@@ -47,7 +77,7 @@ impl PeerShareAdvertiser {
             .register(service_info.clone())
             .context("failed to register peer-share mDNS service")?;
         Ok(Self {
-            daemon,
+            daemon: DaemonGuard(daemon),
             service_info,
         })
     }
@@ -72,27 +102,14 @@ impl PeerShareAdvertiser {
     }
 
     pub fn shutdown(self) -> anyhow::Result<()> {
+        // Explicit shutdown; the DaemonGuard's Drop also calls
+        // shutdown() when this struct is dropped, so a second
+        // (silent) call is expected and harmless.
         let _ = self
             .daemon
             .shutdown()
             .map_err(|error| anyhow::anyhow!(error))?;
         Ok(())
-    }
-}
-
-impl Drop for PeerShareAdvertiser {
-    fn drop(&mut self) {
-        // Best-effort daemon shutdown. Dropping a ServiceDaemon
-        // without shutdown() leaks its thread and its SO_REUSEPORT
-        // *:5353 socket: mdns-sd's run loop only exits on an Exit
-        // command, and dropping the command sender does not stop it
-        // — so an aborted watcher task used to leave a live daemon
-        // behind, stealing a share of incoming multicast and still
-        // answering queries for a stale service instance.
-        // shutdown() only queues the Exit command (the daemon wakes
-        // on its signal socket), so it is safe to call here; the
-        // status receiver is dropped, the daemon still exits.
-        let _ = self.daemon.shutdown();
     }
 }
 
@@ -207,7 +224,10 @@ async fn browser_restart_backoff(cmd_rx: &mut UnboundedReceiver<BrowserCmd>) -> 
 /// shut down (explicit command, or the command channel closing when
 /// the `PeerShareBrowser` is dropped) — either way the daemon is
 /// shut down before returning, so no daemon thread or *:5353 socket
-/// is left behind.
+/// is left behind. The daemon is held through a `DaemonGuard`, so
+/// even if this task's future is dropped unpolled (runtime
+/// teardown), the daemon still gets its Exit command — dropping
+/// the raw `ServiceDaemon` would leak its thread.
 async fn run_browser_drain(
     mut cmd_rx: UnboundedReceiver<BrowserCmd>,
     adv_tx: UnboundedSender<PeerShareAdvertisement>,
@@ -215,14 +235,19 @@ async fn run_browser_drain(
     loop {
         match start_browse_daemon() {
             Ok((daemon, mut receiver)) => {
+                let daemon = DaemonGuard(daemon);
                 match drain_browser_events(&daemon, &mut receiver, &mut cmd_rx, &adv_tx).await
                 {
                     DrainOutcome::Shutdown => {
-                        let _ = daemon.shutdown();
+                        if let Err(err) = daemon.shutdown() {
+                            warn!(error = %err, "peer-share browser daemon shutdown failed");
+                        }
                         return;
                     }
                     DrainOutcome::Recreate => {
-                        let _ = daemon.shutdown();
+                        if let Err(err) = daemon.shutdown() {
+                            warn!(error = %err, "peer-share browser daemon shutdown failed before recreate");
+                        }
                         if !browser_restart_backoff(&mut cmd_rx).await {
                             return;
                         }
@@ -296,6 +321,17 @@ impl PeerShareBrowser {
     pub fn shutdown(&self) -> anyhow::Result<()> {
         let _ = self.cmd_tx.send(BrowserCmd::Shutdown);
         Ok(())
+    }
+}
+
+impl Drop for PeerShareBrowser {
+    fn drop(&mut self) {
+        // Best-effort: ask the drain task to shut down. This alone
+        // does not fix the teardown race (the drain task may never
+        // be polled again), which is why the daemon itself is held
+        // through a DaemonGuard — but for a normal drop it exits
+        // promptly instead of waiting for the guard.
+        let _ = self.cmd_tx.send(BrowserCmd::Shutdown);
     }
 }
 
@@ -535,4 +571,17 @@ mod tests {
             }
         }
     }
+
+    // Note: there is no thread-count regression test for the
+    // DaemonGuard here. The guard's job is to queue the daemon's
+    // Exit command when the drain task is dropped unpolled, and
+    // that only becomes a thread exit on a host where the daemon
+    // thread can actually run its event loop (bind *:5353 and
+    // process commands). In this sandbox the daemon thread cannot
+    // reach its loop, so a thread-count assertion cannot pass
+    // here even with the fix — it would fail for the environment,
+    // not the code. The fix is verified on device: install a
+    // build with it, run sessions, and count `mDNS_daemon`
+    // threads in /proc/<pid>/task — the count must stay flat
+    // instead of growing by one per session stop.
 }
