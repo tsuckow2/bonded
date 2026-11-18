@@ -297,7 +297,12 @@ object BatteryProfileMath {
  * (utime + stime, fields 14 + 15, in 10 ms ticks). Pure parsing is
  * separated from the filesystem walk so tests can inject content. */
 object ThreadCpuReader {
-    /** Exact comm names tracked individually. */
+    /** Exact comm names tracked individually. The kernel truncates
+     * every thread name to 15 chars (TASK_COMM_LEN 16 incl. NUL) in
+     * /proc/.../comm and stat, so the on-device comms are the
+     * truncated forms — matching the full names here never fires
+     * (threadCpu came back empty on the v273 run). Match on the
+     * truncated form; the full name stays the output-map label. */
     val TRACKED_THREADS: List<String> =
             listOf(
                     "bonded-vpn-outbound",
@@ -307,8 +312,9 @@ object ThreadCpuReader {
             )
 
     /** Tokio runtime workers (the native session worker) share one
-     * comm prefix; their CPU is reported as one aggregate row. */
-    const val TOKIO_WORKER_PREFIX: String = "tokio-runtime-worker"
+     * comm prefix; their CPU is reported as one aggregate row.
+     * Truncated to 15 chars like every comm (see above). */
+    const val TOKIO_WORKER_PREFIX: String = "tokio-runtime-w"
     const val TOKIO_WORKER_LABEL: String = "tokio-runtime-worker"
 
     /** One clock tick is 10 ms on Android (USER_HZ = 100). */
@@ -359,9 +365,12 @@ object ThreadCpuReader {
             } catch (_: Exception) {
                 continue
             }
+            // comm is truncated to 15 chars by the kernel; compare
+            // the truncated form, but keep the full name as the label.
+            val tracked = TRACKED_THREADS.firstOrNull { comm == it.take(15) }
             val label =
                     when {
-                        comm in TRACKED_THREADS -> comm
+                        tracked != null -> tracked
                         comm.startsWith(TOKIO_WORKER_PREFIX) -> TOKIO_WORKER_LABEL
                         else -> continue
                     }

@@ -313,13 +313,16 @@ class BatteryProfilerTest {
 
     @Test
     fun threadCpu_readsTrackedThreadsFromTaskDir() {
+        // The kernel truncates comm to 15 chars, so the fake task
+        // dirs use the truncated forms — the full names are the
+        // output-map labels, not what /proc reports.
         val dir = kotlin.io.path.createTempDirectory("bonded-cpu-test").toFile()
         try {
             val worker = java.io.File(dir, "101")
             worker.mkdirs()
-            java.io.File(worker, "comm").writeText("bonded-session-monitor\n")
+            java.io.File(worker, "comm").writeText("bonded-session-\n")
             java.io.File(worker, "stat").writeText(
-                    "101 (bonded-session-monitor) S 1 101 101 0 -1 4194304 " +
+                    "101 (bonded-session-) S 1 101 101 0 -1 4194304 " +
                             "100 0 0 0 200 100 0 0 20 0 1 0 100 1000000 1000"
             )
             val other = java.io.File(dir, "102")
@@ -331,9 +334,9 @@ class BatteryProfilerTest {
             )
             val tokio = java.io.File(dir, "103")
             tokio.mkdirs()
-            java.io.File(tokio, "comm").writeText("tokio-runtime-worker\n")
+            java.io.File(tokio, "comm").writeText("tokio-runtime-w\n")
             java.io.File(tokio, "stat").writeText(
-                    "103 (tokio-runtime-worker) S 1 103 103 0 -1 4194304 " +
+                    "103 (tokio-runtime-w) S 1 103 103 0 -1 4194304 " +
                             "100 0 0 0 10 5 0 0 20 0 1 0 100 1000000 1000"
             )
             val result = ThreadCpuReader.read(dir)
