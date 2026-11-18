@@ -1,6 +1,5 @@
 import java.util.Properties
 import java.io.FileInputStream
-import java.io.ByteArrayOutputStream
 import java.io.File
 
 plugins {
@@ -11,14 +10,13 @@ plugins {
 }
 
 val gitBuildNumber = run {
-    val stdout = ByteArrayOutputStream()
-    rootProject.exec {
+    val output = providers.exec {
         commandLine("git", "rev-list", "--count", "HEAD")
-        standardOutput = stdout
     }
     // Play Store already has v124; ensure version code exceeds it.
     // Base offset 120 + git count (6) = 126 > 124.
-    stdout.toString().trim().toInt() + 120
+    // providers.exec replaces Project.exec, removed in Gradle 9.
+    output.standardOutput.asText.get().trim().toInt() + 120
 }
 
 val keystoreProperties = Properties()
