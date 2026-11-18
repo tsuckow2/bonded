@@ -370,6 +370,12 @@ struct WireGuardPeerRuntime {
 
 struct WireGuardServerPeer {
     public_key: String,
+    /// The WireGuard peer key the runtime's `Tunn` was built with.
+    /// A client restart provisions a fresh keypair, so a runtime
+    /// built with the old key can never handshake the new one —
+    /// `ensure_peer_runtime` discards the stale runtime when the
+    /// registry's key no longer matches this one.
+    wg_public_key: String,
     session_id: u64,
     runtime: Arc<WireGuardPeerRuntime>,
     forwarder: Option<Arc<SmoltcpForwarder>>,
@@ -596,16 +602,31 @@ async fn ensure_peer_runtime(
     dns_server: std::net::SocketAddr,
 ) -> anyhow::Result<Arc<WireGuardServerPeer>> {
     if let Some(existing) = runtimes.get(&peer.device_public_key) {
-        if sessions.contains_client(&peer.device_public_key) {
+        // A restart provisions a fresh WG keypair, so a runtime
+        // built with the old key can never handshake the new one —
+        // and its source-address pin drops the new handshake
+        // datagrams outright. Discard it even while the session
+        // is still registered; the old gate (session cleanup)
+        // could not trigger from the WG side at all, which is
+        // what left a quick restart unable to establish a session
+        // for ~9 minutes.
+        if existing.wg_public_key != peer.wg_public_key {
+            warn!(
+                public_key = %peer.device_public_key,
+                session_id = existing.session_id,
+                "discarding stale wireguard peer runtime: registry key changed (client restarted)"
+            );
+            runtimes.remove(&peer.device_public_key);
+        } else if sessions.contains_client(&peer.device_public_key) {
             return Ok(existing.clone());
+        } else {
+            warn!(
+                public_key = %peer.device_public_key,
+                session_id = existing.session_id,
+                "discarding stale wireguard peer runtime with missing session registration"
+            );
+            runtimes.remove(&peer.device_public_key);
         }
-
-        warn!(
-            public_key = %peer.device_public_key,
-            session_id = existing.session_id,
-            "discarding stale wireguard peer runtime with missing session registration"
-        );
-        runtimes.remove(&peer.device_public_key);
     }
 
     let handle = sessions.register_client(peer.device_public_key.clone());
@@ -663,6 +684,7 @@ async fn ensure_peer_runtime(
 
     let peer_context = Arc::new(WireGuardServerPeer {
         public_key: peer.device_public_key.clone(),
+        wg_public_key: peer.wg_public_key.clone(),
         session_id: handle.session_id,
         runtime: runtime.clone(),
         forwarder: forwarder.clone(),
@@ -1437,6 +1459,71 @@ mod tests {
 
         assert!(sessions.contains_client(&peer.device_public_key));
         assert_ne!(first.session_id, recreated.session_id);
+    }
+
+    #[tokio::test]
+    async fn stale_runtime_is_recreated_when_registry_key_changes() {
+        // A client restart provisions a fresh WG keypair, so the
+        // registry's key changes while the old session is still
+        // registered. The old runtime's Tunn was built with the old
+        // key and its source-address pin drops the new handshake
+        // datagrams — it must be recreated on the first post-restart
+        // datagram, not held until some other transport's reap
+        // finally unregisters the session (~9 min in the 2026-11-11
+        // incident).
+        let mut runtimes = HashMap::new();
+        let mut peer = WireGuardPeer {
+            device_public_key: "restarted-device".to_owned(),
+            wg_public_key: WireGuardKeypair::generate().public_key_b64(),
+            peer_ip: Ipv4Addr::new(100, 64, 1, 22),
+            lease_expires_at: unix_timestamp_after(Duration::from_secs(300))
+                .expect("lease expiry should compute"),
+        };
+        let keypair = Arc::new(WireGuardKeypair::generate());
+        let socket = Arc::new(
+            UdpSocket::bind("127.0.0.1:0")
+                .await
+                .expect("udp socket should bind"),
+        );
+        let sessions = SessionRegistry::default();
+        let forwarders: ForwarderRegistry = Arc::new(RwLock::new(HashMap::new()));
+
+        let first = ensure_peer_runtime(
+            &mut runtimes,
+            &peer,
+            keypair.clone(),
+            socket.clone(),
+            sessions.clone(),
+            forwarders.clone(),
+            None,
+            None,
+            std::net::SocketAddr::from(([192, 0, 2, 53], 53)),
+        )
+        .await
+        .expect("first runtime should be created");
+        assert!(sessions.contains_client(&peer.device_public_key));
+
+        // Restart: same device, fresh WG keypair. The session is
+        // still registered — the old gate would have returned the
+        // stale runtime.
+        peer.wg_public_key = WireGuardKeypair::generate().public_key_b64();
+        let recreated = ensure_peer_runtime(
+            &mut runtimes,
+            &peer,
+            keypair,
+            socket,
+            sessions.clone(),
+            forwarders,
+            None,
+            None,
+            std::net::SocketAddr::from(([192, 0, 2, 53], 53)),
+        )
+        .await
+        .expect("runtime should be recreated on key change");
+
+        assert!(sessions.contains_client(&peer.device_public_key));
+        assert_ne!(first.session_id, recreated.session_id);
+        assert_eq!(recreated.wg_public_key, peer.wg_public_key);
     }
 
     #[tokio::test]
