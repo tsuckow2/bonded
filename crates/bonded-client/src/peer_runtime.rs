@@ -539,36 +539,32 @@ struct ReversedLeg {
 }
 
 /// Record an incoming reversed leg in the browse loop's tracker
-/// (4.57 dedup, consumer side). Returns the renewal generation when
-/// the leg is accepted, or None when this device already holds a leg
-/// for the peer — the caller then closes the duplicate transport.
-/// The peer-level check is all the consumer can observe (it does not
-/// know which provider path a reversed leg is pinned to); the
-/// path-level dedup lives on the provider in `RelayPathClaims`,
-/// shared by the forward accept loop and the dial-back handler, so
-/// at most one leg exists per (peer, provider path) in either
-/// direction.
+/// (4.57 dedup, consumer side). Always accepts the leg and returns
+/// its renewal generation. A reversed leg is an additional leg for
+/// the peer, not a duplicate of the forward legs: the provider
+/// claimed a path for this dial via `plan_dial_back` before dialing,
+/// so a free path exists by construction, and the provider's
+/// per-path `RelayPathClaims` is the authority on duplicates. The
+/// old peer-level refusal (drop the leg when any leg for the peer
+/// already exists) blocked the second direction of a peer pair —
+/// Tom, 2026-11-18: peers must show up as transports for each other,
+/// A1/A2 on B and B1/B2 on A — because a reversed leg can only ever
+/// arrive as an additional leg once a forward leg exists.
 ///
-/// Exception (4.67): when a reversed renewal is pending for the
-/// peer, the incoming leg is the replacement for the still-live leg,
-/// not a duplicate — it is accepted (the renewal overlap), and the
-/// pending mark is cleared. The old leg's close later drops the
-/// count back to one.
+/// The renewal-pending mark is still cleared here: when a reversed
+/// renewal is pending for the peer, the incoming leg is the
+/// replacement for the still-live leg (make-before-break), and the
+/// pending mark must not linger after it arrives.
 fn note_reversed_leg(
     legs: &mut PeerLegTracker,
     connected: &ConnectedPeers,
     peer_id: &str,
     expires_at: u64,
-) -> Option<u64> {
-    if legs.is_connected(peer_id) || connected.is_connected(peer_id) {
-        if !connected.is_reversed_renewal_pending(peer_id) {
-            return None;
-        }
-    }
+) -> u64 {
     let generation = legs.note_dial(peer_id, expires_at, true);
     connected.mark_connected(peer_id);
     connected.clear_reversed_renewal_pending(peer_id);
-    Some(generation)
+    generation
 }
 
 impl Drop for PeerShareRuntime {
@@ -979,10 +975,11 @@ async fn run_peer_accept_loop(
     config: ClientConfig,
     // Consumer-side handoff for reversed legs (4.57): None in
     // provider-only mode, where no browse loop exists to take the
-    // leg. `connected_peers` is the browse loop's live leg set, so
-    // a duplicate reversed leg is refused before it is accepted.
+    // leg. A reversed leg is always accepted — the provider claimed
+    // a path for it before dialing, so a free path exists by
+    // construction; there is no peer-level duplicate check here
+    // (removed 2026-11-18, bidirectional peer transports).
     reversed_leg_tx: Option<tokio::sync::mpsc::UnboundedSender<ReversedLeg>>,
-    connected_peers: ConnectedPeers,
 ) {
     while let Some(incoming) = endpoint.accept().await {
         let connection = match incoming.await {
@@ -1040,19 +1037,20 @@ async fn run_peer_accept_loop(
                 }
                 continue;
             };
-            if connected_peers.is_connected(&peer_id)
-                && !connected_peers.is_reversed_renewal_pending(&peer_id)
-            {
-                warn!(peer = %peer_id, "reversed relay refused: duplicate leg for already-connected peer");
-                emit_peer_share_event(
-                    logger.as_ref(),
-                    format!("reversed relay refused for peer={peer_id}: duplicate leg"),
-                );
-                if peer.send_text(r#"{"status":"no_path"}"#).await.is_err() {
-                    warn!(peer = %peer_id, "reversed relay no_path response send failed");
-                }
-                continue;
-            }
+            // A reversed leg is accepted whenever the provider dialed
+            // it, even when this device already holds a leg for the
+            // peer. The provider claimed a path for this dial via
+            // `plan_dial_back` before dialing, so a free path exists
+            // by construction — the provider's per-path
+            // `RelayPathClaims` is the authority on duplicates, not
+            // this peer-level check. Refusing here would block the
+            // second direction of a peer pair (Tom, 2026-11-18: peers
+            // must show up as transports for each other, A1/A2 on B
+            // and B1/B2 on A), because a reversed leg can only ever
+            // arrive as an additional leg once a forward leg exists.
+            // The old peer-level refusal is gone; the browse loop's
+            // `note_reversed_leg` records the leg and the renewal
+            // generation tracks it like any other leg.
             if peer.send_text(r#"{"status":"ok"}"#).await.is_err() {
                 warn!(peer = %peer_id, "reversed relay accept response send failed");
                 continue;
@@ -1581,7 +1579,6 @@ pub async fn start_peer_share_runtime(
             path_source.clone(),
             config.clone(),
             accept_reversed_tx,
-            connected_peers.clone(),
         ));
         Some(tokio::spawn(run_advertise_watcher(
             config.clone(),
@@ -1734,55 +1731,43 @@ pub async fn start_peer_share_runtime(
                         // loop. It becomes a session path exactly
                         // like a forward leg this loop dialed itself,
                         // with the same renewal and close handling.
-                        // Dedup (second layer — the accept loop
-                        // refused duplicates first): drop the leg
-                        // when one for the peer already exists.
+                        // It is always an additional leg, never a
+                        // duplicate: the provider claimed a path for
+                        // it, so a free path exists by construction.
                         let peer_id = leg.peer_id.clone();
-                        match note_reversed_leg(
+                        let generation = note_reversed_leg(
                             &mut legs,
                             &browse_connected_peers,
                             &peer_id,
                             leg.expires_at,
-                        ) {
-                            Some(generation) => {
-                                info!(peer = %peer_id, "peer-share reversed relay leg received");
-                                emit_peer_share_event(
-                                    browse_logger.as_ref(),
-                                    format!("reversed relay leg received for peer={peer_id}"),
-                                );
-                                if peer_transport_tx
-                                    .send(ClientTransport::peer_relay(
-                                        leg.transport,
-                                        peer_id.clone(),
-                                        closed_peer_tx.clone(),
-                                        leg.expires_at,
-                                    ))
-                                    .is_err()
-                                {
-                                    // The session worker is gone;
-                                    // forget the leg we just noted.
-                                    if legs.note_close(&peer_id) {
-                                        browse_connected_peers.mark_disconnected(&peer_id);
-                                    }
-                                    break;
-                                }
-                                spawn_renewal_notice(
-                                    &renewal_tx,
-                                    peer_id.clone(),
-                                    generation,
-                                    renewal_delay(leg.expires_at, now_unix_secs()),
-                                );
+                        );
+                        info!(peer = %peer_id, "peer-share reversed relay leg received");
+                        emit_peer_share_event(
+                            browse_logger.as_ref(),
+                            format!("reversed relay leg received for peer={peer_id}"),
+                        );
+                        if peer_transport_tx
+                            .send(ClientTransport::peer_relay(
+                                leg.transport,
+                                peer_id.clone(),
+                                closed_peer_tx.clone(),
+                                leg.expires_at,
+                            ))
+                            .is_err()
+                        {
+                            // The session worker is gone;
+                            // forget the leg we just noted.
+                            if legs.note_close(&peer_id) {
+                                browse_connected_peers.mark_disconnected(&peer_id);
                             }
-                            None => {
-                                warn!(peer = %peer_id, "dropping duplicate reversed relay leg");
-                                emit_peer_share_event(
-                                    browse_logger.as_ref(),
-                                    format!("duplicate reversed relay leg dropped for peer={peer_id}"),
-                                );
-                                let mut transport = leg.transport;
-                                let _ = transport.close().await;
-                            }
+                            break;
                         }
+                        spawn_renewal_notice(
+                            &renewal_tx,
+                            peer_id.clone(),
+                            generation,
+                            renewal_delay(leg.expires_at, now_unix_secs()),
+                        );
                         continue;
                     }
                     Some((peer_id, generation)) = renewal_rx.recv() => {
@@ -4137,30 +4122,28 @@ mod tests {
         // its renewal generation returned.
         let mut legs = PeerLegTracker::default();
         let connected = ConnectedPeers::default();
-        let generation = note_reversed_leg(&mut legs, &connected, "peer-a:nonce-1", 1_000)
-            .expect("reversed leg should be accepted");
+        let generation = note_reversed_leg(&mut legs, &connected, "peer-a:nonce-1", 1_000);
         assert_eq!(generation, 1);
         assert!(legs.is_connected("peer-a:nonce-1"));
         assert!(connected.is_connected("peer-a:nonce-1"));
     }
 
     #[test]
-    fn reversed_leg_dropped_when_peer_already_connected() {
-        // Both sides initiating for the same peer: the consumer
-        // already holds a forward leg, so the reversed leg is a
-        // duplicate and is dropped (the accept loop refuses it
-        // first with no_path; this is the browse loop's backstop
-        // for the race where the forward leg lands between the
-        // accept check and the handoff).
+    fn reversed_leg_accepted_as_additional_leg_when_peer_already_connected() {
+        // Tom, 2026-11-18: peers must show up as transports for each
+        // other. A reversed leg is an additional leg for the peer,
+        // not a duplicate of the forward leg — the provider claimed
+        // a path for it, so a free path exists by construction. The
+        // old peer-level refusal is gone; the leg is recorded and
+        // its renewal generation returned.
         let mut legs = PeerLegTracker::default();
         let connected = ConnectedPeers::default();
         legs.note_dial("peer-a:nonce-1", 1_000, false);
         connected.mark_connected("peer-a:nonce-1");
-        assert_eq!(
-            note_reversed_leg(&mut legs, &connected, "peer-a:nonce-1", 1_000),
-            None
-        );
-        assert_eq!(legs.leg_count("peer-a:nonce-1"), 1);
+        let generation = note_reversed_leg(&mut legs, &connected, "peer-a:nonce-1", 1_000);
+        assert_eq!(generation, 2);
+        assert_eq!(legs.leg_count("peer-a:nonce-1"), 2);
+        assert!(legs.is_reversed("peer-a:nonce-1"));
     }
 
     #[test]
@@ -4169,10 +4152,10 @@ mod tests {
         // the same peer is a fresh leg, not a duplicate.
         let mut legs = PeerLegTracker::default();
         let connected = ConnectedPeers::default();
-        assert!(note_reversed_leg(&mut legs, &connected, "peer-a:nonce-1", 1_000).is_some());
+        note_reversed_leg(&mut legs, &connected, "peer-a:nonce-1", 1_000);
         assert!(legs.note_close("peer-a:nonce-1"));
         connected.mark_disconnected("peer-a:nonce-1");
-        assert!(note_reversed_leg(&mut legs, &connected, "peer-a:nonce-1", 1_300).is_some());
+        note_reversed_leg(&mut legs, &connected, "peer-a:nonce-1", 1_300);
         assert!(legs.is_connected("peer-a:nonce-1"));
     }
 
@@ -4213,9 +4196,7 @@ mod tests {
         assert!(legs.is_reversed("peer-a:nonce-1"));
 
         connected.mark_reversed_renewal_pending("peer-a:nonce-1");
-        let generation =
-            note_reversed_leg(&mut legs, &connected, "peer-a:nonce-1", 1_300)
-                .expect("renewal replacement should be accepted");
+        let generation = note_reversed_leg(&mut legs, &connected, "peer-a:nonce-1", 1_300);
         assert_eq!(generation, 2);
         assert_eq!(legs.leg_count("peer-a:nonce-1"), 2);
         assert!(legs.is_reversed("peer-a:nonce-1"));
@@ -4226,13 +4207,13 @@ mod tests {
         assert!(legs.is_connected("peer-a:nonce-1"));
         assert_eq!(legs.leg_count("peer-a:nonce-1"), 1);
 
-        // Without a pending renewal the same situation is still a
-        // duplicate: the next reversed leg is dropped.
-        assert_eq!(
-            note_reversed_leg(&mut legs, &connected, "peer-a:nonce-1", 1_600),
-            None
-        );
-        assert_eq!(legs.leg_count("peer-a:nonce-1"), 1);
+        // Without a pending renewal a further reversed leg is still
+        // an additional leg, not a duplicate (bidirectional peer
+        // transports, 2026-11-18): it is accepted and the count
+        // rises to two.
+        let generation = note_reversed_leg(&mut legs, &connected, "peer-a:nonce-1", 1_600);
+        assert_eq!(generation, 3);
+        assert_eq!(legs.leg_count("peer-a:nonce-1"), 2);
     }
 
     #[test]
