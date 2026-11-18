@@ -26,12 +26,14 @@ class VpnControlReceiver : BroadcastReceiver() {
                     android.util.Log.i("VpnControlReceiver", "Starting VPN with device_id=$deviceId")
                     BondedVpnService.start(context, deviceId, runBackground)
                 } else {
-                    // Try to find first paired device
-                    val preferred = PairedServerStore.selectPreferredRecord(PairedServerStore.loadAll(context))
+                    // Try to find first paired device: UI-selected
+                    // record first, then newest peer-share record,
+                    // then newest record.
+                    val preferred = AppSettingsStore.selectedRecord(context)
                     if (preferred != null) {
                         android.util.Log.i(
                             "VpnControlReceiver",
-                            "Starting VPN with preferred paired device: ${preferred.id}",
+                            "Starting VPN with preferred paired device: ${preferred.id} peerShareEnabled=${preferred.peerShareEnabled}",
                         )
                         BondedVpnService.start(context, preferred.id, runBackground)
                     } else {

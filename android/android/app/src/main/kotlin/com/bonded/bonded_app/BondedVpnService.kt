@@ -1459,7 +1459,7 @@ class BondedVpnService : VpnService() {
             val bindAddressesJson = JSONArray(bindAddresses).toString()
             android.util.Log.i(
                     "BondedVPN",
-                    "Starting native session: server=${server.publicAddress}, resolved=$resolvedServerAddr, protocols=$protocolCsv, pathCount=$pathCount, bindAddresses=$bindAddressesJson",
+                    "Starting native session: server=${server.publicAddress}, id=${server.id}, peerShareEnabled=${server.peerShareEnabled}, diagnosticsUploadEnabled=${server.diagnosticsUploadEnabled}, diagnosticsUploadPeriodSecs=${server.diagnosticsUploadPeriodSecs}, resolved=$resolvedServerAddr, protocols=$protocolCsv, pathCount=$pathCount, bindAddresses=$bindAddressesJson",
             )
             val started =
                     nativeStartSession(

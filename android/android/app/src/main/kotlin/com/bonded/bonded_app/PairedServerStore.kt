@@ -82,7 +82,15 @@ object PairedServerStore {
             return exactMatch
         }
 
-        return records.maxWithOrNull(compareBy<PairedServerRecord> { record ->
+        // No explicit id: prefer a peer-share-capable record, then
+        // recency. A bare connect used to pick purely by newest
+        // pairedAt, which could land on a record with
+        // peerShareEnabled=false (e.g. the local record) and silently
+        // run the session with no peer runtime. Peer-share records
+        // win first; recency is the tiebreak within each pool.
+        val peerShareCandidates = records.filter { it.peerShareEnabled }
+        val pool = peerShareCandidates.ifEmpty { records }
+        return pool.maxWithOrNull(compareBy<PairedServerRecord> { record ->
             runCatching { Instant.parse(record.pairedAt) }.getOrDefault(Instant.EPOCH)
         })
     }

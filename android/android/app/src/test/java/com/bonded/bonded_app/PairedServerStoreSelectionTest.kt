@@ -25,13 +25,50 @@ class PairedServerStoreSelectionTest {
         assertEquals("new-device", result?.id)
     }
 
-    private fun pairedServer(id: String, pairedAt: String): PairedServerRecord =
+    @Test
+    fun selectPreferredRecord_prefersPeerShareOverRecency() {
+        // The wrong-record trap: a newer record with peer sharing
+        // off must lose to an older record with it on.
+        val charter = pairedServer("charter-device", "2026-10-18T00:00:00Z", peerShareEnabled = true)
+        val local = pairedServer("local-device", "2026-10-22T00:00:00Z", peerShareEnabled = false)
+
+        val result = PairedServerStore.selectPreferredRecord(listOf(charter, local), null)
+
+        assertEquals("charter-device", result?.id)
+    }
+
+    @Test
+    fun selectPreferredRecord_newestPeerShareWinsAmongPeerShare() {
+        val older = pairedServer("older-peer", "2026-10-18T00:00:00Z", peerShareEnabled = true)
+        val newer = pairedServer("newer-peer", "2026-10-20T00:00:00Z", peerShareEnabled = true)
+        val local = pairedServer("local-device", "2026-10-22T00:00:00Z", peerShareEnabled = false)
+
+        val result = PairedServerStore.selectPreferredRecord(listOf(older, newer, local), null)
+
+        assertEquals("newer-peer", result?.id)
+    }
+
+    @Test
+    fun selectPreferredRecord_explicitIdStillWinsOverPeerShare() {
+        val charter = pairedServer("charter-device", "2026-10-18T00:00:00Z", peerShareEnabled = true)
+        val local = pairedServer("local-device", "2026-10-22T00:00:00Z", peerShareEnabled = false)
+
+        val result = PairedServerStore.selectPreferredRecord(listOf(charter, local), "local-device")
+
+        assertEquals("local-device", result?.id)
+    }
+
+    private fun pairedServer(
+        id: String,
+        pairedAt: String,
+        peerShareEnabled: Boolean = false,
+    ): PairedServerRecord =
         PairedServerRecord(
             id = id,
             publicAddress = "127.0.0.1:8000",
             serverIdentityPublicKey = "key-$id",
             supportedProtocols = emptyList(),
-            peerShareEnabled = false,
+            peerShareEnabled = peerShareEnabled,
             peerShareBindAddress = "",
             peerShareAdvertiseIp = "",
             peerShareMaxConsumers = 4,

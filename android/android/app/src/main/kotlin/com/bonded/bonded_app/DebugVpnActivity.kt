@@ -201,9 +201,11 @@ class DebugVpnActivity : Activity() {
     // ── Helpers ──────────────────────────────────────────────────────────────
 
     private fun resolveFirstPairedDeviceId(): String? {
-        val server = PairedServerStore.selectPreferredRecord(PairedServerStore.loadAll(this))
+        // UI-selected record first, then newest peer-share record,
+        // then newest record (via AppSettingsStore.selectedRecord).
+        val server = AppSettingsStore.selectedRecord(this)
         if (server != null) {
-            log("Using preferred paired server: id=${server.id} addr=${server.publicAddress}")
+            log("Using preferred paired server: id=${server.id} addr=${server.publicAddress} peerShareEnabled=${server.peerShareEnabled}")
         }
         return server?.id
     }
