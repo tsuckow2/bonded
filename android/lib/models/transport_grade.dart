@@ -1,24 +1,26 @@
-import 'session_grade.dart';
+import 'grade_scoring.dart';
 import 'session_status.dart';
 
 /// Per-transport grading (plan 4.50).
 ///
 /// The user corrected 4.47: grades belong on the TRANSPORTS
-/// (per path), not the session. Each path gets its own grade from
-/// its OWN metrics, accumulated from the same snapshot stream the
-/// home screen already polls — no new timers, wakeups,
-/// permissions, or server changes, and no Rust/Kotlin changes:
-/// every input (RTT, QUIC loss, PING counters, byte counters)
-/// already arrives per path in the snapshot.
+/// (per path), not the session. The session-grade card was removed
+/// (2026-11-17); each path gets its own grade from its OWN
+/// metrics, accumulated from the same snapshot stream the home
+/// screen already polls — no new timers, wakeups, permissions,
+/// or server changes, and no Rust/Kotlin changes: every input
+/// (RTT, QUIC loss, PING counters, byte counters) already arrives
+/// per path in the snapshot.
 ///
-/// Rubric (weights sum to 100, same shape as 4.47):
+/// Rubric (weights sum to 100):
 ///
 /// * Latency (30): this path's median RTT. 100 at ≤ 50 ms,
-///   0 at ≥ 500 ms, linear — the 4.47 function, reused.
+///   0 at ≥ 500 ms, linear — the shared scoring function, reused.
 /// * Stability (30): this path's flaps per hour — its QUIC PING
 ///   counter dropping (a re-dial restarts it from zero) or the
 ///   path rejoining after being inactive. Max 1 event per sample.
-///   100 at 0/h, 0 at ≥ 12/h, linear — the 4.47 function, reused.
+///   100 at 0/h, 0 at ≥ 12/h, linear — the shared scoring
+///   function, reused.
 ///   Only scored after ≥ 60 s of sampled time for that path.
 /// * Loss (20): this path's QUIC loss rate (lost / sent, from
 ///   the 4.49 counters). 100 at ≤ 0.1%, 0 at ≥ 10%, linear.
@@ -41,15 +43,14 @@ import 'session_status.dart';
 ///   RTT inflation and loss spikes under load are the observable
 ///   saturation signals we have.
 ///
-/// Every component is optional at runtime, like 4.47: no data
-/// yet → excluded, total rebalances proportionally over the
-/// components that do have data (total = Σ w·s / Σ w). The
-/// detail view shows each sub-score and its measurement, so the
-/// grade is explainable. Letters: 90+ A, 80+ B, 70+ C, 60+ D,
-/// below 60 F, no plus/minus — reused from 4.47.
+/// Every component is optional at runtime: no data yet →
+/// excluded, total rebalances proportionally over the components
+/// that do have data (total = Σ w·s / Σ w). The detail view shows
+/// each sub-score and its measurement, so the grade is explainable.
+/// Letters: 90+ A, 80+ B, 70+ C, 60+ D, below 60 F, no
+/// plus/minus — reused from the shared scoring primitives.
 ///
-/// Sampling limits, as in 4.47: the grade only sees what the
-/// snapshot stream sees. Intervals longer than 35 s (app
+/// Sampling limits: the grade only sees what the snapshot stream
 /// backgrounded, home screen left) are skipped as unknown time;
 /// flaps and saturation between samples are missed at that
 /// cadence. Medians come from the shared RTT histogram buckets;
@@ -97,7 +98,7 @@ class TransportGrade {
 
 /// Pure scoring functions, one per component new to this slice.
 /// Latency, stability, letters, and the rebalanced total are
-/// reused from `session_grade.dart`.
+/// reused from `grade_scoring.dart`.
 
 /// QUIC loss rate, 0–1: 100 at ≤ 0.1%, 0 at ≥ 10%, linear.
 double lossScoreFromRate(double rate) =>

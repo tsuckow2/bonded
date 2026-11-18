@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
 
-import '../models/session_grade.dart' show formatSampledFor;
+import '../models/grade_scoring.dart' show formatSampledFor;
 import '../models/transport_grade.dart';
 
 /// Per-transport grade display for the Paths card (plan 4.50):
@@ -158,7 +158,7 @@ Future<void> showTransportGradeSheet(
   );
 }
 
-/// Letter colour, same bands as the session grade card.
+/// Letter colour, same bands as the shared scoring primitives.
 Color gradeLetterColor(String letter) {
   switch (letter) {
     case 'A':
