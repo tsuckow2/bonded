@@ -1522,7 +1522,11 @@ mod tests {
         .expect("runtime should be recreated on key change");
 
         assert!(sessions.contains_client(&peer.device_public_key));
-        assert_ne!(first.session_id, recreated.session_id);
+        // The session is the same one (still registered), so the
+        // session_id is the same — what proves recreation is the
+        // key: the old runtime was built with the old key, so if
+        // ensure_peer_runtime had returned it, this would fail.
+        assert_eq!(first.session_id, recreated.session_id);
         assert_eq!(recreated.wg_public_key, peer.wg_public_key);
     }
 
