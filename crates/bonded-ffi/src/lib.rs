@@ -217,6 +217,12 @@ pub extern "system" fn JNI_OnLoad(vm: jni::JavaVM, _: *mut std::ffi::c_void) -> 
         }
     }));
 
+    // Bridge tracing (bonded-client's info!/warn!) to logcat. Without a
+    // subscriber the client crate's events were silently discarded on
+    // Android (4.87's h3 observer logging was invisible until this).
+    #[cfg(target_os = "android")]
+    let _ = tracing::subscriber::set_global_default(LogcatSubscriber);
+
     jni::sys::JNI_VERSION_1_6
 }
 
@@ -243,6 +249,92 @@ fn alog(priority: i32, msg: &str) {
         }
     }
     log_ring_append(priority, msg);
+}
+
+/// Bridge `tracing` events (used by `bonded-client` and friends) to Android
+/// logcat. Without a subscriber installed, `tracing::info!/warn!` on Android
+/// hit the default no-op dispatcher and were invisible — the FFI's own
+/// `alog_*` macros were the only Rust lines reaching logcat, which is why
+/// 4.87's h3 observer logging (added in `bonded-client`) produced zero
+/// lines on device even though the code ran. Installed once in `JNI_OnLoad`.
+/// Events below INFO (DEBUG/TRACE, e.g. quinn internals) are dropped.
+#[cfg(target_os = "android")]
+struct LogcatSubscriber;
+
+#[cfg(target_os = "android")]
+impl tracing::Subscriber for LogcatSubscriber {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        *metadata.level() <= tracing::Level::INFO
+    }
+
+    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        tracing::span::Id::from_u64(
+            NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(
+        &self,
+        _span: &tracing::span::Id,
+        _follows: &tracing::span::Id,
+    ) {
+    }
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        let meta = event.metadata();
+        let prio = match *meta.level() {
+            tracing::Level::ERROR => 6,
+            tracing::Level::WARN => 5,
+            tracing::Level::INFO => 4,
+            tracing::Level::DEBUG => 3,
+            tracing::Level::TRACE => 2,
+        };
+        struct Visitor {
+            message: String,
+            fields: String,
+        }
+        impl tracing::field::Visit for Visitor {
+            fn record_debug(
+                &mut self,
+                field: &tracing::field::Field,
+                value: &dyn std::fmt::Debug,
+            ) {
+                if field.name() == "message" {
+                    self.message = format!("{value:?}");
+                } else {
+                    self.fields
+                        .push_str(&format!(" {}={value:?}", field.name()));
+                }
+            }
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                self.fields.push_str(&format!(" {}={value}", field.name()));
+            }
+            fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+                self.fields.push_str(&format!(" {}={value}", field.name()));
+            }
+            fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+                self.fields.push_str(&format!(" {}={value}", field.name()));
+            }
+            fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+                self.fields.push_str(&format!(" {}={value}", field.name()));
+            }
+        }
+        let mut visitor = Visitor {
+            message: String::new(),
+            fields: String::new(),
+        };
+        event.record(&mut visitor);
+        alog(
+            prio,
+            &format!("{}: {}{}", meta.target(), visitor.message, visitor.fields),
+        );
+    }
+
+    fn enter(&self, _span: &tracing::span::Id) {}
+    fn exit(&self, _span: &tracing::span::Id) {}
 }
 
 /// On-device diagnostic log ring. When diagnostics upload is enabled,

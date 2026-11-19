@@ -35,7 +35,7 @@ use h3::server;
 use quinn::{Endpoint, ServerConfig};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::sync::mpsc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::auth_handshake::perform_quic_auth_handshake;
 use crate::authorized_keys::AuthorizedKeysStore;
@@ -182,9 +182,23 @@ async fn handle_h3_connection(
         .await
         .context("failed to build HTTP/3 server connection")?;
 
+    // Requests served on this connection. A bootstrap client opens one
+    // connection per request and goes away right after its answer, so
+    // an accept error after >=1 served request is normal teardown,
+    // not a failure worth a WARN (4.87).
+    let mut requests_served = 0usize;
+
     loop {
-        let Some(resolver) = h3_conn.accept().await.context("HTTP/3 accept failed")? else {
-            break;
+        let resolver = match h3_conn.accept().await {
+            Ok(Some(resolver)) => resolver,
+            Ok(None) => break,
+            Err(err) => {
+                if requests_served > 0 {
+                    debug!(peer = %peer, requests_served, error = ?err, "HTTP/3 accept failed after requests served");
+                    break;
+                }
+                return Err(err).context("HTTP/3 accept failed");
+            }
         };
         let (request, mut stream) = resolver
             .resolve_request()
@@ -237,6 +251,7 @@ async fn handle_h3_connection(
             .finish()
             .await
             .context("failed to finish HTTP/3 response")?;
+        requests_served += 1;
     }
 
     Ok(())

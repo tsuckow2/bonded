@@ -16,7 +16,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use base64::Engine as _;
@@ -42,6 +42,13 @@ type ForwarderRegistry = Arc<RwLock<HashMap<u64, Arc<SessionContext>>>>;
 const WG_MAX_DATAGRAM: usize = 1500;
 const WG_HS_BUF: usize = 148;
 const WG_ENCAP_OVERHEAD: usize = 60;
+/// Idle reap (4.88 part 3): how often the server scans for dead
+/// runtimes, and how long a runtime may go without an accepted
+/// datagram before it is reaped. 300 s is 5x the 60 s WG keepalive /
+/// session heartbeat, so a live peer — even one that missed several
+/// keepalives — can never trip it.
+const WG_REAP_INTERVAL: Duration = Duration::from_secs(60);
+const WG_IDLE_REAP_AFTER: Duration = Duration::from_secs(300);
 const WG_FAKE_SRC_IP: [u8; 4] = [100, 64, 0, 1];
 const WG_FAKE_DST_IP: [u8; 4] = [100, 64, 0, 2];
 const IPV4_HDR_LEN: usize = 20;
@@ -358,6 +365,9 @@ struct WireGuardPeerTransportState {
     peer_addr: Option<SocketAddr>,
     pending_recv: VecDeque<SessionFrame>,
     wg_buf: Vec<u8>,
+    /// Last wall-clock-free instant a datagram from this peer was
+    /// accepted (4.88 part 3: the idle reap reads this).
+    last_datagram_at: Instant,
 }
 
 #[derive(Clone)]
@@ -414,6 +424,7 @@ impl WireGuardPeerRuntime {
                 peer_addr: None,
                 pending_recv: VecDeque::new(),
                 wg_buf: vec![0u8; WG_MAX_DATAGRAM + WG_ENCAP_OVERHEAD],
+                last_datagram_at: Instant::now(),
             })),
         })
     }
@@ -425,20 +436,36 @@ impl WireGuardPeerRuntime {
     ) -> anyhow::Result<Option<Vec<SessionFrame>>> {
         let (peer_addr, outbound_packets, decoded_frames) = {
             let mut guard = self.state.lock().await;
-            if let Some(existing_peer_addr) = guard.peer_addr {
-                if existing_peer_addr != src {
-                    return Ok(None);
-                }
-            }
+            // Roaming (4.88 part 2): the peer's source address can
+            // change (NAT rebinding, wifi/cellular switch) while the
+            // key stays the same. The old pin check rejected those
+            // datagrams outright and nothing ever discarded the
+            // runtime, so the session went deaf. Trial-decapsulate
+            // instead: only a cryptographically valid packet from
+            // this peer can succeed, so success proves the new source
+            // is the same peer and re-pinning is safe. A failure
+            // leaves the pin untouched — decapsulate errors surface
+            // as Ok(None) (see handle_tunn_result), so a wrong-peer's
+            // packet consumes nothing and the probe loop is unaffected.
+            let roaming = matches!(guard.peer_addr, Some(addr) if addr != src);
 
             let processed = process_datagram(&mut guard, src.ip(), datagram)?;
             let Some((outbound_packets, decoded_frames)) = processed else {
                 return Ok(None);
             };
 
-            if guard.peer_addr.is_none() {
+            if roaming {
+                warn!(
+                    device = %self.device_public_key,
+                    old = %guard.peer_addr.expect("roaming implies a pinned address"),
+                    new = %src,
+                    "wireguard peer source changed, re-pinning",
+                );
+                guard.peer_addr = Some(src);
+            } else if guard.peer_addr.is_none() {
                 guard.peer_addr = Some(src);
             }
+            guard.last_datagram_at = Instant::now();
 
             (
                 guard.peer_addr.expect("peer address set"),
@@ -504,6 +531,48 @@ impl WireGuardPeerRuntime {
 
         Ok(())
     }
+
+    /// Instant the last datagram from this peer was accepted.
+    async fn last_seen(&self) -> Instant {
+        self.state.lock().await.last_datagram_at
+    }
+
+    #[cfg(test)]
+    async fn set_last_seen(&self, at: Instant) {
+        self.state.lock().await.last_datagram_at = at;
+    }
+}
+
+/// Idle reap (4.88 part 3): drop runtimes that have not seen an
+/// accepted datagram for longer than `WG_IDLE_REAP_AFTER`, removing
+/// the map entry and running the normal peer cleanup (forwarder /
+/// transport / session). A reaped peer is not gone: its next datagram
+/// recreates the runtime through `ensure_peer_runtime`, exactly like
+/// a fresh handshake. `now` is a parameter (not `Instant::now()`) so
+/// tests can drive the reap with a fake clock.
+async fn reap_idle_wireguard_runtimes(
+    runtimes: &mut HashMap<String, Arc<WireGuardServerPeer>>,
+    forwarders: &ForwarderRegistry,
+    sessions: &SessionRegistry,
+    now: Instant,
+) {
+    let mut idle = Vec::new();
+    for (key, peer) in runtimes.iter() {
+        let last = peer.runtime.last_seen().await;
+        if now.checked_duration_since(last).unwrap_or(Duration::ZERO) > WG_IDLE_REAP_AFTER {
+            idle.push(key.clone());
+        }
+    }
+    for key in idle {
+        if let Some(peer) = runtimes.remove(&key) {
+            warn!(
+                session_id = peer.session_id,
+                public_key = %peer.public_key,
+                "reaping idle wireguard peer runtime"
+            );
+            cleanup_wireguard_peer(&peer, forwarders, sessions).await;
+        }
+    }
 }
 
 pub async fn run_wireguard_server(
@@ -523,70 +592,78 @@ pub async fn run_wireguard_server(
     let mut peer_by_source: HashMap<SocketAddr, String> = HashMap::new();
     let mut runtimes: HashMap<String, Arc<WireGuardServerPeer>> = HashMap::new();
 
+    let mut reap_interval = tokio::time::interval(WG_REAP_INTERVAL);
     loop {
-        let (read, source) = socket.recv_from(&mut datagram_buf).await?;
-        let datagram = &datagram_buf[..read];
+        tokio::select! {
+            result = socket.recv_from(&mut datagram_buf) => {
+                let (read, source) = result?;
+                let datagram = &datagram_buf[..read];
 
-        // NOTE: each datagram must pass through boringtun's decapsulate
-        // exactly once. Data packets carry a nonce that replay protection
-        // rejects on a second pass, so the old shape — probe every
-        // registered peer with try_accept_datagram (consuming the
-        // datagram, discarding any decoded frames) and then process the
-        // same datagram a second time — ate every session data frame:
-        // the probe discarded the discovery ping and the reprocessing
-        // rejected it, so session discovery over WireGuard could never
-        // complete. The probe's frames are therefore the ones delivered
-        // below; there is no second pass.
-        let (peer, frames) = if let Some(device_public_key) =
-            peer_by_source.get(&source).cloned()
-        {
-            let Some(peer) = runtimes.get(&device_public_key).cloned() else {
-                peer_by_source.remove(&source);
-                continue;
-            };
-            match peer.runtime.try_accept_datagram(source, datagram).await? {
-                Some(frames) => (peer, frames),
-                None => {
+            // NOTE: each datagram must pass through boringtun's decapsulate
+            // exactly once. Data packets carry a nonce that replay protection
+            // rejects on a second pass, so the old shape — probe every
+            // registered peer with try_accept_datagram (consuming the
+            // datagram, discarding any decoded frames) and then process the
+            // same datagram a second time — ate every session data frame:
+            // the probe discarded the discovery ping and the reprocessing
+            // rejected it, so session discovery over WireGuard could never
+            // complete. The probe's frames are therefore the ones delivered
+            // below; there is no second pass.
+            let (peer, frames) = if let Some(device_public_key) =
+                peer_by_source.get(&source).cloned()
+            {
+                let Some(peer) = runtimes.get(&device_public_key).cloned() else {
                     peer_by_source.remove(&source);
-                    debug!(source = %source, session_id = peer.session_id, "wireguard datagram rejected by cached peer runtime");
                     continue;
+                };
+                match peer.runtime.try_accept_datagram(source, datagram).await? {
+                    Some(frames) => (peer, frames),
+                    None => {
+                        peer_by_source.remove(&source);
+                        debug!(source = %source, session_id = peer.session_id, "wireguard datagram rejected by cached peer runtime");
+                        continue;
+                    }
                 }
-            }
-        } else {
-            let mut found = None;
-            for registered_peer in peers.all_peers() {
-                let runtime = ensure_peer_runtime(
-                    &mut runtimes,
-                    &registered_peer,
-                    keypair.clone(),
-                    socket.clone(),
-                    sessions.clone(),
-                    forwarders.clone(),
-                    tun_bridge.clone(),
-                    tunnel_pcap.clone(),
-                    dns_server,
-                )
-                .await?;
-                if let Some(frames) = runtime
-                    .runtime
-                    .try_accept_datagram(source, datagram)
-                    .await?
-                {
-                    peer_by_source.insert(source, registered_peer.device_public_key.clone());
-                    found = Some((runtime, frames));
-                    break;
+            } else {
+                let mut found = None;
+                for registered_peer in peers.all_peers() {
+                    let runtime = ensure_peer_runtime(
+                        &mut runtimes,
+                        &registered_peer,
+                        keypair.clone(),
+                        socket.clone(),
+                        sessions.clone(),
+                        forwarders.clone(),
+                        tun_bridge.clone(),
+                        tunnel_pcap.clone(),
+                        dns_server,
+                    )
+                    .await?;
+                    if let Some(frames) = runtime
+                        .runtime
+                        .try_accept_datagram(source, datagram)
+                        .await?
+                    {
+                        peer_by_source.insert(source, registered_peer.device_public_key.clone());
+                        found = Some((runtime, frames));
+                        break;
+                    }
                 }
-            }
 
-            let Some(found) = found else {
-                debug!(source = %source, bytes = read, "wireguard datagram did not match any provisioned peer");
-                continue;
+                let Some(found) = found else {
+                    debug!(source = %source, bytes = read, "wireguard datagram did not match any provisioned peer");
+                    continue;
+                };
+                found
             };
-            found
-        };
 
-        peer_by_source.insert(source, peer.public_key.clone());
-        handle_decoded_frames(&peer, frames, &tunnel_pcap).await;
+            peer_by_source.insert(source, peer.public_key.clone());
+            handle_decoded_frames(&peer, frames, &tunnel_pcap).await;
+            }
+            _ = reap_interval.tick() => {
+                reap_idle_wireguard_runtimes(&mut runtimes, &forwarders, &sessions, Instant::now()).await;
+            }
+        }
     }
 }
 
@@ -1104,7 +1181,7 @@ mod tests {
     use bytes::Bytes;
     use std::fs;
     use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -1528,6 +1605,220 @@ mod tests {
         // ensure_peer_runtime had returned it, this would fail.
         assert_eq!(first.session_id, recreated.session_id);
         assert_eq!(recreated.wg_public_key, peer.wg_public_key);
+    }
+
+    #[tokio::test]
+    async fn wireguard_runtime_repin_accepts_same_peer_from_new_source() {
+        // 4.88 part 2: a client whose source address changes (NAT
+        // rebinding, wifi/cellular switch) with the SAME WG key must
+        // keep working. The old pin check dropped those datagrams
+        // outright and nothing ever discarded the runtime, so the
+        // session went deaf. Two client transports share one keypair
+        // (one peer identity) but bind different ephemeral ports:
+        // the second transport's handshake is the roaming leg.
+        let server_socket = Arc::new(
+            UdpSocket::bind("127.0.0.1:0")
+                .await
+                .expect("server socket should bind"),
+        );
+        let server_addr = server_socket
+            .local_addr()
+            .expect("server addr should resolve");
+
+        let server_keypair = WireGuardKeypair::generate();
+        let client_keypair = WireGuardKeypair::generate();
+        let peer = WireGuardPeer {
+            device_public_key: "roaming-device".to_owned(),
+            wg_public_key: client_keypair.public_key_b64(),
+            peer_ip: Ipv4Addr::new(100, 64, 1, 23),
+            lease_expires_at: unix_timestamp_after(Duration::from_secs(300))
+                .expect("lease expiry should compute"),
+        };
+        let server_runtime = Arc::new(
+            WireGuardPeerRuntime::new(&peer, &server_keypair, 8, server_socket.clone())
+                .expect("server runtime should build"),
+        );
+
+        let server_task = {
+            let server_socket = server_socket.clone();
+            let server_runtime = server_runtime.clone();
+            tokio::spawn(async move {
+                let mut datagram_buf = vec![0u8; WG_MAX_DATAGRAM + WG_ENCAP_OVERHEAD];
+                let mut echoed = 0;
+                while echoed < 2 {
+                    let (read, source) = server_socket
+                        .recv_from(&mut datagram_buf)
+                        .await
+                        .expect("server should receive datagram");
+                    let frames = server_runtime
+                        .try_accept_datagram(source, &datagram_buf[..read])
+                        .await
+                        .expect("server should process datagram");
+                    let Some(frames) = frames else {
+                        continue;
+                    };
+                    for frame in frames {
+                        server_runtime
+                            .send_frame(bonded_core::session::SessionFrame {
+                                header: bonded_core::session::SessionHeader {
+                                    connection_id: frame.header.connection_id,
+                                    sequence: frame.header.sequence + 1,
+                                    flags: 0,
+                                },
+                                payload: Bytes::from_static(b"roam-pong"),
+                            })
+                            .await
+                            .expect("server should send echo response");
+                        echoed += 1;
+                    }
+                }
+            })
+        };
+
+        // Leg 1: establishes the pin.
+        let client_keypair2 = WireGuardKeypair {
+            secret: client_keypair.secret.clone(),
+            public: client_keypair.public,
+        };
+        let mut first_transport = WireGuardTransport::new(
+            client_keypair,
+            server_keypair.public,
+            "127.0.0.1:0",
+            server_addr,
+            11,
+            #[cfg(unix)]
+            None,
+        )
+        .await
+        .expect("first client transport should build");
+        first_transport
+            .send(bonded_core::session::SessionFrame {
+                header: bonded_core::session::SessionHeader {
+                    connection_id: 77,
+                    sequence: 0,
+                    flags: 0,
+                },
+                payload: Bytes::from_static(b"roam-ping-1"),
+            })
+            .await
+            .expect("first client should send frame");
+        let echoed = first_transport
+            .recv()
+            .await
+            .expect("first client should receive echoed frame");
+        assert_eq!(echoed.header.sequence, 1);
+        assert_eq!(&echoed.payload[..], b"roam-pong");
+
+        // Leg 2: same peer identity, new source address. If the
+        // re-pin is broken the handshake is dropped and this recv
+        // times out instead of echoing.
+        let mut second_transport = WireGuardTransport::new(
+            client_keypair2,
+            server_keypair.public,
+            "127.0.0.1:0",
+            server_addr,
+            12,
+            #[cfg(unix)]
+            None,
+        )
+        .await
+        .expect("second client transport should build");
+        second_transport
+            .send(bonded_core::session::SessionFrame {
+                header: bonded_core::session::SessionHeader {
+                    connection_id: 78,
+                    sequence: 0,
+                    flags: 0,
+                },
+                payload: Bytes::from_static(b"roam-ping-2"),
+            })
+            .await
+            .expect("second client should send frame");
+        let echoed = tokio::time::timeout(
+            Duration::from_secs(10),
+            second_transport.recv(),
+        )
+        .await
+        .expect("roaming leg should complete within 10 s")
+        .expect("second client should receive echoed frame");
+        assert_eq!(echoed.header.sequence, 1);
+        assert_eq!(&echoed.payload[..], b"roam-pong");
+
+        server_task.await.expect("server task should join");
+    }
+
+    #[tokio::test]
+    async fn reap_idle_wireguard_runtimes_removes_stale_entries() {
+        // 4.88 part 3: runtimes that have not seen an accepted
+        // datagram for longer than WG_IDLE_REAP_AFTER are removed
+        // from the map and cleaned up; a live peer survives.
+        let mut runtimes = HashMap::new();
+        let keypair = Arc::new(WireGuardKeypair::generate());
+        let socket = Arc::new(
+            UdpSocket::bind("127.0.0.1:0")
+                .await
+                .expect("udp socket should bind"),
+        );
+        let sessions = SessionRegistry::default();
+        let forwarders: ForwarderRegistry = Arc::new(RwLock::new(HashMap::new()));
+        let dns = std::net::SocketAddr::from(([192, 0, 2, 53], 53));
+
+        let stale_peer = WireGuardPeer {
+            device_public_key: "idle-device".to_owned(),
+            wg_public_key: WireGuardKeypair::generate().public_key_b64(),
+            peer_ip: Ipv4Addr::new(100, 64, 1, 24),
+            lease_expires_at: unix_timestamp_after(Duration::from_secs(300))
+                .expect("lease expiry should compute"),
+        };
+        let stale = ensure_peer_runtime(
+            &mut runtimes,
+            &stale_peer,
+            keypair.clone(),
+            socket.clone(),
+            sessions.clone(),
+            forwarders.clone(),
+            None,
+            None,
+            dns,
+        )
+        .await
+        .expect("stale runtime should be created");
+        assert!(sessions.contains_client(&stale_peer.device_public_key));
+
+        let live_peer = WireGuardPeer {
+            device_public_key: "live-device".to_owned(),
+            wg_public_key: WireGuardKeypair::generate().public_key_b64(),
+            peer_ip: Ipv4Addr::new(100, 64, 1, 25),
+            lease_expires_at: unix_timestamp_after(Duration::from_secs(300))
+                .expect("lease expiry should compute"),
+        };
+        let _live = ensure_peer_runtime(
+            &mut runtimes,
+            &live_peer,
+            keypair,
+            socket,
+            sessions.clone(),
+            forwarders.clone(),
+            None,
+            None,
+            dns,
+        )
+        .await
+        .expect("live runtime should be created");
+        assert!(sessions.contains_client(&live_peer.device_public_key));
+
+        stale
+            .runtime
+            .set_last_seen(Instant::now() - WG_IDLE_REAP_AFTER - Duration::from_secs(1))
+            .await;
+
+        reap_idle_wireguard_runtimes(&mut runtimes, &forwarders, &sessions, Instant::now())
+            .await;
+
+        assert!(!runtimes.contains_key("idle-device"));
+        assert!(!sessions.contains_client("idle-device"));
+        assert!(runtimes.contains_key("live-device"));
+        assert!(sessions.contains_client("live-device"));
     }
 
     #[tokio::test]

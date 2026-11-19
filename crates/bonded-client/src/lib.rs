@@ -1766,6 +1766,8 @@ async fn request_bootstrap_json_h3(
         anyhow::bail!("HTTP/3 bootstrap requires tls_cert_fingerprint or server_public_key");
     };
 
+    info!(host = %host, port, method, path, "HTTP/3 bootstrap request");
+
     let (_endpoint, connection) = match connect_quic_client(
         host,
         port,
@@ -1802,7 +1804,10 @@ async fn request_bootstrap_json_h3(
                 format!("HTTP/3 reconnect after cert rotation failed for {host}:{port}: {err}")
             })?
         }
-        Err(err) => return Err(err),
+        Err(err) => {
+            warn!(host = %host, port, method, path, error = %err, "HTTP/3 bootstrap connect failed");
+            return Err(err);
+        }
     };
 
     let presented_cert = if require_cert_proof {
@@ -1827,7 +1832,11 @@ async fn request_bootstrap_json_h3(
             "/v1/bootstrap/cert-proof",
             None,
         )
-        .await?;
+        .await
+        .map_err(|err| {
+            warn!(host = %host, port, error = %err, "HTTP/3 cert-proof request failed");
+            err
+        })?;
         cert_proof::verify_cert_proof_response(
             cert.as_ref(),
             &config.client.server_public_key,
@@ -1837,6 +1846,10 @@ async fn request_bootstrap_json_h3(
 
     let result = send_h3_json_request(&mut send_request, host, method, path, body).await;
     driver_task.abort();
+    match &result {
+        Ok(_) => info!(host = %host, port, method, path, "HTTP/3 bootstrap request succeeded"),
+        Err(err) => warn!(host = %host, port, method, path, error = %err, "HTTP/3 bootstrap request failed"),
+    }
     result
 }
 
