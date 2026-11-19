@@ -115,6 +115,16 @@ the App Store matters.
    - Neither failure says anything about the Rust code yet. Once a
      toolchain exists, re-run both checks; the real list (Linux-gated
      modules, dep support) comes out of that run.
+
+   **DIRECTION (Tom, 2026-11-19 ~08:42 PST, Bonded chat — "should you
+   just rely on GitHub agents"):** yes, mostly. A GitHub agent on a
+   Windows or macOS runner has MinGW / Apple clang natively, so the
+   cross-compile problem goes away. Split: the agent does the
+   implementation and the native build and opens a PR; the assistant
+   reviews the PR and does the verification the agent can't (no bench
+   phones, no Dell, no real device). The local cross-compile checks
+   above stay as the record of why this route was chosen; they are not
+   the path forward.
 2. **C-ABI FFI design** (small doc + skeleton): the session-start /
    stop / status / diagnostics surface the desktop shells need, mirroring
    what the JNI layer exposes today. Decide whether the desktop FFI is
