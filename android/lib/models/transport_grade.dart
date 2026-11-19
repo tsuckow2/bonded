@@ -50,6 +50,19 @@ import 'session_status.dart';
 /// Letters: 90+ A, 80+ B, 70+ C, 60+ D, below 60 F, no
 /// plus/minus — reused from the shared scoring primitives.
 ///
+/// Exploration prior (4.86): a transport with insufficient data
+/// — not enough traffic to measure loss or bandwidth — grades 99,
+/// not its thin measured total. An idle leg would otherwise grade
+/// low on RTT alone (a peer relay at 300 ms scores ~44) and never
+/// win traffic in BestTransport, so it never gathers the data
+/// that would raise it: the feedback loop. 99 is just below a
+/// known-perfect 100 and above most known-worse, so the leg gets
+/// tried, gathers data, and then earns a real grade. The prior is
+/// marked on the grade ([TransportGrade.isPrior]) and explained
+/// in the detail view; it ends as soon as the transport meets
+/// either traffic threshold (≥ 100 packets sent for loss, or
+/// ≥ 10 active windows for bandwidth).
+///
 /// Sampling limits: the grade only sees what the snapshot stream
 /// backgrounded, home screen left) are skipped as unknown time;
 /// flaps and saturation between samples are missed at that
@@ -80,6 +93,16 @@ class TransportGrade {
   final Duration sampledFor;
   final int sampleCount;
 
+  /// True when the total is the 99 exploration prior (plan 4.86),
+  /// not a measured grade: the transport has not yet carried
+  /// enough traffic to measure loss or bandwidth, so it is graded
+  /// 99 — just below a known-perfect 100, above most known-worse —
+  /// so BestTransport tries it and it gathers data. The sub-scores
+  /// are still the honest measurements (they may show what little
+  /// data exists); only the total is the prior. Once the transport
+  /// carries enough traffic the grade becomes measured.
+  final bool isPrior;
+
   const TransportGrade({
     required this.total,
     required this.letter,
@@ -93,6 +116,7 @@ class TransportGrade {
     required this.bandwidthDetail,
     required this.sampledFor,
     required this.sampleCount,
+    this.isPrior = false,
   });
 }
 
@@ -182,6 +206,20 @@ class TransportGradeTracker {
   static const minLossSpikePackets = 20;
   static const lossSpikeRate = 0.05;
 
+  /// Exploration prior (plan 4.86): a transport with insufficient
+  /// data grades this, not its thin measured total. 99 is just
+  /// below a known-perfect 100 and above most known-worse
+  /// transports, so BestTransport tries it and it gathers data.
+  /// Insufficient data means it has not yet carried enough traffic
+  /// to measure loss (fewer than [minLossSentPackets] sent) AND
+  /// has not yet had enough active windows to measure bandwidth
+  /// (fewer than [minBandwidthActiveIntervals]): essentially
+  /// unmeasured. Once either threshold is met the grade becomes
+  /// the measured total. A bad leg is bounded by this: it gets one
+  /// flow's worth of traffic, then a real grade (and send-failure
+  /// eviction if it cannot carry it).
+  static const priorGradeTotal = 99;
+
   int _sessionId = 0;
   DateTime? _lastSampleAt;
   final Map<String, _PathGradeState> _paths = {};
@@ -245,6 +283,31 @@ class TransportGradeTracker {
           : 'no saturation in ${state.activeIntervals} active windows';
     }
 
+    // Exploration prior (4.86): insufficient data — not enough
+    // traffic to measure loss or bandwidth — grades 99 so this
+    // transport gets tried and gathers data. The sub-scores stay
+    // the honest measurements (they may show what little data
+    // exists); only the total is the prior.
+    final insufficientData = state.sentTotal < minLossSentPackets &&
+        state.activeIntervals < minBandwidthActiveIntervals;
+    if (insufficientData) {
+      return TransportGrade(
+        total: priorGradeTotal,
+        letter: letterForScore(priorGradeTotal),
+        latencyScore: latencyScore,
+        stabilityScore: stabilityScore,
+        lossScore: lossScore,
+        bandwidthScore: bandwidthScore,
+        latencyDetail: latencyDetail,
+        stabilityDetail: stabilityDetail,
+        lossDetail: lossDetail,
+        bandwidthDetail: bandwidthDetail,
+        sampledFor: Duration(milliseconds: state.sampledMs),
+        sampleCount: state.samples,
+        isPrior: true,
+      );
+    }
+
     final total = totalScore([
       WeightedComponent(weights['latency']!, latencyScore),
       WeightedComponent(weights['stability']!, stabilityScore),
@@ -265,6 +328,7 @@ class TransportGradeTracker {
       bandwidthDetail: bandwidthDetail,
       sampledFor: Duration(milliseconds: state.sampledMs),
       sampleCount: state.samples,
+      isPrior: false,
     );
   }
 

@@ -121,9 +121,11 @@ void main() {
       expect(grade.stabilityScore, isNull);
       // No bytes moved: no active windows, bandwidth not scored.
       expect(grade.bandwidthScore, isNull);
-      // Total rebalances over latency only → 100 → A.
-      expect(grade.total, 100);
+      // Insufficient data (no loss, no bandwidth): the 4.86 prior,
+      // 99, not the thin rebalanced total over latency alone.
+      expect(grade.total, 99);
       expect(grade.letter, 'A');
+      expect(grade.isPrior, isTrue);
       expect(grade.sampleCount, 11);
     });
 
@@ -361,6 +363,117 @@ void main() {
         tracker.gradeFor('d0')!.latencyScore,
         closeTo(16.7, 0.1),
       );
+    });
+  });
+
+  group('exploration prior (4.86)', () {
+    final t0 = DateTime(2026, 1, 1, 12, 0, 0);
+
+    test('idle peer leg with high RTT grades 99, not its thin total', () {
+      final tracker = TransportGradeTracker();
+      for (var i = 0; i < 12; i++) {
+        // A peer-relay leg (OnePlus) that reports RTT but carries
+        // no traffic: the idle-leg case from the v304 bench check.
+        tracker.record(
+          tstatusWith(
+            paths: [tpath(index: null, kind: 'h3', peerId: 'abcdef12', rtt: 300)],
+          ),
+          t0.add(Duration(seconds: i)),
+        );
+      }
+      final grade = tracker.gradeFor('rabcdef12:h3')!;
+      // RTT 300 ms alone would score ~50 (D) and the leg would
+      // never win traffic — the feedback loop. The prior is 99.
+      expect(grade.latencyScore, 50);
+      expect(grade.total, 99);
+      expect(grade.letter, 'A');
+      expect(grade.isPrior, isTrue);
+      expect(grade.lossScore, isNull);
+      expect(grade.bandwidthScore, isNull);
+    });
+
+    test('a path that just appeared, with no samples, gets the prior', () {
+      final tracker = TransportGradeTracker();
+      // One sample only: the re-baseline, nothing accumulated.
+      tracker.record(tstatusWith(paths: [tpath(rtt: 40)]), t0);
+      final grade = tracker.gradeFor('d0')!;
+      expect(grade.total, 99);
+      expect(grade.isPrior, isTrue);
+      expect(grade.latencyScore, isNull);
+      expect(grade.sampleCount, 0);
+    });
+
+    test('prior ends once the transport carries enough traffic', () {
+      final tracker = TransportGradeTracker();
+      for (var i = 0; i < 12; i++) {
+        tracker.record(
+          tstatusWith(paths: [tpath(rtt: 300)]),
+          t0.add(Duration(seconds: i)),
+        );
+      }
+      var grade = tracker.gradeFor('d0')!;
+      expect(grade.total, 99);
+      expect(grade.isPrior, isTrue);
+      // Now traffic: 1000 packets sent per interval, no loss,
+      // bytes moving. The first traffic sample only re-baselines
+      // the counters (previous sent was null); the next two add
+      // 1000 sent each, so sentTotal reaches 2000.
+      for (var i = 0; i < 3; i++) {
+        final n = 12 + i;
+        tracker.record(
+          tstatusWith(
+            paths: [
+              tpath(
+                rtt: 300,
+                sent: 1000 * (i + 1),
+                lost: 0,
+                inb: 1250000 * (i + 1),
+              ),
+            ],
+          ),
+          t0.add(Duration(seconds: n)),
+        );
+      }
+      grade = tracker.gradeFor('d0')!;
+      // sentTotal >= 100: the prior ends, the grade is measured.
+      expect(grade.isPrior, isFalse);
+      expect(grade.lossScore, 100);
+      // Latency 50 (300 ms), loss 100 (0%): (30*50 + 20*100)/50.
+      expect(grade.total, 70);
+      expect(grade.letter, 'C');
+    });
+
+    test('bandwidth data alone ends the prior', () {
+      final tracker = TransportGradeTracker();
+      for (var i = 0; i < 12; i++) {
+        // Bytes moving every interval, but no loss counters at all
+        // (non-QUIC): 11 active windows, bandwidth scores 100.
+        tracker.record(
+          tstatusWith(paths: [tpath(rtt: 40, inb: 1250000 * i)]),
+          t0.add(Duration(seconds: i)),
+        );
+      }
+      final grade = tracker.gradeFor('d0')!;
+      // activeIntervals >= 10, so the grade is measured even
+      // though loss was never observed.
+      expect(grade.isPrior, isFalse);
+      expect(grade.bandwidthScore, 100);
+      expect(grade.lossScore, isNull);
+      // Latency 100 + bandwidth 100 → 100.
+      expect(grade.total, 100);
+    });
+
+    test('a measured grade is never a prior', () {
+      final tracker = TransportGradeTracker();
+      for (var i = 0; i < 12; i++) {
+        tracker.record(
+          tstatusWith(paths: [tpath(rtt: 40, lost: 10 * i, sent: 1000 * i)]),
+          t0.add(Duration(seconds: i)),
+        );
+      }
+      final grade = tracker.gradeFor('d0')!;
+      expect(grade.isPrior, isFalse);
+      expect(grade.total, 96);
     });
   });
 }

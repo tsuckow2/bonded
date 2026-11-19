@@ -98,6 +98,19 @@ class TransportGradeDetail extends StatelessWidget {
         _componentRow('Stability', grade.stabilityScore, grade.stabilityDetail),
         _componentRow('Loss', grade.lossScore, grade.lossDetail),
         _componentRow('Bandwidth', grade.bandwidthScore, grade.bandwidthDetail),
+        if (grade.isPrior) ...[
+          const SizedBox(height: 8),
+          Text(
+            'Not enough data yet — graded 99 so this transport gets '
+            'tried. The grade becomes measured once it carries '
+            'traffic.',
+            style: TextStyle(
+              fontSize: 12,
+              fontStyle: FontStyle.italic,
+              color: Colors.grey[600],
+            ),
+          ),
+        ],
         const SizedBox(height: 8),
         Text(
           'Based on ${grade.sampleCount} samples over '

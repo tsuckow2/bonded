@@ -33,6 +33,22 @@ const _sparseGrade = TransportGrade(
   sampleCount: 20,
 );
 
+const _priorGrade = TransportGrade(
+  total: 99,
+  letter: 'A',
+  latencyScore: 50,
+  stabilityScore: null,
+  lossScore: null,
+  bandwidthScore: null,
+  latencyDetail: 'median 200–350 ms',
+  stabilityDetail: null,
+  lossDetail: null,
+  bandwidthDetail: null,
+  sampledFor: Duration(seconds: 20),
+  sampleCount: 20,
+  isPrior: true,
+);
+
 void main() {
   testWidgets('chip shows the letter and score', (WidgetTester tester) async {
     await tester.pumpWidget(
@@ -87,5 +103,48 @@ void main() {
     expect(find.text('Cellular grade'), findsOneWidget);
     expect(find.textContaining('median ≤ 50 ms'), findsOneWidget);
     expect(find.text('— not enough data yet'), findsNWidgets(3));
+  });
+
+  testWidgets('detail for a prior grade explains the 99', (
+    WidgetTester tester,
+  ) async {
+    await tester.pumpWidget(
+      const MaterialApp(
+        home: Scaffold(
+          body: TransportGradeDetail(label: 'Peer abcdef12', grade: _priorGrade),
+        ),
+      ),
+    );
+    await tester.pump();
+
+    expect(find.text('Peer abcdef12 grade'), findsOneWidget);
+    expect(find.text('99 / 100'), findsOneWidget);
+    expect(find.textContaining('median 200–350 ms'), findsOneWidget);
+    expect(
+      find.textContaining('graded 99 so this transport gets tried'),
+      findsOneWidget,
+    );
+    expect(
+      find.textContaining('becomes measured once it carries traffic'),
+      findsOneWidget,
+    );
+  });
+
+  testWidgets('detail for a measured grade shows no prior note', (
+    WidgetTester tester,
+  ) async {
+    await tester.pumpWidget(
+      const MaterialApp(
+        home: Scaffold(
+          body: TransportGradeDetail(label: 'Wi-Fi', grade: _fullGrade),
+        ),
+      ),
+    );
+    await tester.pump();
+
+    expect(
+      find.textContaining('graded 99 so this transport gets tried'),
+      findsNothing,
+    );
   });
 }
