@@ -160,6 +160,20 @@ jobs:
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
 
+      - name: Install Npcap SDK
+        # pnet_datalink links Packet.lib on Windows, and the test
+        # binary is the first thing that actually links (the library
+        # build never links, so `cargo build` passes without it).
+        # The stock runner has no Packet.lib, so fetch the SDK and
+        # point the linker at it. Packet.lib is located dynamically
+        # in case the zip's top-level folder name changes.
+        run: |
+          Invoke-WebRequest -Uri "https://npcap.com/dist/npcap-sdk-1.13.zip" -OutFile "$env:TEMP\npcap-sdk.zip"
+          Expand-Archive -Path "$env:TEMP\npcap-sdk.zip" -DestinationPath "$env:TEMP\npcap-sdk" -Force
+          $packetLib = Get-ChildItem -Path "$env:TEMP\npcap-sdk" -Recurse -Filter "Packet.lib" | Select-Object -First 1
+          if (-not $packetLib) { throw "Packet.lib not found in Npcap SDK" }
+          "RUSTFLAGS=-L native=$($packetLib.DirectoryName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
       # First slice of the Windows desktop work (codingwell/bonded#1):
       # does the Rust core build and do its tests pass on a native
       # Windows runner? The Linux cross-compile attempt
