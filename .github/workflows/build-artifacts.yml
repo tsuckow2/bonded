@@ -214,6 +214,21 @@ jobs:
       # (x86_64-pc-windows-gnu) stopped at the C toolchain before any
       # Rust code was type-checked, so the real porting surface is
       # still unmeasured. This job measures it natively.
+      #
+      # WINDOWS BASELINE (run 44652533178, 2026-11-20): the core
+      # builds, and 112/117 tests pass. The 5 failures are
+      # environmental, matching the Linux sandbox baseline pattern:
+      # 4 are the same network-dependent QUIC/WSS tests that fail in
+      # the Linux sandbox (peer_listener reversed_introduction +
+      # signed_introduction, client_integration
+      # mixed_websocket_quic_failover + multipath_can_mix_websocket
+      # _and_naive_tcp — all "closed by peer" / "deadline elapsed"),
+      # and 1 is interfaces_can_be_enumerated (pnet_datalink returns
+      # no interfaces because the Npcap driver is not installed —
+      # only its DLLs are present). The h3 QUIC tests pass on
+      # Windows, so QUIC itself works; the 4 failures are a
+      # TLS/handshake investigation for the desktop work, not a
+      # build problem.
       - name: Build bonded-client
         run: cargo build -p bonded-client
 
