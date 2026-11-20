@@ -176,6 +176,14 @@ jobs:
           if (-not $packetLib) { throw "Packet.lib (x64) not found in Npcap SDK" }
           "RUSTFLAGS=-L native=$($packetLib.DirectoryName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
+      - name: Install Npcap runtime
+        # The SDK only provides Packet.lib (the import library) for
+        # linking. At runtime the test binary needs Packet.dll, which
+        # comes from the Npcap runtime — without it the test process
+        # fails to start with 0xc0000135 STATUS_DLL_NOT_FOUND.
+        # Chocolatey is preinstalled on windows-latest.
+        run: choco install npcap -y
+
       # First slice of the Windows desktop work (codingwell/bonded#1):
       # does the Rust core build and do its tests pass on a native
       # Windows runner? The Linux cross-compile attempt
