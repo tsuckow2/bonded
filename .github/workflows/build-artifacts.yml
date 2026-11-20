@@ -192,10 +192,18 @@ jobs:
           & 7z x "$env:TEMP\npcap-1.90.exe" -o"$env:TEMP\npcap-extract" -y | Out-Null
           $dllDir = "$env:TEMP\npcap-dlls"
           New-Item -ItemType Directory -Path $dllDir -Force | Out-Null
+          # Pick the x64 DLL by PE machine type (0x8664), not by folder
+          # name — the extracted layout has no reliable 'x64' in the
+          # path, and the x86 DLL produces 0xc000007b in the x64
+          # test binary.
+          function Get-DllMachine($path) {
+            $bytes = [System.IO.File]::ReadAllBytes($path)
+            $peOffset = [BitConverter]::ToInt32($bytes, 0x3C)
+            return [BitConverter]::ToUInt16($bytes, $peOffset + 4)
+          }
           foreach ($name in @("Packet.dll", "wpcap.dll")) {
-            $dll = Get-ChildItem -Path "$env:TEMP\npcap-extract" -Recurse -Filter $name | Where-Object { $_.FullName -match 'x64' } | Select-Object -First 1
-            if (-not $dll) { $dll = Get-ChildItem -Path "$env:TEMP\npcap-extract" -Recurse -Filter $name | Select-Object -First 1 }
-            if (-not $dll) { throw "$name not found in Npcap installer" }
+            $dll = Get-ChildItem -Path "$env:TEMP\npcap-extract" -Recurse -Filter $name | Where-Object { (Get-DllMachine $_.FullName) -eq 0x8664 } | Select-Object -First 1
+            if (-not $dll) { throw "$name (x64) not found in Npcap installer" }
             Copy-Item $dll.FullName $dllDir
           }
           $dllDir | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
