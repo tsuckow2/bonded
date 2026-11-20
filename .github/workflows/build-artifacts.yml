@@ -181,8 +181,11 @@ jobs:
         # linking. At runtime the test binary needs Packet.dll, which
         # comes from the Npcap runtime — without it the test process
         # fails to start with 0xc0000135 STATUS_DLL_NOT_FOUND.
-        # Chocolatey is preinstalled on windows-latest.
-        run: choco install npcap -y
+        # (No `npcap` package exists on the Chocolatey community
+        # feed, so install the official installer silently instead.)
+        run: |
+          Invoke-WebRequest -Uri "https://npcap.com/dist/npcap-1.90.exe" -OutFile "$env:TEMP\npcap-1.90.exe"
+          Start-Process -FilePath "$env:TEMP\npcap-1.90.exe" -ArgumentList "/S" -Wait
 
       # First slice of the Windows desktop work (codingwell/bonded#1):
       # does the Rust core build and do its tests pass on a native
