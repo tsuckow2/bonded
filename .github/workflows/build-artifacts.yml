@@ -165,13 +165,15 @@ jobs:
         # binary is the first thing that actually links (the library
         # build never links, so `cargo build` passes without it).
         # The stock runner has no Packet.lib, so fetch the SDK and
-        # point the linker at it. Packet.lib is located dynamically
-        # in case the zip's top-level folder name changes.
+        # point the linker at it. The SDK ships both x86 and x64
+        # Packet.lib files; the x64 one (Lib\x64) is required or the
+        # link fails with LNK4272 (machine-type conflict) and
+        # unresolved Packet* symbols.
         run: |
           Invoke-WebRequest -Uri "https://npcap.com/dist/npcap-sdk-1.13.zip" -OutFile "$env:TEMP\npcap-sdk.zip"
           Expand-Archive -Path "$env:TEMP\npcap-sdk.zip" -DestinationPath "$env:TEMP\npcap-sdk" -Force
-          $packetLib = Get-ChildItem -Path "$env:TEMP\npcap-sdk" -Recurse -Filter "Packet.lib" | Select-Object -First 1
-          if (-not $packetLib) { throw "Packet.lib not found in Npcap SDK" }
+          $packetLib = Get-ChildItem -Path "$env:TEMP\npcap-sdk" -Recurse -Filter "Packet.lib" | Where-Object { $_.DirectoryName -match 'x64$' } | Select-Object -First 1
+          if (-not $packetLib) { throw "Packet.lib (x64) not found in Npcap SDK" }
           "RUSTFLAGS=-L native=$($packetLib.DirectoryName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       # First slice of the Windows desktop work (codingwell/bonded#1):
