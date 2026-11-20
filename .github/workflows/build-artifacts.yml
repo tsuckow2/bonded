@@ -181,11 +181,24 @@ jobs:
         # linking. At runtime the test binary needs Packet.dll, which
         # comes from the Npcap runtime — without it the test process
         # fails to start with 0xc0000135 STATUS_DLL_NOT_FOUND.
-        # (No `npcap` package exists on the Chocolatey community
-        # feed, so install the official installer silently instead.)
+        # The official installer hangs in silent mode on this runner
+        # (stuck >10 min at the driver install), so instead of
+        # running it, extract Packet.dll/wpcap.dll from it with 7-Zip
+        # (preinstalled) and put them on PATH. The DLLs only need to
+        # be loadable; the driver itself is not required for the
+        # test binary to start.
         run: |
           Invoke-WebRequest -Uri "https://npcap.com/dist/npcap-1.90.exe" -OutFile "$env:TEMP\npcap-1.90.exe"
-          Start-Process -FilePath "$env:TEMP\npcap-1.90.exe" -ArgumentList "/S" -Wait
+          & 7z x "$env:TEMP\npcap-1.90.exe" -o"$env:TEMP\npcap-extract" -y | Out-Null
+          $dllDir = "$env:TEMP\npcap-dlls"
+          New-Item -ItemType Directory -Path $dllDir -Force | Out-Null
+          foreach ($name in @("Packet.dll", "wpcap.dll")) {
+            $dll = Get-ChildItem -Path "$env:TEMP\npcap-extract" -Recurse -Filter $name | Where-Object { $_.FullName -match 'x64' } | Select-Object -First 1
+            if (-not $dll) { $dll = Get-ChildItem -Path "$env:TEMP\npcap-extract" -Recurse -Filter $name | Select-Object -First 1 }
+            if (-not $dll) { throw "$name not found in Npcap installer" }
+            Copy-Item $dll.FullName $dllDir
+          }
+          $dllDir | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
 
       # First slice of the Windows desktop work (codingwell/bonded#1):
       # does the Rust core build and do its tests pass on a native
