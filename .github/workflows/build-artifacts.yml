@@ -143,3 +143,31 @@ jobs:
           path: android/build/app/outputs/flutter-apk/app-debug.apk
           if-no-files-found: error
           retention-days: 7
+
+  windows-core:
+    name: Windows Rust Core Build
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.88.0
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      # First slice of the Windows desktop work (codingwell/bonded#1):
+      # does the Rust core build and do its tests pass on a native
+      # Windows runner? The Linux cross-compile attempt
+      # (x86_64-pc-windows-gnu) stopped at the C toolchain before any
+      # Rust code was type-checked, so the real porting surface is
+      # still unmeasured. This job measures it natively.
+      - name: Build bonded-client
+        run: cargo build -p bonded-client
+
+      - name: Test bonded-client
+        run: cargo test -p bonded-client
