@@ -308,3 +308,22 @@ jobs:
       - name: Test bonded-ffi
         if: always()
         run: cargo test -p bonded-ffi
+
+      # Third slice of the macOS desktop work (plan row 4.97): build
+      # the Xcode project (app + PacketTunnelProvider extension) and
+      # link it against the Rust FFI staticlib built above. Unsigned
+      # (no Developer account on the runner): CODE_SIGNING_ALLOWED=NO.
+      # The staticlib is self-contained apart from system libraries:
+      # rustc's staticlib step merges the aws-lc/ring C objects into
+      # the archive, so the Xcode link needs only libSystem plus the
+      # NetworkExtension framework (and libpcap, for pnet_datalink's
+      # macOS backend). No live tunnel can be tested on a CI runner
+      # (it cannot load a NetworkExtension tunnel) — this step is a
+      # compile + link check only.
+      - name: Build macOS app + PacketTunnelProvider (unsigned)
+        if: always()
+        run: |
+          test -f target/debug/libbonded_ffi.a
+          xcodebuild -project macos/Bonded.xcodeproj \
+            -target Bonded -configuration Debug \
+            CODE_SIGNING_ALLOWED=NO build
