@@ -251,13 +251,15 @@ jobs:
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
 
-      - name: Add 127.0.0.2 loopback alias
-        # Two bind-awareness tests dial from 127.0.0.2 as a second local
-        # address. Linux treats the whole 127/8 range as loopback, so it
-        # binds there out of the box; macOS only configures 127.0.0.1,
-        # and binding 127.0.0.2 fails with EADDRNOTAVAIL (os error 49).
-        # The alias is a standard loopback configuration for the job.
-        run: sudo ifconfig lo0 alias 127.0.0.2 up
+      - name: Add 127.0.0.2/127.0.0.3 loopback aliases
+        # Bind-awareness tests dial from 127.0.0.2 and 127.0.0.3 as
+        # second/third local addresses (bonded-client's two bind tests
+        # use .2; bonded-ffi's two-path session tests use .2 + .3).
+        # Linux treats the whole 127/8 range as loopback, so they bind
+        # out of the box; macOS only configures 127.0.0.1, and binding
+        # the others fails with EADDRNOTAVAIL (os error 49). The aliases
+        # are a standard loopback configuration for the job.
+        run: sudo ifconfig lo0 alias 127.0.0.2 up && sudo ifconfig lo0 alias 127.0.0.3 up
 
       # Second slice of the macOS desktop work (plan row 4.96): does
       # the Rust core build and do its tests pass on a native macOS
