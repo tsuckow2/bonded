@@ -328,7 +328,7 @@ final class TunnelManager: ObservableObject {
     /// previous snapshot in place.
     private func pollSnapshot() {
         guard let session = manager?.connection as? NETunnelProviderSession else { return }
-        session.sendProviderMessage(Data("snapshot".utf8)) { [weak self] data in
+        try? session.sendProviderMessage(Data("snapshot".utf8)) { [weak self] data in
             guard
                 let self = self,
                 let data = data,
