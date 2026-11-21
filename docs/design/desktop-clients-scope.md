@@ -85,6 +85,20 @@ The Flutter macOS runner + `dart:ffi` core + utun is the smallest
 credible macOS slice. The NetworkExtension shape is a second slice if
 the App Store matters.
 
+**DECISION (Tom, 2026-11-20): PacketTunnelProvider, App Store path.**
+The plain app + utun option is NOT App Store-viable (sandboxed apps
+cannot open `/dev/utun` or change routes; only the NetworkExtension
+entitlement lets the system build the tunnel). Plan rows 4.94–4.98 in
+`docs/design/implementation-plan.md` carry the slices: 4.95 C-ABI FFI
+(shared with Windows), 4.96 macOS core build + test baseline on CI,
+4.97 PacketTunnelProvider skeleton + plumbing, 4.98 app UI + store
+packaging. Open: peer sharing on day one vs single-device v1; is
+there a Mac for live tunnel testing. Note: the "rely on GitHub agents"
+direction in the Next steps below is SUPERSEDED — Tom reversed it
+2026-11-19 ("I don't want you to use GitHub agents. Write the PR
+yourself"). Desktop work is written directly by the assistant; CI
+runners (macos-latest) are the build/test host, not agents.
+
 ## Next steps (in order)
 
 1. **Rust core cross-compile check** (Linux-verifiable): add the
