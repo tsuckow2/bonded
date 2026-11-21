@@ -1744,6 +1744,9 @@ fn start_android_session(
             // themselves land in the ring for the next upload).
             #[cfg(target_os = "android")]
             if config.client.diagnostics_upload_enabled {
+                // Restored: 4.95 removed this binding as dead, but the
+                // Android-only use below still needs it (E0425 on Android).
+                let diagnostics_client_build = _app_version_code.to_string();
                 let _diagnostics_task = bonded_client::diagnostics::spawn_diagnostics_uploader(
                     config.clone(),
                     diagnostics_client_build.clone(),
