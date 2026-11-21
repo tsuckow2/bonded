@@ -324,6 +324,11 @@ jobs:
         if: always()
         run: |
           test -f target/debug/libbonded_ffi.a
+          # -arch arm64: the runner is arm64 and the Rust FFI above is
+          # built for the host arch only, so a universal (arm64+x86_64)
+          # Xcode build would fail to link the x86_64 slice (no x86_64
+          # FFI symbols). A universal FFI (lipo) is a packaging step
+          # for later, not part of this build check.
           xcodebuild -project macos/Bonded.xcodeproj \
-            -target Bonded -configuration Debug \
+            -target Bonded -configuration Debug -arch arm64 \
             CODE_SIGNING_ALLOWED=NO build
