@@ -3,9 +3,10 @@ use bonded_core::config::SocketProtectFn;
 use bonded_core::peer_share::{PeerRelayRegistration, SignedPeerShareIntroduction};
 use bonded_core::transport::{QuicTransport, Transport};
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::select;
 
@@ -316,6 +317,20 @@ async fn dial_peer_relay(
     }
 }
 
+/// Per-consumer relay byte counters for one peer this device serves
+/// as provider for. One entry per consumer device key, shared by all
+/// legs that consumer holds (one per provider path). The pump bumps
+/// these alongside the aggregate [`PeerShareRelayStats`] counters so
+/// the app can show one row per served peer with its traffic, instead
+/// of only the aggregate "Relayed for others" totals.
+#[derive(Debug, Default)]
+pub struct RelayedPeerCounters {
+    /// Bytes forwarded peer -> upstream (consumer -> server).
+    pub up_bytes: AtomicU64,
+    /// Bytes forwarded upstream -> peer (server -> consumer).
+    pub down_bytes: AtomicU64,
+}
+
 /// Aggregate bytes relayed for other consumers while this phone acts
 /// as a peer-share provider. One shared instance covers all relay legs
 /// (a consumer with several provider paths holds several legs); the
@@ -336,6 +351,63 @@ pub struct PeerShareRelayStats {
     pub relay_tasks_started: AtomicU64,
     /// Relay pump tasks ended (pump returned normally or on error).
     pub relay_tasks_ended: AtomicU64,
+    /// Per-consumer relay counters, keyed by consumer device key.
+    /// One entry per peer this device is currently providing for;
+    /// the count is the live leg count for that consumer (one per
+    /// provider path the consumer holds a leg on). `run_relay_task`
+    /// registers its consumer on start and releases it on end, so
+    /// the map holds exactly the active provider legs. The pump
+    /// bumps the entry's counters alongside the aggregates above.
+    pub relayed_peers: Mutex<HashMap<String, (Arc<RelayedPeerCounters>, usize)>>,
+}
+
+impl PeerShareRelayStats {
+    /// Counters for `consumer_key`, creating the entry when absent
+    /// and counting one more live leg for that consumer. Called by
+    /// `run_relay_task` on start; all legs that consumer holds share
+    /// the one entry, so a consumer with several provider paths gets
+    /// a single row with its combined traffic.
+    pub fn counters_for_consumer(&self, consumer_key: &str) -> Arc<RelayedPeerCounters> {
+        let mut peers = self.relayed_peers.lock().expect("relayed peers lock poisoned");
+        let entry = peers
+            .entry(consumer_key.to_owned())
+            .or_insert_with(|| (Arc::new(RelayedPeerCounters::default()), 0));
+        entry.1 += 1;
+        Arc::clone(&entry.0)
+    }
+
+    /// Release one live leg for `consumer_key`. Called by
+    /// `run_relay_task` when the task ends (next to the path-claim
+    /// release). The entry is removed only when the last leg for
+    /// that consumer ends, so a second leg keeps the peer visible.
+    pub fn release_consumer(&self, consumer_key: &str) {
+        let mut peers = self.relayed_peers.lock().expect("relayed peers lock poisoned");
+        if let Some((_, legs)) = peers.get_mut(consumer_key) {
+            *legs = legs.saturating_sub(1);
+            if *legs == 0 {
+                peers.remove(consumer_key);
+            }
+        }
+    }
+
+    /// Snapshot of the peers this device is currently providing for:
+    /// `(consumer key, up bytes, down bytes)`, sorted by key for a
+    /// stable snapshot order. Read live at snapshot serialization.
+    pub fn relayed_peers_snapshot(&self) -> Vec<(String, u64, u64)> {
+        let peers = self.relayed_peers.lock().expect("relayed peers lock poisoned");
+        let mut out: Vec<(String, u64, u64)> = peers
+            .iter()
+            .map(|(key, (counters, _))| {
+                (
+                    key.clone(),
+                    counters.up_bytes.load(Ordering::Relaxed),
+                    counters.down_bytes.load(Ordering::Relaxed),
+                )
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
 }
 
 /// Outcome of dialing a peer relay: either the provider accepted the
@@ -444,6 +516,7 @@ pub async fn relay_peer_frames<A, B>(
     peer: &mut A,
     upstream: &mut B,
     stats: &PeerShareRelayStats,
+    per_peer: Option<&RelayedPeerCounters>,
 ) -> anyhow::Result<()>
 where
     A: Transport,
@@ -467,6 +540,9 @@ where
                     return Err(e.into());
                 }
                 stats.relayed_up_bytes.fetch_add(len, Ordering::Relaxed);
+                if let Some(counters) = per_peer {
+                    counters.up_bytes.fetch_add(len, Ordering::Relaxed);
+                }
             }
             upstream_frame = upstream.recv() => {
                 let frame = match upstream_frame {
@@ -483,6 +559,9 @@ where
                     return Err(e.into());
                 }
                 stats.relayed_down_bytes.fetch_add(len, Ordering::Relaxed);
+                if let Some(counters) = per_peer {
+                    counters.down_bytes.fetch_add(len, Ordering::Relaxed);
+                }
             }
         }
     }
@@ -529,11 +608,14 @@ impl PeerRelayRateLimiter {
 /// applied in both directions. Successfully forwarded payload bytes are
 /// counted into `stats` (up = consumer -> server, down = server ->
 /// consumer) so the app can show what others used through this phone.
+/// When `per_peer` is set, the same bytes are also counted into that
+/// consumer's entry, so the app can show one row per served peer.
 pub async fn relay_peer_frames_rate_limited<A, B>(
     peer: &mut A,
     upstream: &mut B,
     limiter: &mut PeerRelayRateLimiter,
     stats: &PeerShareRelayStats,
+    per_peer: Option<&RelayedPeerCounters>,
 ) -> anyhow::Result<()>
 where
     A: Transport,
@@ -558,6 +640,9 @@ where
                     return Err(e.into());
                 }
                 stats.relayed_up_bytes.fetch_add(len as u64, Ordering::Relaxed);
+                if let Some(counters) = per_peer {
+                    counters.up_bytes.fetch_add(len as u64, Ordering::Relaxed);
+                }
             }
             upstream_frame = upstream.recv() => {
                 let frame = match upstream_frame {
@@ -574,6 +659,9 @@ where
                     return Err(e.into());
                 }
                 stats.relayed_down_bytes.fetch_add(len as u64, Ordering::Relaxed);
+                if let Some(counters) = per_peer {
+                    counters.down_bytes.fetch_add(len as u64, Ordering::Relaxed);
+                }
             }
         }
     }
@@ -626,7 +714,7 @@ mod tests {
         verify_consumer_introduction, verify_provider_introduction,
         verify_reversed_introduction_for_dialer, verify_reversed_introduction_for_listener,
         AcceptedPeerRelay, PeerListenerIdentity, PeerRelayDial, PeerRelayRateLimiter,
-        PeerShareRelayStats, RelayAcceptVerdict,
+        PeerShareRelayStats, RelayAcceptVerdict, RelayedPeerCounters,
     };
     use bonded_core::auth::{sign_bytes, DeviceKeypair};
     use bonded_core::peer_share::{
@@ -1383,7 +1471,7 @@ mod tests {
             let relay_stats = PeerShareRelayStats::default();
             let relay_result = timeout(
                 Duration::from_secs(5),
-                relay_peer_frames(&mut peer, &mut upstream, &relay_stats),
+                relay_peer_frames(&mut peer, &mut upstream, &relay_stats, None),
             )
             .await
             .expect("relay loop should stay active during exchange");
@@ -1456,7 +1544,7 @@ mod tests {
         let pump_stats = Arc::clone(&stats);
         let mut limiter = PeerRelayRateLimiter::unlimited();
         let pump = tokio::spawn(async move {
-            relay_peer_frames_rate_limited(&mut peer, &mut upstream, &mut limiter, &pump_stats)
+            relay_peer_frames_rate_limited(&mut peer, &mut upstream, &mut limiter, &pump_stats, None)
                 .await
         });
 
@@ -1511,6 +1599,110 @@ mod tests {
         assert!(pump_result.is_err(), "pump should end once channels close");
         assert_eq!(stats.relayed_up_bytes.load(Ordering::Relaxed), 19);
         assert_eq!(stats.relayed_down_bytes.load(Ordering::Relaxed), 18);
+    }
+
+    #[tokio::test]
+    async fn relay_pump_counts_per_consumer_bytes_and_snapshot() {
+        // Two consumers registered; only the first one's leg pumps.
+        // The pump must count the same bytes into the aggregate AND
+        // into that consumer's entry, leave the other consumer at
+        // zero, and the snapshot must list both (sorted) until each
+        // leg is released. This is the provider-side visibility data
+        // for the Paths card: one row per served peer.
+        let stats = Arc::new(PeerShareRelayStats::default());
+        let counters_a = stats.counters_for_consumer("consumer-a");
+        let counters_b = stats.counters_for_consumer("consumer-b");
+        // A second leg for the same consumer shares the entry.
+        let counters_a2 = stats.counters_for_consumer("consumer-a");
+        assert!(Arc::ptr_eq(&counters_a, &counters_a2));
+
+        let (mut peer, mut peer_control) = MockTransport::new(TransportKind::Quic);
+        let (mut upstream, mut upstream_control) =
+            MockTransport::new(TransportKind::NaiveTcp);
+        let pump_stats = Arc::clone(&stats);
+        let pump_counters = Arc::clone(&counters_a);
+        let mut limiter = PeerRelayRateLimiter::unlimited();
+        let pump = tokio::spawn(async move {
+            relay_peer_frames_rate_limited(
+                &mut peer,
+                &mut upstream,
+                &mut limiter,
+                &pump_stats,
+                Some(&pump_counters),
+            )
+            .await
+        });
+
+        peer_control
+            .send_inbound(SessionFrame {
+                header: SessionHeader {
+                    connection_id: 1,
+                    sequence: 0,
+                    flags: 0,
+                },
+                payload: Bytes::from_static(b"forward-to-upstream"),
+            })
+            .expect("peer should accept injected frame");
+        let forwarded = timeout(Duration::from_secs(5), upstream_control.recv_sent())
+            .await
+            .expect("upstream recv should not time out")
+            .expect("upstream should receive forwarded frame");
+        assert_eq!(
+            forwarded.payload,
+            Bytes::from_static(b"forward-to-upstream")
+        );
+
+        upstream_control
+            .send_inbound(SessionFrame {
+                header: SessionHeader {
+                    connection_id: 1,
+                    sequence: 1,
+                    flags: 0,
+                },
+                payload: Bytes::from_static(b"return-to-consumer"),
+            })
+            .expect("upstream should accept injected reply frame");
+        let response = timeout(Duration::from_secs(5), peer_control.recv_sent())
+            .await
+            .expect("peer recv should not time out")
+            .expect("peer should receive relayed reply frame");
+        assert_eq!(response.payload, Bytes::from_static(b"return-to-consumer"));
+
+        assert_eq!(stats.relayed_up_bytes.load(Ordering::Relaxed), 19);
+        assert_eq!(stats.relayed_down_bytes.load(Ordering::Relaxed), 18);
+        assert_eq!(counters_a.up_bytes.load(Ordering::Relaxed), 19);
+        assert_eq!(counters_a.down_bytes.load(Ordering::Relaxed), 18);
+        assert_eq!(counters_b.up_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(counters_b.down_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            stats.relayed_peers_snapshot(),
+            vec![
+                ("consumer-a".to_owned(), 19, 18),
+                ("consumer-b".to_owned(), 0, 0),
+            ]
+        );
+
+        // Releasing one of consumer-a's two legs keeps the entry
+        // (the second leg still holds it); releasing the last leg
+        // removes it. Releasing a consumer with no legs is a no-op.
+        stats.release_consumer("consumer-a");
+        assert_eq!(stats.relayed_peers_snapshot().len(), 2);
+        stats.release_consumer("consumer-a");
+        assert_eq!(
+            stats.relayed_peers_snapshot(),
+            vec![("consumer-b".to_owned(), 0, 0)]
+        );
+        stats.release_consumer("consumer-b");
+        assert!(stats.relayed_peers_snapshot().is_empty());
+        stats.release_consumer("consumer-b");
+
+        drop(peer_control);
+        drop(upstream_control);
+        let pump_result = timeout(Duration::from_secs(5), pump)
+            .await
+            .expect("pump should stop")
+            .expect("pump task should join");
+        assert!(pump_result.is_err(), "pump should end once channels close");
     }
 
     #[test]

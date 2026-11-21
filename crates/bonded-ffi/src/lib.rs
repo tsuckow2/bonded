@@ -939,8 +939,28 @@ fn snapshot_json(snapshot: &AndroidSessionSnapshot) -> String {
         .collect::<Vec<_>>()
         .join(",");
 
+    /// Peers this device is currently providing for (4.91): one
+    /// entry per served consumer with its relayed byte totals, so
+    /// the app can show one row per peer on the Paths card instead
+    /// of only the aggregate "Relayed for others" totals. Empty
+    /// when peer-share never provided.
+    let relayed_peers = snapshot
+        .relay_stats
+        .relayed_peers_snapshot()
+        .iter()
+        .map(|(peer_id, up_bytes, down_bytes)| {
+            format!(
+                "{{\"peerId\":\"{}\",\"upBytes\":{},\"downBytes\":{}}}",
+                escape_json(peer_id),
+                up_bytes,
+                down_bytes,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+
     format!(
-        "{{\"state\":\"{}\",\"serverAddress\":\"{}\",\"activeTransport\":\"{}\",\"transportCount\":{},\"peerRelayCount\":{},\"outboundPackets\":{},\"inboundPackets\":{},\"outboundBytes\":{},\"inboundBytes\":{},\"relayedUpBytes\":{},\"relayedDownBytes\":{},\"heartbeatPingsSent\":{},\"supervisorRedialAttempts\":{},\"relayTasksStarted\":{},\"relayTasksEnded\":{},\"connectedAtMs\":{},\"lastError\":{},\"peerShareError\":{},\"interception\":{},\"paths\":[{}]}}",
+        "{{\"state\":\"{}\",\"serverAddress\":\"{}\",\"activeTransport\":\"{}\",\"transportCount\":{},\"peerRelayCount\":{},\"outboundPackets\":{},\"inboundPackets\":{},\"outboundBytes\":{},\"inboundBytes\":{},\"relayedUpBytes\":{},\"relayedDownBytes\":{},\"relayedPeers\":[{}],\"heartbeatPingsSent\":{},\"supervisorRedialAttempts\":{},\"relayTasksStarted\":{},\"relayTasksEnded\":{},\"connectedAtMs\":{},\"lastError\":{},\"peerShareError\":{},\"interception\":{},\"paths\":[{}]}}",
         escape_json(&snapshot.state),
         escape_json(&snapshot.server_address),
         escape_json(&snapshot.active_transport),
@@ -958,6 +978,7 @@ fn snapshot_json(snapshot: &AndroidSessionSnapshot) -> String {
             .relay_stats
             .relayed_down_bytes
             .load(Ordering::Relaxed),
+        relayed_peers,
         snapshot
             .wakeup_stats
             .heartbeat_pings_sent

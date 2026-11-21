@@ -605,6 +605,11 @@ async fn run_relay_task(
     relay_stats
         .relay_tasks_started
         .fetch_add(1, Ordering::Relaxed);
+    // Provider-side visibility (4.91): register this consumer's
+    // per-peer counters so the app can show one row per served peer
+    // on the Paths card. All legs this consumer holds share the one
+    // entry; it is released below when the task ends.
+    let peer_counters = relay_stats.counters_for_consumer(&consumer_key);
     // Resilience: if the upstream (provider->server) connection fails,
     // re-establish it instead of terminating the relay permanently.
     // The peer (consumer->provider QUIC) connection is kept alive
@@ -664,6 +669,7 @@ async fn run_relay_task(
                 &mut upstream,
                 &mut limiter,
                 &relay_stats,
+                Some(&peer_counters),
             )
             .await
             {
@@ -694,12 +700,15 @@ async fn run_relay_task(
     relay_count.fetch_sub(1, Ordering::SeqCst);
     // Release the path claim (a no-op when a newer leg has
     // already taken the path over) so the path is claimable
-    // by the consumer's next dial.
+    // by the consumer's next dial. Release this leg's hold on
+    // the consumer's per-peer counters alongside it: the entry
+    // stays while another leg for the same consumer is live.
     relay_claims.lock().expect("relay path claims lock poisoned").release(
         &consumer_key,
         claimed_index,
         introduction_expires_at,
     );
+    relay_stats.release_consumer(&consumer_key);
     match result {
         Ok(()) => {
             emit_peer_share_event(

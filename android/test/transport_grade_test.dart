@@ -41,6 +41,7 @@ SessionStatus tstatusWith({
   inboundBytes: 0,
   relayedUpBytes: 0,
   relayedDownBytes: 0,
+  relayedPeers: const [],
   heartbeatPingsSent: 0,
   relayTasksStarted: 0,
   relayTasksEnded: 0,

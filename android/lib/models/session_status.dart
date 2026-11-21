@@ -159,6 +159,34 @@ class InterceptionInfo {
   }
 }
 
+/// One peer this device is serving as a peer-share provider for
+/// (4.91): consumer device key + relayed byte totals (up = consumer
+/// -> server, down = server -> consumer). One entry per served peer;
+/// a consumer with several provider paths holds one entry with its
+/// combined traffic. The provider side of a leg is never a transport,
+/// so these peers never appear in [SessionStatus.peerTransports] —
+/// this list is how they show on the Paths card.
+class RelayedPeer {
+  /// Consumer device key (base64).
+  final String peerId;
+  final int upBytes;
+  final int downBytes;
+
+  const RelayedPeer({
+    required this.peerId,
+    required this.upBytes,
+    required this.downBytes,
+  });
+
+  factory RelayedPeer.fromMap(Map<dynamic, dynamic> map) {
+    return RelayedPeer(
+      peerId: map['peerId'] as String? ?? '',
+      upBytes: (map['upBytes'] as num?)?.toInt() ?? 0,
+      downBytes: (map['downBytes'] as num?)?.toInt() ?? 0,
+    );
+  }
+}
+
 class SessionStatus {
   final String state; // connecting | connected | error | stopped | …
   final String serverAddress;
@@ -171,6 +199,10 @@ class SessionStatus {
   /// up = consumer -> server, down = server -> consumer.
   final int relayedUpBytes;
   final int relayedDownBytes;
+  /// Peers this device is currently providing for (4.91): one
+  /// entry per served consumer. Empty when peer-share never
+  /// provided.
+  final List<RelayedPeer> relayedPeers;
   /// Session heartbeat PINGs sent by the native worker (all paths,
   /// all ticks). Wakeup accounting for the battery profiler.
   final int heartbeatPingsSent;
@@ -197,6 +229,7 @@ class SessionStatus {
     required this.inboundBytes,
     required this.relayedUpBytes,
     required this.relayedDownBytes,
+    required this.relayedPeers,
     required this.heartbeatPingsSent,
     required this.relayTasksStarted,
     required this.relayTasksEnded,
@@ -220,6 +253,7 @@ class SessionStatus {
     inboundBytes: 0,
     relayedUpBytes: 0,
     relayedDownBytes: 0,
+    relayedPeers: [],
     heartbeatPingsSent: 0,
     relayTasksStarted: 0,
     relayTasksEnded: 0,
@@ -250,6 +284,10 @@ class SessionStatus {
       inboundBytes: (map['inboundBytes'] as num?)?.toInt() ?? 0,
       relayedUpBytes: (map['relayedUpBytes'] as num?)?.toInt() ?? 0,
       relayedDownBytes: (map['relayedDownBytes'] as num?)?.toInt() ?? 0,
+      relayedPeers: (map['relayedPeers'] as List? ?? const [])
+          .map((e) => RelayedPeer.fromMap(Map<dynamic, dynamic>.from(e as Map)))
+          .where((peer) => peer.peerId.isNotEmpty)
+          .toList(),
       heartbeatPingsSent: (map['heartbeatPingsSent'] as num?)?.toInt() ?? 0,
       relayTasksStarted: (map['relayTasksStarted'] as num?)?.toInt() ?? 0,
       relayTasksEnded: (map['relayTasksEnded'] as num?)?.toInt() ?? 0,

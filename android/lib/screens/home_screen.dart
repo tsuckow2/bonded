@@ -60,6 +60,13 @@ class _HomeScreenState extends State<HomeScreen> {
   double _relayedUpRate = 0;
   double _relayedDownRate = 0;
 
+  // Live per-served-peer rates (4.91), sampled the same way as the
+  // aggregate above: latest 1s delta of each served peer's relayed
+  // totals, keyed by peer id. Reset with the own-rate state below;
+  // a peer that leaves the snapshot drops out of both maps.
+  final Map<String, ({int up, int down})> _lastRelayedPeerBytes = {};
+  final Map<String, ({double up, double down})> _relayedPeerRates = {};
+
   // Per-transport grades (4.50): one grade per path, accumulated
   // from the same snapshot samples. No last-session retention —
   // grades belong to the live paths.
@@ -162,6 +169,8 @@ class _HomeScreenState extends State<HomeScreen> {
       _lastRelayedDownBytes = null;
       _relayedUpRate = 0;
       _relayedDownRate = 0;
+      _lastRelayedPeerBytes.clear();
+      _relayedPeerRates.clear();
       return;
     }
     if (status.connectedAtMs != _sampledConnectedAtMs) {
@@ -175,6 +184,8 @@ class _HomeScreenState extends State<HomeScreen> {
       _lastRelayedDownBytes = null;
       _relayedUpRate = 0;
       _relayedDownRate = 0;
+      _lastRelayedPeerBytes.clear();
+      _relayedPeerRates.clear();
       // New session: the transport tracker resets.
       _transportGradeTracker.beginSession(status.connectedAtMs);
     }
@@ -213,6 +224,28 @@ class _HomeScreenState extends State<HomeScreen> {
           _relayedUpRate = relayedUp < 0 ? 0 : relayedUp;
           _relayedDownRate = relayedDown < 0 ? 0 : relayedDown;
         }
+        // Per-served-peer rates (4.91): same delta math per peer.
+        // A peer that left the snapshot drops out; a new peer starts
+        // at zero until its second sample.
+        final seenPeers = <String>{};
+        for (final peer in status.relayedPeers) {
+          seenPeers.add(peer.peerId);
+          final last = _lastRelayedPeerBytes[peer.peerId];
+          if (last != null) {
+            final upRate = (peer.upBytes - last.up) / dt;
+            final downRate = (peer.downBytes - last.down) / dt;
+            _relayedPeerRates[peer.peerId] = (
+              up: upRate < 0 ? 0 : upRate,
+              down: downRate < 0 ? 0 : downRate,
+            );
+          }
+        }
+        _lastRelayedPeerBytes.removeWhere(
+          (peerId, _) => !seenPeers.contains(peerId),
+        );
+        _relayedPeerRates.removeWhere(
+          (peerId, _) => !seenPeers.contains(peerId),
+        );
       }
     }
     _lastInBytes = status.inboundBytes;
@@ -220,6 +253,9 @@ class _HomeScreenState extends State<HomeScreen> {
     _lastSampleAt = now;
     _lastRelayedUpBytes = status.relayedUpBytes;
     _lastRelayedDownBytes = status.relayedDownBytes;
+    for (final peer in status.relayedPeers) {
+      _lastRelayedPeerBytes[peer.peerId] = (up: peer.upBytes, down: peer.downBytes);
+    }
   }
 
   void _maybeAutoConnect() {
@@ -660,7 +696,8 @@ class _HomeScreenState extends State<HomeScreen> {
             _buildTotalsRow(),
             const SizedBox(height: 16),
             _buildPathsCard(),
-            if (_status.relayedUpBytes + _status.relayedDownBytes > 0) ...[
+            if (_status.relayedUpBytes + _status.relayedDownBytes > 0 ||
+                _status.relayedPeers.isNotEmpty) ...[
               const SizedBox(height: 16),
               _buildRelayedCard(),
             ],
@@ -760,10 +797,15 @@ class _HomeScreenState extends State<HomeScreen> {
   /// Aggregate bandwidth others used through this phone's paths while
   /// it acted as a peer-share provider: totals plus the live rate,
   /// same ↓/↑ orientation as the Totals row (up = toward the server,
-  /// down = toward the peer). Shown only once anything has been
-  /// relayed this session. One FocusableRow stop for the whole card,
-  /// like the graphs card, so D-pad focus can scroll it into view on
-  /// a TV without adding a stop per line.
+  /// down = toward the peer). Shown once anything has been relayed
+  /// this session, or while a peer is being served (4.91: a freshly
+  /// accepted leg with no traffic yet still names its peer). Below
+  /// the totals, one row per served peer with its identity and its
+  /// own totals + live rate — the provider side of a leg is never a
+  /// transport, so without these rows the provider sees only this
+  /// aggregate and never which peer it serves. One FocusableRow stop
+  /// for the whole card, like the graphs card, so D-pad focus can
+  /// scroll it into view on a TV without adding a stop per line.
   Widget _buildRelayedCard() {
     return FocusableRow(
       child: Card(
@@ -842,6 +884,11 @@ class _HomeScreenState extends State<HomeScreen> {
                   ),
                 ],
               ),
+              for (final peer in _status.relayedPeers)
+                _RelayedPeerRow(
+                  peer: peer,
+                  rate: _relayedPeerRates[peer.peerId],
+                ),
             ],
           ),
         ),
@@ -1157,6 +1204,60 @@ class _PathRow extends StatelessWidget {
     if (bytes < 1024) return '$bytes B';
     if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
     return '${(bytes / (1024 * 1024)).toStringAsFixed(2)} MB';
+  }
+}
+
+/// One peer this device is serving as a provider for (4.91): peer
+/// short id + its relayed totals and live rate, same ↓/↑ orientation
+/// as the Relayed card (down = toward the peer, up = toward the
+/// server). No grade: provider-side legs are not transports and are
+/// never graded — the row names the peer and shows its traffic.
+/// Lives inside the Relayed card's single focus stop, so no
+/// FocusableRow of its own.
+class _RelayedPeerRow extends StatelessWidget {
+  final RelayedPeer peer;
+
+  /// Latest 1s live rate for this peer, null until its second
+  /// sample. No rate shown while null.
+  final ({double up, double down})? rate;
+  const _RelayedPeerRow({required this.peer, this.rate});
+
+  static String _shortId(String peerId) {
+    return peerId.length > 8 ? peerId.substring(0, 8) : peerId;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final live = rate != null && (rate!.up > 0 || rate!.down > 0);
+    return Padding(
+      padding: const EdgeInsets.only(top: 12),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.center,
+        children: [
+          const Icon(Icons.people, size: 20, color: Colors.teal),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Peer ${_shortId(peer.peerId)}',
+                  style: const TextStyle(fontWeight: FontWeight.w600),
+                ),
+                Text(
+                  [
+                    '↓ ${_PathRow._bytes(peer.downBytes)} · ↑ ${_PathRow._bytes(peer.upBytes)}',
+                    if (live)
+                      '↓ ${_HomeScreenState._fmtRate(rate!.down)} · ↑ ${_HomeScreenState._fmtRate(rate!.up)}',
+                  ].join(' · '),
+                  style: TextStyle(fontSize: 12, color: Colors.grey[700]),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
   }
 }
 

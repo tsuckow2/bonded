@@ -129,4 +129,52 @@ class SessionSnapshotTest {
         assertNull(map["quicLostBytes"])
         assertNull(map["quicSentPackets"])
     }
+
+    @Test
+    fun parseRelayedPeers_readsEntries() {
+        val peers =
+                parseRelayedPeers(
+                        JSONArray(
+                                """[
+                                    {"peerId": "eNaeK60nAAA", "upBytes": 1900, "downBytes": 1800},
+                                    {"peerId": "YeZMPfbcBBB", "upBytes": 0, "downBytes": 0}
+                                ]"""
+                        )
+                )
+        assertEquals(2, peers.size)
+        assertEquals("eNaeK60nAAA", peers[0].peerId)
+        assertEquals(1900L, peers[0].upBytes)
+        assertEquals(1800L, peers[0].downBytes)
+        assertEquals("YeZMPfbcBBB", peers[1].peerId)
+        assertEquals(0L, peers[1].upBytes)
+        assertEquals(0L, peers[1].downBytes)
+    }
+
+    @Test
+    fun parseRelayedPeers_missingId_isSkipped() {
+        val peers =
+                parseRelayedPeers(
+                        JSONArray("""[{"upBytes": 5}, {"peerId": "", "upBytes": 5}, {"peerId": "ok"}]""")
+                )
+        assertEquals(1, peers.size)
+        assertEquals("ok", peers[0].peerId)
+        assertEquals(0L, peers[0].upBytes)
+        assertEquals(0L, peers[0].downBytes)
+    }
+
+    @Test
+    fun parseRelayedPeers_nullArray_returnsEmpty() {
+        assertTrue(parseRelayedPeers(null).isEmpty())
+    }
+
+    @Test
+    fun relayedPeerStatToMap_forwardsFields() {
+        val map =
+                relayedPeerStatToMap(
+                        RelayedPeerStat(peerId = "eNaeK60nAAA", upBytes = 1900, downBytes = 1800)
+                )
+        assertEquals("eNaeK60nAAA", map["peerId"])
+        assertEquals(1900L, map["upBytes"])
+        assertEquals(1800L, map["downBytes"])
+    }
 }

@@ -103,4 +103,40 @@ void main() {
     expect(status.paths[0].lossDisplay, '—');
     expect(status.lossRate, isNull);
   });
+
+  test('SessionStatus reads relayed peers, defaulting to empty', () {
+    final status = SessionStatus.fromMap(<String, dynamic>{
+      'state': 'connected',
+      'relayedUpBytes': 1900,
+      'relayedDownBytes': 1800,
+      'relayedPeers': <Map<String, dynamic>>[
+        <String, dynamic>{
+          'peerId': 'eNaeK60nAAA',
+          'upBytes': 1900,
+          'downBytes': 1800,
+        },
+        <String, dynamic>{
+          'peerId': 'YeZMPfbcBBB',
+          'upBytes': 0,
+          'downBytes': 0,
+        },
+        // An entry without an id is not a peer.
+        <String, dynamic>{'upBytes': 5, 'downBytes': 5},
+      ],
+      'paths': <Map<String, dynamic>>[],
+    });
+    expect(status.relayedPeers.length, 2);
+    expect(status.relayedPeers[0].peerId, 'eNaeK60nAAA');
+    expect(status.relayedPeers[0].upBytes, 1900);
+    expect(status.relayedPeers[0].downBytes, 1800);
+    expect(status.relayedPeers[1].peerId, 'YeZMPfbcBBB');
+    expect(status.relayedPeers[1].upBytes, 0);
+
+    // An older snapshot without the key still parses, with none.
+    final legacy = SessionStatus.fromMap(<String, dynamic>{
+      'state': 'connected',
+      'paths': <Map<String, dynamic>>[],
+    });
+    expect(legacy.relayedPeers, isEmpty);
+  });
 }

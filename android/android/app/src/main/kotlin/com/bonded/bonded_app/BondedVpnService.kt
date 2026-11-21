@@ -47,6 +47,10 @@ data class SessionSnapshot(
         val relayedUpBytes: Long,
         /** Bytes relayed for others, server -> consumer. */
         val relayedDownBytes: Long,
+        /** Peers this device is currently providing for (4.91):
+         * one entry per served consumer with its relayed totals.
+         * Empty when peer-share never provided. */
+        val relayedPeers: List<RelayedPeerStat> = emptyList(),
         /** Session heartbeat PINGs sent by the native worker (all
          * paths, all ticks). Wakeup accounting for the profiler. */
         val heartbeatPingsSent: Long = 0,
@@ -72,6 +76,18 @@ data class InterceptionWarning(
         val pathIndex: Int?,
         val detail: String,
         val atMs: Long,
+)
+
+/** One peer this device is serving as a peer-share provider for
+ * (4.91): consumer device key + relayed byte totals (up = consumer
+ * -> server, down = server -> consumer). One entry per served peer;
+ * a consumer with several provider paths holds one entry with its
+ * combined traffic. */
+data class RelayedPeerStat(
+        /** Consumer device key (base64). */
+        val peerId: String,
+        val upBytes: Long,
+        val downBytes: Long,
 )
 
 /** Per-path stats from the native snapshot (transport-vec order). */
@@ -166,6 +182,27 @@ internal fun parseSessionPaths(array: JSONArray?): List<SessionPathStat> {
     return paths
 }
 
+/** Parse the native snapshot's per-served-peer stats (4.91).
+ * Top-level alongside [parseSessionPaths] so the parse is
+ * unit-testable. Entries without a peer id are skipped; missing
+ * keys default to zero. */
+internal fun parseRelayedPeers(array: JSONArray?): List<RelayedPeerStat> {
+    if (array == null) return emptyList()
+    val peers = ArrayList<RelayedPeerStat>(array.length())
+    for (i in 0 until array.length()) {
+        val item = array.optJSONObject(i) ?: continue
+        val peerId = item.optString("peerId").takeIf { it.isNotEmpty() } ?: continue
+        peers.add(
+                RelayedPeerStat(
+                        peerId = peerId,
+                        upBytes = item.optLong("upBytes", 0),
+                        downBytes = item.optLong("downBytes", 0),
+                )
+        )
+    }
+    return peers
+}
+
 /** Serialize one per-path stat for the Dart side
  * ([BondedVpnService.getSessionSnapshot]). Top-level alongside
  * [parseSessionPaths] so the forward is unit-testable. */
@@ -186,6 +223,16 @@ internal fun sessionPathStatToMap(path: SessionPathStat): Map<String, Any?> =
                 "quicLostPackets" to path.quicLostPackets,
                 "quicLostBytes" to path.quicLostBytes,
                 "quicSentPackets" to path.quicSentPackets,
+        )
+
+/** Serialize one per-served-peer stat for the Dart side (4.91).
+ * Top-level alongside [sessionPathStatToMap] so the forward is
+ * unit-testable. */
+internal fun relayedPeerStatToMap(peer: RelayedPeerStat): Map<String, Any?> =
+        mapOf(
+                "peerId" to peer.peerId,
+                "upBytes" to peer.upBytes,
+                "downBytes" to peer.downBytes,
         )
 
 class BondedVpnService : VpnService() {
@@ -1055,6 +1102,7 @@ class BondedVpnService : VpnService() {
                     inboundBytes = json.optLong("inboundBytes", 0),
                     relayedUpBytes = json.optLong("relayedUpBytes", 0),
                     relayedDownBytes = json.optLong("relayedDownBytes", 0),
+                    relayedPeers = parseRelayedPeers(json.optJSONArray("relayedPeers")),
                     heartbeatPingsSent = json.optLong("heartbeatPingsSent", 0),
                     supervisorRedialAttempts = json.optLong("supervisorRedialAttempts", 0),
                     relayTasksStarted = json.optLong("relayTasksStarted", 0),
@@ -1877,6 +1925,7 @@ class BondedVpnService : VpnService() {
                     "inboundBytes" to snapshot.inboundBytes,
                     "relayedUpBytes" to snapshot.relayedUpBytes,
                     "relayedDownBytes" to snapshot.relayedDownBytes,
+                    "relayedPeers" to snapshot.relayedPeers.map(::relayedPeerStatToMap),
                     "heartbeatPingsSent" to snapshot.heartbeatPingsSent,
                     "relayTasksStarted" to snapshot.relayTasksStarted,
                     "relayTasksEnded" to snapshot.relayTasksEnded,
