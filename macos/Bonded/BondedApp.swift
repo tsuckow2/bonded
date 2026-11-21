@@ -1,32 +1,21 @@
-// BondedApp.swift — minimal macOS app shell (slice 4.97).
+// BondedApp.swift — macOS app entry (slice 4.98).
 //
-// The real UI — pairing, server config, status/paths, Relayed card —
-// lands in slice 4.98. This stub exists so the Xcode project has an
-// app target that embeds the PacketTunnelProvider extension and so CI
-// can prove the project builds end to end. The app does not link the
-// Rust FFI in this slice: it talks to the extension through
-// NETunnelProviderManager, and pairing (which needs the FFI) is a
-// 4.98 concern — that slice shares BondedFFI.swift into the app
-// target and links the staticlib there.
+// The app owns one TunnelManager (the NETunnelProviderManager
+// plumbing + snapshot poll + pairing) and hands it to the content
+// view. The tunnel itself lives in the PacketTunnelProvider
+// extension; the app never starts a session — it installs the
+// provider configuration and asks the system to start the tunnel.
 
 import SwiftUI
 
 @main
 struct BondedApp: App {
+    @StateObject private var tunnel = TunnelManager()
+
     var body: some Scene {
         WindowGroup {
             ContentView()
+                .environmentObject(tunnel)
         }
-    }
-}
-
-struct ContentView: View {
-    var body: some View {
-        VStack(spacing: 8) {
-            Text("Bonded").font(.title)
-            Text("macOS client — the app UI lands in slice 4.98.")
-                .foregroundStyle(.secondary)
-        }
-        .frame(minWidth: 320, minHeight: 200)
     }
 }

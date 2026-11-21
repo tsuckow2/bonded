@@ -13,6 +13,15 @@
 		120000000000000000000004 /* NetworkExtension.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 11000000000000000000000B /* NetworkExtension.framework */; };
 		120000000000000000000005 /* libpcap.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = 11000000000000000000000C /* libpcap.tbd */; };
 		120000000000000000000006 /* BondedTunnel.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = 11000000000000000000000A /* BondedTunnel.appex */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
+		120000000000000000000007 /* SessionSnapshot.swift in Sources */ = {isa = PBXBuildFile; fileRef = 11000000000000000000000D /* SessionSnapshot.swift */; };
+		120000000000000000000008 /* TransportGrade.swift in Sources */ = {isa = PBXBuildFile; fileRef = 11000000000000000000000E /* TransportGrade.swift */; };
+		120000000000000000000009 /* TunnelManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 11000000000000000000000F /* TunnelManager.swift */; };
+		12000000000000000000000A /* PairingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 110000000000000000000010 /* PairingView.swift */; };
+		12000000000000000000000B /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 110000000000000000000011 /* ContentView.swift */; };
+		12000000000000000000000C /* BondedFFI.swift in Sources */ = {isa = PBXBuildFile; fileRef = 110000000000000000000005 /* BondedFFI.swift */; };
+		12000000000000000000000D /* NetworkExtension.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 11000000000000000000000B /* NetworkExtension.framework */; };
+		12000000000000000000000E /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = 110000000000000000000012 /* PrivacyInfo.xcprivacy */; };
+		12000000000000000000000F /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 110000000000000000000013 /* Assets.xcassets */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -52,6 +61,13 @@
 		11000000000000000000000A /* BondedTunnel.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = BondedTunnel.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		11000000000000000000000B /* NetworkExtension.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = NetworkExtension.framework; path = System/Library/Frameworks/NetworkExtension.framework; sourceTree = SDKROOT; };
 		11000000000000000000000C /* libpcap.tbd */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.text-based-dylib-definition"; name = libpcap.tbd; path = usr/lib/libpcap.tbd; sourceTree = SDKROOT; };
+		11000000000000000000000D /* SessionSnapshot.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionSnapshot.swift; sourceTree = "<group>"; };
+		11000000000000000000000E /* TransportGrade.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TransportGrade.swift; sourceTree = "<group>"; };
+		11000000000000000000000F /* TunnelManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TunnelManager.swift; sourceTree = "<group>"; };
+		110000000000000000000010 /* PairingView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PairingView.swift; sourceTree = "<group>"; };
+		110000000000000000000011 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
+		110000000000000000000012 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; lastKnownFileType = text.xml; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
+		110000000000000000000013 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -61,6 +77,14 @@
 			files = (
 				120000000000000000000004 /* NetworkExtension.framework in Frameworks */,
 				120000000000000000000005 /* libpcap.tbd in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		130000000000000000000005 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				12000000000000000000000D /* NetworkExtension.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -91,8 +115,15 @@
 			isa = PBXGroup;
 			children = (
 				110000000000000000000001 /* BondedApp.swift */,
+				110000000000000000000011 /* ContentView.swift */,
+				11000000000000000000000D /* SessionSnapshot.swift */,
+				11000000000000000000000E /* TransportGrade.swift */,
+				11000000000000000000000F /* TunnelManager.swift */,
+				110000000000000000000010 /* PairingView.swift */,
 				110000000000000000000002 /* Bonded.entitlements */,
 				110000000000000000000003 /* Info.plist */,
+				110000000000000000000012 /* PrivacyInfo.xcprivacy */,
+				110000000000000000000013 /* Assets.xcassets */,
 			);
 			path = Bonded;
 			sourceTree = "<group>";
@@ -133,6 +164,8 @@
 			buildConfigurationList = 160000000000000000000002 /* Build configuration list for PBXNativeTarget "Bonded" */;
 			buildPhases = (
 				130000000000000000000001 /* Sources */,
+				130000000000000000000005 /* Frameworks */,
+				130000000000000000000006 /* Resources */,
 				130000000000000000000002 /* Embed App Extensions */,
 			);
 			buildRules = (
@@ -188,12 +221,30 @@
 		};
 /* End PBXProject section */
 
+/* Begin PBXResourcesBuildPhase section */
+		130000000000000000000006 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				12000000000000000000000E /* PrivacyInfo.xcprivacy in Resources */,
+				12000000000000000000000F /* Assets.xcassets in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
 /* Begin PBXSourcesBuildPhase section */
 		130000000000000000000001 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
 				120000000000000000000001 /* BondedApp.swift in Sources */,
+				12000000000000000000000B /* ContentView.swift in Sources */,
+				120000000000000000000007 /* SessionSnapshot.swift in Sources */,
+				120000000000000000000008 /* TransportGrade.swift in Sources */,
+				120000000000000000000009 /* TunnelManager.swift in Sources */,
+				12000000000000000000000A /* PairingView.swift in Sources */,
+				12000000000000000000000C /* BondedFFI.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -272,32 +323,60 @@
 		150000000000000000000003 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_ENTITLEMENTS = Bonded/Bonded.entitlements;
 				CODE_SIGN_STYLE = Automatic;
+				HEADER_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(SRCROOT)/../crates/bonded-ffi/include",
+				);
 				INFOPLIST_FILE = Bonded/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
+				LIBRARY_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(SRCROOT)/../target/debug",
+				);
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"-lbonded_ffi",
+				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.bonded.bonded-app;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SKIP_INSTALL = NO;
+				SWIFT_OBJC_BRIDGING_HEADER = "$(SRCROOT)/Shared/Bonded-Bridging-Header.h";
 			};
 			name = Debug;
 		};
 		150000000000000000000004 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_ENTITLEMENTS = Bonded/Bonded.entitlements;
 				CODE_SIGN_STYLE = Automatic;
+				HEADER_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(SRCROOT)/../crates/bonded-ffi/include",
+				);
 				INFOPLIST_FILE = Bonded/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
+				LIBRARY_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(SRCROOT)/../target/release",
+				);
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"-lbonded_ffi",
+				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.bonded.bonded-app;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SKIP_INSTALL = NO;
+				SWIFT_OBJC_BRIDGING_HEADER = "$(SRCROOT)/Shared/Bonded-Bridging-Header.h";
 			};
 			name = Release;
 		};
