@@ -315,8 +315,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     /// default routes (everything through the tunnel, like Android's
     /// default mode — the local-traffic exclusion mode is an app-level
     /// setting for 4.98), and DNS via the in-tunnel gateway.
-    private func networkSettings() -> NETunnelNetworkSettings {
-        let settings = NETunnelNetworkSettings(
+    private func networkSettings() -> NEPacketTunnelNetworkSettings {
+        let settings = NEPacketTunnelNetworkSettings(
             tunnelRemoteAddress: Tunnel.dnsServer)
         settings.mtu = Tunnel.mtu
         let ipv4 = NEIPv4Settings(
