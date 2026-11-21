@@ -160,12 +160,75 @@ jobs:
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
 
+      - name: Install Npcap SDK
+        # pnet_datalink links Packet.lib on Windows, and the test
+        # binary is the first thing that actually links (the library
+        # build never links, so `cargo build` passes without it).
+        # The stock runner has no Packet.lib, so fetch the SDK and
+        # point the linker at it. The SDK ships both x86 and x64
+        # Packet.lib files; the x64 one (Lib\x64) is required or the
+        # link fails with LNK4272 (machine-type conflict) and
+        # unresolved Packet* symbols.
+        run: |
+          Invoke-WebRequest -Uri "https://npcap.com/dist/npcap-sdk-1.13.zip" -OutFile "$env:TEMP\npcap-sdk.zip"
+          Expand-Archive -Path "$env:TEMP\npcap-sdk.zip" -DestinationPath "$env:TEMP\npcap-sdk" -Force
+          $packetLib = Get-ChildItem -Path "$env:TEMP\npcap-sdk" -Recurse -Filter "Packet.lib" | Where-Object { $_.DirectoryName -match 'x64$' } | Select-Object -First 1
+          if (-not $packetLib) { throw "Packet.lib (x64) not found in Npcap SDK" }
+          "RUSTFLAGS=-L native=$($packetLib.DirectoryName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Install Npcap runtime
+        # The SDK only provides Packet.lib (the import library) for
+        # linking. At runtime the test binary needs Packet.dll, which
+        # comes from the Npcap runtime — without it the test process
+        # fails to start with 0xc0000135 STATUS_DLL_NOT_FOUND.
+        # The official installer hangs in silent mode on this runner
+        # (stuck >10 min at the driver install), so instead of
+        # running it, extract Packet.dll/wpcap.dll from it with 7-Zip
+        # (preinstalled) and put them on PATH. The DLLs only need to
+        # be loadable; the driver itself is not required for the
+        # test binary to start.
+        run: |
+          Invoke-WebRequest -Uri "https://npcap.com/dist/npcap-1.90.exe" -OutFile "$env:TEMP\npcap-1.90.exe"
+          & 7z x "$env:TEMP\npcap-1.90.exe" -o"$env:TEMP\npcap-extract" -y | Out-Null
+          $dllDir = "$env:TEMP\npcap-dlls"
+          New-Item -ItemType Directory -Path $dllDir -Force | Out-Null
+          # Pick the x64 DLL by PE machine type (0x8664), not by folder
+          # name — the extracted layout has no reliable 'x64' in the
+          # path, and the x86 DLL produces 0xc000007b in the x64
+          # test binary.
+          function Get-DllMachine($path) {
+            $bytes = [System.IO.File]::ReadAllBytes($path)
+            $peOffset = [BitConverter]::ToInt32($bytes, 0x3C)
+            return [BitConverter]::ToUInt16($bytes, $peOffset + 4)
+          }
+          foreach ($name in @("Packet.dll", "wpcap.dll")) {
+            $dll = Get-ChildItem -Path "$env:TEMP\npcap-extract" -Recurse -Filter $name | Where-Object { (Get-DllMachine $_.FullName) -eq 0x8664 } | Select-Object -First 1
+            if (-not $dll) { throw "$name (x64) not found in Npcap installer" }
+            Copy-Item $dll.FullName $dllDir
+          }
+          $dllDir | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
       # First slice of the Windows desktop work (codingwell/bonded#1):
       # does the Rust core build and do its tests pass on a native
       # Windows runner? The Linux cross-compile attempt
       # (x86_64-pc-windows-gnu) stopped at the C toolchain before any
       # Rust code was type-checked, so the real porting surface is
       # still unmeasured. This job measures it natively.
+      #
+      # WINDOWS BASELINE (run 44652533178, 2026-11-20): the core
+      # builds, and 112/117 tests pass. The 5 failures are
+      # environmental, matching the Linux sandbox baseline pattern:
+      # 4 are the same network-dependent QUIC/WSS tests that fail in
+      # the Linux sandbox (peer_listener reversed_introduction +
+      # signed_introduction, client_integration
+      # mixed_websocket_quic_failover + multipath_can_mix_websocket
+      # _and_naive_tcp — all "closed by peer" / "deadline elapsed"),
+      # and 1 is interfaces_can_be_enumerated (pnet_datalink returns
+      # no interfaces because the Npcap driver is not installed —
+      # only its DLLs are present). The h3 QUIC tests pass on
+      # Windows, so QUIC itself works; the 4 failures are a
+      # TLS/handshake investigation for the desktop work, not a
+      # build problem.
       - name: Build bonded-client
         run: cargo build -p bonded-client
 
