@@ -1,10 +1,9 @@
-#[cfg(any(target_os = "android", test))]
 use bonded_client::{
-    establish_naive_tcp_session, establish_transport_paths,
-    establish_transport_paths_with_observer, peer_listener::PeerShareRelayStats, peer_runtime,
-    ClientTransport,
+    establish_transport_paths, establish_transport_paths_with_observer,
+    peer_listener::PeerShareRelayStats, peer_runtime, ClientTransport,
 };
-#[cfg(any(target_os = "android", test))]
+#[cfg(test)]
+use bonded_client::establish_naive_tcp_session;
 use bonded_core::config::ClientConfig;
 use bonded_core::heartbeat::{
     is_idle, next_heartbeat_idle, standby_ping_due, IDLE_INTERVAL, STANDBY_PING_INTERVAL,
@@ -14,38 +13,28 @@ use bonded_core::config::SocketNetworkBindFn;
 #[cfg(target_os = "android")]
 use bonded_core::config::SocketProtectFn;
 use bonded_core::session::SessionFrame;
-#[cfg(any(target_os = "android", test))]
 use bonded_core::session::{
     decode_observed_address, SessionHeader, SessionState, FLAG_MULTIPATH_RECV, FLAG_PATH_RETIRE,
     FLAG_PING, FLAG_PONG, FLAG_REDUNDANT, FLAG_SESSION_EPOCH,
 };
-#[cfg(any(target_os = "android", test))]
-use bonded_core::transport::{NaiveTcpTransport, Transport};
-#[cfg(any(target_os = "android", test))]
 use bytes::Bytes;
-#[cfg(any(target_os = "android", test))]
 use std::collections::VecDeque;
-#[cfg(target_os = "android")]
+#[cfg(unix)]
 use std::fs::File;
-#[cfg(target_os = "android")]
+#[cfg(unix)]
 use std::io::Write;
-#[cfg(target_os = "android")]
+#[cfg(unix)]
 use std::os::fd::FromRawFd;
-#[cfg(any(target_os = "android", test))]
 use std::path::PathBuf;
 use std::slice;
-#[cfg(any(target_os = "android", test))]
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-#[cfg(any(target_os = "android", test))]
 use std::thread::{self, JoinHandle};
-#[cfg(any(target_os = "android", test))]
 use std::time::Duration;
-#[cfg(any(target_os = "android", test))]
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-#[cfg(any(target_os = "android", test))]
 use tokio_util::sync::CancellationToken;
 
+mod desktop;
 mod path_supervisor;
 use path_supervisor::{
     spawn_path_supervisor, PathIndexMap, PathsUpdate, RedialOutcome,
@@ -56,7 +45,6 @@ use path_supervisor::{
 // to 16s before the inner layer reports a failure.  Give the outer wrapper 30s so
 // it never races with the inner per-attempt timeouts and we always surface the
 // real error message rather than a generic outer-timeout.
-#[cfg(any(target_os = "android", test))]
 const ANDROID_PATH_ESTABLISH_TIMEOUT: Duration = Duration::from_secs(30);
 
 // ── JVM / VPN-service globals (Android only) ────────────────────────────────
@@ -71,10 +59,11 @@ static ANDROID_JVM: OnceLock<jni::JavaVM> = OnceLock::new();
 static ANDROID_VPN_SERVICE: Mutex<Option<jni::objects::GlobalRef>> = Mutex::new(None);
 
 /// A duplicated TUN fd owned by native code for direct inbound packet writes.
-#[cfg(target_os = "android")]
-static ANDROID_TUN_WRITER: OnceLock<Mutex<Option<File>>> = OnceLock::new();
+/// Unix-only: on Windows there is no raw TUN fd and inbound packets always
+/// go through the queue (see `tun_writer_slot`).
+#[cfg(unix)]
+static TUN_WRITER: OnceLock<Mutex<Option<File>>> = OnceLock::new();
 
-#[cfg(target_os = "android")]
 static LAST_NATIVE_ERROR: Mutex<Option<String>> = Mutex::new(None);
 
 /// Traffic-mode engine for the running session (4.51): the rule table
@@ -145,7 +134,6 @@ fn path_grades_snapshot() -> Vec<Option<u8>> {
 /// transport vec-index order (see `publish_path_stats`), so index
 /// `i` is transport `i`; a snapshot shorter than the transport set
 /// pads with the all-unknown signal.
-#[cfg(any(target_os = "android", test))]
 fn path_signals(
     snapshot: &Arc<Mutex<AndroidSessionSnapshot>>,
     count: usize,
@@ -186,10 +174,7 @@ pub extern "system" fn JNI_OnLoad(vm: jni::JavaVM, _: *mut std::ffi::c_void) -> 
     let _ = ANDROID_JVM.set(vm);
 
     // Install the rustls crypto provider (ring) once at library load time.
-    // Without this rustls panics with "Could not automatically determine the
-    // process-level CryptoProvider" when the worker thread first tries to open
-    // a TLS connection.
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    ensure_crypto_provider();
 
     // Install a panic hook that writes the panic message to Android logcat so
     // panics in Rust worker threads are visible without a debugger.
@@ -533,14 +518,14 @@ fn bind_socket_to_network(fd: i32, bind_address: &str) -> bool {
     result
 }
 
-#[cfg(target_os = "android")]
-fn android_tun_writer_slot() -> &'static Mutex<Option<File>> {
-    ANDROID_TUN_WRITER.get_or_init(|| Mutex::new(None))
+#[cfg(unix)]
+fn tun_writer_slot() -> &'static Mutex<Option<File>> {
+    TUN_WRITER.get_or_init(|| Mutex::new(None))
 }
 
-#[cfg(target_os = "android")]
-fn set_android_tun_fd(fd: i32) -> bool {
-    let mut guard = match android_tun_writer_slot().lock() {
+#[cfg(unix)]
+fn set_tun_fd(fd: i32) -> bool {
+    let mut guard = match tun_writer_slot().lock() {
         Ok(lock) => lock,
         Err(_) => return false,
     };
@@ -565,9 +550,9 @@ fn set_android_tun_fd(fd: i32) -> bool {
     true
 }
 
-#[cfg(target_os = "android")]
+#[cfg(unix)]
 fn write_inbound_packet_to_tun(payload: &[u8]) -> bool {
-    let mut guard = match android_tun_writer_slot().lock() {
+    let mut guard = match tun_writer_slot().lock() {
         Ok(lock) => lock,
         Err(_) => return false,
     };
@@ -584,7 +569,6 @@ fn write_inbound_packet_to_tun(payload: &[u8]) -> bool {
     }
 }
 
-#[cfg(any(target_os = "android", test))]
 struct AndroidSessionHandle {
     outbound_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     inbound_queue: Arc<Mutex<VecDeque<Vec<u8>>>>,
@@ -618,7 +602,6 @@ pub(crate) struct SessionWakeupStats {
     pub supervisor_redial_attempts: std::sync::atomic::AtomicU64,
 }
 
-#[cfg(any(target_os = "android", test))]
 #[derive(Clone, Debug)]
 struct AndroidSessionSnapshot {
     state: String,
@@ -661,7 +644,6 @@ struct AndroidSessionSnapshot {
 }
 
 /// A server-identity verification failure attributed to a connection.
-#[cfg(any(target_os = "android", test))]
 #[derive(Clone, Debug)]
 struct InterceptionRecord {
     /// Path whose connection presented the bad credentials; `None` when
@@ -673,7 +655,6 @@ struct InterceptionRecord {
 }
 
 /// Stats for one session transport, in transport-vec order.
-#[cfg(any(target_os = "android", test))]
 #[derive(Clone, Debug, Default)]
 struct AndroidPathStat {
     /// Supervisor path index of this transport; `None` for peer relays,
@@ -727,20 +708,16 @@ struct AndroidPathStat {
     peer_id: Option<String>,
 }
 
-#[cfg(any(target_os = "android", test))]
 static ANDROID_SESSION: OnceLock<Mutex<Option<AndroidSessionHandle>>> = OnceLock::new();
 
 const BONDED_FFI_OK: i32 = 0;
 const BONDED_FFI_ERR_NULL_POINTER: i32 = 1;
 const BONDED_FFI_ERR_DECODE: i32 = 2;
 
-#[cfg(any(target_os = "android", test))]
 const ANDROID_STOP_JOIN_TIMEOUT: Duration = Duration::from_millis(250);
 
-#[cfg(any(target_os = "android", test))]
 const ANDROID_TRANSPORT_CLOSE_TIMEOUT: Duration = Duration::from_millis(100);
 
-#[cfg(any(target_os = "android", test))]
 async fn close_client_transports(transports: &mut Vec<ClientTransport>) {
     for transport in transports.iter_mut() {
         alog_info!("Worker: closing transport for session stop");
@@ -776,12 +753,10 @@ fn decode_frame_metadata(raw: &[u8]) -> Result<BondedFrameMetadata, i32> {
     })
 }
 
-#[cfg(any(target_os = "android", test))]
 fn android_session_slot() -> &'static Mutex<Option<AndroidSessionHandle>> {
     ANDROID_SESSION.get_or_init(|| Mutex::new(None))
 }
 
-#[cfg(any(target_os = "android", test))]
 fn android_client_config(
     server_address: &str,
     resolved_server_address: &str,
@@ -809,7 +784,6 @@ fn android_client_config(
     config
 }
 
-#[cfg(any(target_os = "android", test))]
 fn normalize_optional_string(value: &str) -> Option<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -819,7 +793,6 @@ fn normalize_optional_string(value: &str) -> Option<String> {
     }
 }
 
-#[cfg(any(target_os = "android", test))]
 fn parse_protocol_list(raw: &str) -> Vec<String> {
     raw.split(',')
         .map(str::trim)
@@ -828,7 +801,6 @@ fn parse_protocol_list(raw: &str) -> Vec<String> {
         .collect()
 }
 
-#[cfg(any(target_os = "android", test))]
 fn parse_bind_address_list(raw: &str) -> Vec<String> {
     serde_json::from_str::<Vec<String>>(raw)
         .unwrap_or_default()
@@ -838,7 +810,6 @@ fn parse_bind_address_list(raw: &str) -> Vec<String> {
         .collect()
 }
 
-#[cfg(any(target_os = "android", test))]
 fn escape_json(value: &str) -> String {
     value
         .replace('\\', "\\\\")
@@ -847,7 +818,6 @@ fn escape_json(value: &str) -> String {
         .replace('\r', "\\r")
 }
 
-#[cfg(any(target_os = "android", test))]
 fn snapshot_json(snapshot: &AndroidSessionSnapshot) -> String {
     let last_error = snapshot
         .last_error
@@ -939,11 +909,11 @@ fn snapshot_json(snapshot: &AndroidSessionSnapshot) -> String {
         .collect::<Vec<_>>()
         .join(",");
 
-    /// Peers this device is currently providing for (4.91): one
-    /// entry per served consumer with its relayed byte totals, so
-    /// the app can show one row per peer on the Paths card instead
-    /// of only the aggregate "Relayed for others" totals. Empty
-    /// when peer-share never provided.
+    // Peers this device is currently providing for (4.91): one
+    // entry per served consumer with its relayed byte totals, so
+    // the app can show one row per peer on the Paths card instead
+    // of only the aggregate "Relayed for others" totals. Empty
+    // when peer-share never provided.
     let relayed_peers = snapshot
         .relay_stats
         .relayed_peers_snapshot()
@@ -1003,7 +973,6 @@ fn snapshot_json(snapshot: &AndroidSessionSnapshot) -> String {
     )
 }
 
-#[cfg(any(target_os = "android", test))]
 fn update_snapshot(
     snapshot: &Arc<Mutex<AndroidSessionSnapshot>>,
     update: impl FnOnce(&mut AndroidSessionSnapshot),
@@ -1014,7 +983,6 @@ fn update_snapshot(
     update(&mut guard);
 }
 
-#[cfg(any(target_os = "android", test))]
 fn client_transport_kind(transport: &ClientTransport) -> &'static str {
     match transport {
         ClientTransport::NaiveTcp(_) => "NaiveTCP",
@@ -1036,7 +1004,6 @@ fn client_transport_kind(transport: &ClientTransport) -> &'static str {
 /// moved; duplicates in the new list are ignored after the first
 /// occurrence. Unbound paths (no map entry) are never removed by a
 /// diff — they have no address to match on.
-#[cfg(any(target_os = "android", test))]
 fn diff_path_addresses(
     current: &std::collections::HashMap<usize, String>,
     used_indexes: &std::collections::HashSet<usize>,
@@ -1074,7 +1041,6 @@ fn diff_path_addresses(
 
 /// Debug controls for one direct path, sent from the app (long-press on
 /// a path row) to the worker loop.
-#[cfg(any(target_os = "android", test))]
 enum PathControl {
     /// Pause (`paused = true`) or resume a path. A paused path stays
     /// in the transport set — heartbeats, session binding and inbound
@@ -1121,6 +1087,19 @@ enum PathControl {
     DeviceIdleMode { idle: bool },
 }
 
+/// Send one control message to the running session worker. Shared by
+/// the JNI wrappers and the desktop C-ABI: both are thin translation
+/// layers over this slot. Returns false when no session is running
+/// (the caller re-pushes the current state at session start).
+fn send_path_control(control: PathControl) -> bool {
+    android_session_slot()
+        .lock()
+        .expect("android session slot lock poisoned")
+        .as_ref()
+        .map(|handle| handle.path_control_tx.send(control).is_ok())
+        .unwrap_or(false)
+}
+
 /// Demote paused paths to the end of an already mode-ordered
 /// candidate list (4.51), preserving the mode's order within each
 /// group. The traffic-mode engine owns the ordering now (hash
@@ -1128,7 +1107,6 @@ enum PathControl {
 /// only applies the pause discipline on top. When every candidate is
 /// paused the mode order covers all of them, so pausing everything
 /// degrades to the mode's behavior instead of blackholing the session.
-#[cfg(any(target_os = "android", test))]
 fn demote_paused_paths(
     candidates: Vec<usize>,
     is_paused: impl Fn(usize) -> bool,
@@ -1149,7 +1127,6 @@ fn demote_paused_paths(
 /// so the packet still goes out once on a paused path instead of
 /// being dropped. With one transport the set is just it, so the
 /// single-transport degenerate case sends exactly one copy.
-#[cfg(any(target_os = "android", test))]
 fn redundant_fan_out_targets(
     candidates: &[usize],
     is_paused: impl Fn(usize) -> bool,
@@ -1165,7 +1142,6 @@ fn redundant_fan_out_targets(
 /// battery saver (it is the cheapest transport per byte: kernel
 /// crypto, no TLS/QUIC framing). No-op when WireGuard is absent or
 /// already first; the remaining order is unchanged.
-#[cfg(any(target_os = "android", test))]
 fn prefer_wireguard_first(protocols: &mut Vec<String>) {
     if let Some(position) = protocols
         .iter()
@@ -1193,7 +1169,6 @@ fn prefer_wireguard_first(protocols: &mut Vec<String>) {
 /// transport down and re-dialing on demand, which is a larger
 /// supervisor change with failover risk; that step is deliberately
 /// not taken here.
-#[cfg(any(target_os = "android", test))]
 fn compute_auto_paused(
     battery_saver: bool,
     idle: bool,
@@ -1208,7 +1183,6 @@ fn compute_auto_paused(
 }
 
 /// Path indexes whose desired bind address is a cellular address.
-#[cfg(any(target_os = "android", test))]
 fn cellular_path_indexes(
     desired: &std::collections::HashMap<usize, String>,
     cellular_bind_addresses: &std::collections::HashSet<String>,
@@ -1226,7 +1200,6 @@ fn cellular_path_indexes(
 /// non-cellular path is live, `compute_auto_paused` returns empty for
 /// any idle value, so a lost Wi-Fi path clears parking even if the
 /// session was idle a moment ago.
-#[cfg(any(target_os = "android", test))]
 fn desired_auto_paused(
     battery_saver: bool,
     idle: bool,
@@ -1258,7 +1231,6 @@ fn desired_auto_paused(
 /// Events carry their transport's vec index at poll time. Callers must
 /// process removals carefully (errors in descending index order) because
 /// removing a transport shifts the indices above it.
-#[cfg(any(target_os = "android", test))]
 async fn recv_batch(
     transports: &mut [ClientTransport],
 ) -> Vec<(usize, anyhow::Result<SessionFrame>)> {
@@ -1287,7 +1259,6 @@ async fn recv_batch(
     events
 }
 
-#[cfg(any(target_os = "android", test))]
 fn sync_transport_snapshot(
     snapshot: &Arc<Mutex<AndroidSessionSnapshot>>,
     transports: &[ClientTransport],
@@ -1325,7 +1296,6 @@ fn sync_transport_snapshot(
 /// Whether an error text represents a server-identity verification
 /// failure: the error chain carries the `server-identity-mismatch`
 /// marker, or the text is the canonical user-surfaced identity error.
-#[cfg(any(target_os = "android", test))]
 fn is_identity_failure_text(text: &str) -> bool {
     text.contains("server-identity-mismatch")
         || text.contains("Server identity verification failed")
@@ -1335,7 +1305,6 @@ fn is_identity_failure_text(text: &str) -> bool {
 /// session snapshot for the app to surface, attributed to the path
 /// whose connection presented the bad credentials (`None` for the
 /// pre-session identity gate).
-#[cfg(any(target_os = "android", test))]
 fn record_interception(
     snapshot: &Arc<Mutex<AndroidSessionSnapshot>>,
     path_index: Option<usize>,
@@ -1361,7 +1330,6 @@ fn record_interception(
 
 /// Per-vec-index path-index slots from the worker's path map, in the
 /// shape [`publish_path_stats`] expects.
-#[cfg(any(target_os = "android", test))]
 fn path_index_slots(map: &PathIndexMap, len: usize) -> Vec<Option<usize>> {
     (0..len).map(|index| map.path_of(index)).collect()
 }
@@ -1371,7 +1339,6 @@ fn path_index_slots(map: &PathIndexMap, len: usize) -> Vec<Option<usize>> {
 /// shows paused if either mechanism parked it. (Long-press toggles
 /// only the debug set; an auto-paused row keeps showing paused until
 /// the next tick evaluation clears it.)
-#[cfg(any(target_os = "android", test))]
 fn sync_paused_snapshot_flags(
     snapshot: &Arc<Mutex<AndroidSessionSnapshot>>,
     paused_paths: &std::collections::HashSet<usize>,
@@ -1396,7 +1363,6 @@ fn sync_paused_snapshot_flags(
 /// it. Suppression is computed from the condition, not the live
 /// set, so the dead path is suppressed exactly when a live one
 /// would be parked.
-#[cfg(any(target_os = "android", test))]
 fn desired_suppressed_paths(
     battery_saver: bool,
     idle: bool,
@@ -1426,7 +1392,6 @@ fn desired_suppressed_paths(
 /// suppressed set is computed from the same condition, so parking
 /// and suppression flip together; the diff is sent only when the
 /// set actually changes.
-#[cfg(any(target_os = "android", test))]
 #[allow(clippy::too_many_arguments)]
 fn reevaluate_auto_paused(
     battery_saver: bool,
@@ -1510,7 +1475,6 @@ fn reevaluate_auto_paused(
 /// position. Between refreshes the worker increments counters in place
 /// by vec index — safe because every structural change republishes
 /// before any further counter update, all within the one worker task.
-#[cfg(any(target_os = "android", test))]
 fn publish_path_stats(
     snapshot: &Arc<Mutex<AndroidSessionSnapshot>>,
     transports: &[ClientTransport],
@@ -1566,7 +1530,18 @@ fn publish_path_stats(
     });
 }
 
-#[cfg(any(target_os = "android", test))]
+/// Install the rustls crypto provider (ring) once. On Android this
+/// is also done in JNI_OnLoad; on desktop there is no load hook, so
+/// every entry point that opens a TLS connection ensures it first
+/// (4.95 — without this the worker thread panics with "Could not
+/// automatically determine the process-level CryptoProvider" the
+/// first time it opens a TLS connection). `install_default` is
+/// idempotent: it errors if a provider is already installed, which
+/// we ignore.
+fn ensure_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 fn stop_android_session() {
     let handle = {
         let mut slot = android_session_slot()
@@ -1609,7 +1584,6 @@ fn stop_android_session() {
     // until a manual VPN toggle (2026-10-18).
 }
 
-#[cfg(any(target_os = "android", test))]
 fn start_android_session(
     server_address: &str,
     resolved_server_address: &str,
@@ -1624,12 +1598,16 @@ fn start_android_session(
     peer_share_relay_bandwidth_kbps: u64,
     diagnostics_upload_enabled: bool,
     diagnostics_upload_period_secs: u64,
-    app_version_code: u64,
+    _app_version_code: u64,
     storage_dir: &str,
     battery_saver: bool,
     cellular_bind_addresses_json: &str,
     traffic_rules_json: &str,
 ) -> anyhow::Result<()> {
+    // A session opens TLS connections (QUIC / WSS transports), so
+    // make sure the crypto provider is installed before the worker
+    // spawns — on desktop there is no JNI_OnLoad to do it.
+    ensure_crypto_provider();
     #[cfg(target_os = "android")]
     if diagnostics_upload_enabled {
         init_log_ring(storage_dir);
@@ -1713,7 +1691,6 @@ fn start_android_session(
     config.client.peer_share_relay_bandwidth_kbps = peer_share_relay_bandwidth_kbps;
     config.client.diagnostics_upload_enabled = diagnostics_upload_enabled;
     config.client.diagnostics_upload_period_secs = diagnostics_upload_period_secs;
-    let diagnostics_client_build = app_version_code.to_string();
     if let Some(bind_address) = normalize_optional_string(peer_share_bind_address) {
         config.client.peer_share_bind_address = bind_address;
     }
@@ -1795,7 +1772,7 @@ fn start_android_session(
             // whatever subset of the requested paths connected (a dead
             // path no longer vetoes the session), and the supervisor
             // needs the true indexes to re-dial the missing ones.
-            let mut session_path_indexes: Vec<usize> = Vec::new();
+            let session_path_indexes: Vec<usize>;
             let mut transports = match tokio::time::timeout(
                 ANDROID_PATH_ESTABLISH_TIMEOUT,
                 establish_transport_paths_with_observer(&config, requested_paths, |message| {
@@ -1829,7 +1806,7 @@ fn start_android_session(
                         established.len(),
                         session_path_indexes
                     );
-                    let mut transports: Vec<ClientTransport> =
+                    let transports: Vec<ClientTransport> =
                         established.into_iter().map(|(_, transport)| transport).collect();
                     for (index, transport) in transports.iter().enumerate() {
                         let kind = client_transport_kind(transport);
@@ -2924,7 +2901,7 @@ fn start_android_session(
                                 // block: the send loops below mutate
                                 // `path_index_map`, so the closure must
                                 // be dropped before they run.
-                                let (mut candidates, fan_out) = {
+                                let (candidates, fan_out) = {
                                     let is_paused = |vec_index: usize| {
                                         path_index_map
                                             .path_of(vec_index)
@@ -3272,11 +3249,11 @@ fn start_android_session(
                                         let payload = frame.payload.to_vec();
                                         let payload_len = payload.len() as u64;
                                         let delivered_to_tun = {
-                                            #[cfg(target_os = "android")]
+                                            #[cfg(unix)]
                                             {
                                                 write_inbound_packet_to_tun(&payload)
                                             }
-                                            #[cfg(not(target_os = "android"))]
+                                            #[cfg(not(unix))]
                                             {
                                                 false
                                             }
@@ -3736,7 +3713,6 @@ fn start_android_session(
     Ok(())
 }
 
-#[cfg(any(target_os = "android", test))]
 fn get_session_snapshot_json() -> Option<String> {
     android_session_slot()
         .lock()
@@ -3752,7 +3728,6 @@ fn get_session_snapshot_json() -> Option<String> {
         })
 }
 
-#[cfg(any(target_os = "android", test))]
 fn queue_outbound_packet(packet: Vec<u8>) -> bool {
     if let Some(handle) = android_session_slot()
         .lock()
@@ -3783,7 +3758,11 @@ fn queue_outbound_packet(packet: Vec<u8>) -> bool {
     false
 }
 
-#[cfg(any(target_os = "android", test))]
+/// Drain one inbound packet from the session queue. Used by the JNI
+/// wrapper (Android) and the tests; the desktop C-ABI peeks at the
+/// queue directly instead (it must not pop a packet that does not
+/// fit the caller's buffer), so this is unused on desktop builds.
+#[allow(dead_code)]
 fn poll_inbound_packet() -> Option<Vec<u8>> {
     let result = android_session_slot()
         .lock()
@@ -3800,13 +3779,16 @@ fn poll_inbound_packet() -> Option<Vec<u8>> {
     result
 }
 
-#[cfg(any(target_os = "android", test))]
 fn redeem_invite_token(
     server_address: &str,
     server_public_key: &str,
     invite_token: &str,
     storage_dir: &str,
 ) -> anyhow::Result<()> {
+    // Redeem dials the server over TLS (wss first), so make sure the
+    // crypto provider is installed — on desktop there is no
+    // JNI_OnLoad to do it.
+    ensure_crypto_provider();
     let mut config = android_client_config(server_address, "", server_public_key, storage_dir);
     config.client.invite_token = invite_token.to_owned();
 
@@ -3834,13 +3816,16 @@ fn redeem_invite_token(
 /// by this device's existing pairing with the server. Load-only on the
 /// keypair: minting requires a pairing, so a missing key is an error, not
 /// a reason to create a fresh (unauthorized) identity.
-#[cfg(any(target_os = "android", test))]
 fn mint_invite_token(
     server_address: &str,
     server_public_key: &str,
     storage_dir: &str,
     target_device_key: &str,
 ) -> anyhow::Result<String> {
+    // Mint dials the server over TLS, so make sure the crypto
+    // provider is installed — on desktop there is no JNI_OnLoad
+    // to do it.
+    ensure_crypto_provider();
     let config = android_client_config(server_address, "", server_public_key, storage_dir);
     let public_key_path = std::path::Path::new(&config.client.public_key_path);
     if !public_key_path.exists() {
@@ -3863,7 +3848,6 @@ fn mint_invite_token(
 /// This device's public key, creating the keypair if this is the first run.
 /// The keypair is global per storage dir (not per server), so a TV can
 /// display its identity in a pairing QR before it knows any server.
-#[cfg(any(target_os = "android", test))]
 fn device_public_key(storage_dir: &str) -> anyhow::Result<String> {
     let config = android_client_config("", "", "", storage_dir);
     let keypair = bonded_client::load_or_create_device_keypair(
@@ -3879,7 +3863,6 @@ fn device_public_key(storage_dir: &str) -> anyhow::Result<String> {
 /// resolve_session_binding on the server), so a bare connect + auth +
 /// drop leaves it waiting for a frame that never comes and the
 /// connection is discarded when the stream closes.
-#[cfg(any(target_os = "android", test))]
 async fn complete_pairing_session_binding(
     transport: &mut ClientTransport,
 ) -> anyhow::Result<()> {
@@ -4225,7 +4208,7 @@ pub extern "system" fn Java_com_bonded_bonded_1app_BondedVpnService_nativeSetTun
     _obj: jni::objects::JObject,
     fd: jni::sys::jint,
 ) -> jni::sys::jboolean {
-    if set_android_tun_fd(fd as i32) {
+    if set_tun_fd(fd as i32) {
         1
     } else {
         0
@@ -4272,20 +4255,10 @@ pub extern "system" fn Java_com_bonded_bonded_1app_BondedVpnService_nativePauseP
     path_index: jni::sys::jint,
     paused: jni::sys::jboolean,
 ) -> jni::sys::jboolean {
-    android_session_slot()
-        .lock()
-        .expect("android session slot lock poisoned")
-        .as_ref()
-        .map(|handle| {
-            handle
-                .path_control_tx
-                .send(PathControl::Pause {
-                    path_index: path_index as usize,
-                    paused: paused != 0,
-                })
-                .is_ok()
-        })
-        .unwrap_or(false) as jni::sys::jboolean
+    send_path_control(PathControl::Pause {
+        path_index: path_index as usize,
+        paused: paused != 0,
+    }) as jni::sys::jboolean
 }
 
 /// Display interactivity (screen on/off) from the platform layer
@@ -4302,19 +4275,9 @@ pub extern "system" fn Java_com_bonded_bonded_1app_BondedVpnService_nativeSetDis
     _obj: jni::objects::JObject,
     interactive: jni::sys::jboolean,
 ) -> jni::sys::jboolean {
-    android_session_slot()
-        .lock()
-        .expect("android session slot lock poisoned")
-        .as_ref()
-        .map(|handle| {
-            handle
-                .path_control_tx
-                .send(PathControl::DisplayInteractive {
-                    interactive: interactive != 0,
-                })
-                .is_ok()
-        })
-        .unwrap_or(false) as jni::sys::jboolean
+    send_path_control(PathControl::DisplayInteractive {
+        interactive: interactive != 0,
+    }) as jni::sys::jboolean
 }
 
 /// Device idle mode (Doze) from the platform layer (4.77): feeds
@@ -4331,17 +4294,7 @@ pub extern "system" fn Java_com_bonded_bonded_1app_BondedVpnService_nativeSetDev
     _obj: jni::objects::JObject,
     idle: jni::sys::jboolean,
 ) -> jni::sys::jboolean {
-    android_session_slot()
-        .lock()
-        .expect("android session slot lock poisoned")
-        .as_ref()
-        .map(|handle| {
-            handle
-                .path_control_tx
-                .send(PathControl::DeviceIdleMode { idle: idle != 0 })
-                .is_ok()
-        })
-        .unwrap_or(false) as jni::sys::jboolean
+    send_path_control(PathControl::DeviceIdleMode { idle: idle != 0 }) as jni::sys::jboolean
 }
 
 #[cfg(target_os = "android")]
@@ -4351,19 +4304,9 @@ pub extern "system" fn Java_com_bonded_bonded_1app_BondedVpnService_nativeResetP
     _obj: jni::objects::JObject,
     path_index: jni::sys::jint,
 ) -> jni::sys::jboolean {
-    android_session_slot()
-        .lock()
-        .expect("android session slot lock poisoned")
-        .as_ref()
-        .map(|handle| {
-            handle
-                .path_control_tx
-                .send(PathControl::Reset {
-                    path_index: path_index as usize,
-                })
-                .is_ok()
-        })
-        .unwrap_or(false) as jni::sys::jboolean
+    send_path_control(PathControl::Reset {
+        path_index: path_index as usize,
+    }) as jni::sys::jboolean
 }
 
 /// Network path-set update (an interface appeared or vanished):
@@ -4391,20 +4334,10 @@ pub extern "system" fn Java_com_bonded_bonded_1app_BondedVpnService_nativeUpdate
     let bind_addresses = parse_bind_address_list(&bind_addresses_json);
     let cellular_bind_addresses =
         parse_bind_address_list(&cellular_bind_addresses_json);
-    android_session_slot()
-        .lock()
-        .expect("android session slot lock poisoned")
-        .as_ref()
-        .map(|handle| {
-            handle
-                .path_control_tx
-                .send(PathControl::PathsChanged {
-                    bind_addresses,
-                    cellular_bind_addresses,
-                })
-                .is_ok()
-        })
-        .unwrap_or(false) as jni::sys::jboolean
+    send_path_control(PathControl::PathsChanged {
+        bind_addresses,
+        cellular_bind_addresses,
+    }) as jni::sys::jboolean
 }
 
 /// Live traffic-rules update (4.51): hands the running worker a new
@@ -4955,7 +4888,7 @@ mod tests {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::{TcpListener, TcpStream};
 
-    fn temp_dir_path(name: &str) -> PathBuf {
+    pub(crate) fn temp_dir_path(name: &str) -> PathBuf {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock should be valid")
@@ -5057,7 +4990,7 @@ mod tests {
     /// them so they cannot interleave workers and snapshots.
     static SESSION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    fn session_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    pub(crate) fn session_test_lock() -> std::sync::MutexGuard<'static, ()> {
         SESSION_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -5102,6 +5035,20 @@ mod tests {
                 })
                 .await
                 .expect("pairing pong should send");
+
+            // The session-start identity gate opens a TLS connection
+            // to the bootstrap endpoint before any path is
+            // established. This plaintext test server cannot serve
+            // it, so accept and drop it; the gate fails with EOF and
+            // the worker continues with per-path verification. The
+            // gate runs over the default route, so it arrives from
+            // 127.0.0.1 (not the session's 127.0.0.2 bind address)
+            // and must be consumed before the session accept below.
+            let (gate_stream, _) = listener
+                .accept()
+                .await
+                .expect("identity gate accept should succeed");
+            drop(gate_stream);
 
             let (session_stream, session_peer_addr) = listener
                 .accept()
@@ -5202,6 +5149,228 @@ mod tests {
         assert_eq!(echoed, b"android-smoke");
 
         stop_android_session();
+        runtime
+            .block_on(server_task)
+            .expect("server task should join");
+        let _ = fs::remove_dir_all(storage_dir);
+    }
+
+    /// 4.95: the same pair-and-exchange flow as
+    /// `android_session_runtime_can_pair_and_exchange_packets`, driven
+    /// entirely through the desktop C-ABI (`bonded_session_start` /
+    /// `bonded_session_snapshot` / `bonded_tun_handle_outbound` /
+    /// `bonded_tun_poll_inbound` / `bonded_session_stop`). The
+    /// pairing itself still uses the internal harness (the production
+    /// redeem dials wss, which the plaintext test server cannot
+    /// serve). Peer sharing is enabled in the JSON config to prove
+    /// the peer-share keys flow through the C boundary, and the
+    /// snapshot is asserted to carry the `relayedPeers` array the
+    /// desktop shell reads for the Relayed card.
+    #[test]
+    fn desktop_c_abi_session_lifecycle() {
+        use std::ffi::CString;
+
+        use super::desktop::BONDED_ERR_BUFFER_TOO_SMALL;
+        use super::desktop::BONDED_OK;
+        use super::desktop::bonded_session_snapshot;
+        use super::desktop::bonded_session_start;
+        use super::desktop::bonded_session_stop;
+        use super::desktop::bonded_tun_handle_outbound;
+        use super::desktop::bonded_tun_poll_inbound;
+
+        let _guard = session_test_lock();
+        let runtime = tokio::runtime::Runtime::new().expect("runtime should build");
+        let storage_dir = temp_dir_path("desktop-c-abi-session");
+        fs::create_dir_all(&storage_dir).expect("storage dir should be created");
+
+        let listener = runtime
+            .block_on(TcpListener::bind("127.0.0.1:0"))
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("local addr should resolve");
+
+        let server_task = runtime.spawn(async move {
+            let (pair_stream, _) = listener.accept().await.expect("pair accept should succeed");
+            let (public_key, pair_stream) =
+                handshake_server_connection(pair_stream, None, "android-invite").await;
+            let mut pair_transport = NaiveTcpTransport::from_stream(pair_stream);
+            let ping = pair_transport
+                .recv()
+                .await
+                .expect("pairing ping should arrive");
+            assert!(
+                ping.header.flags & FLAG_PING != 0,
+                "expected PING as the pairing session's first frame"
+            );
+            pair_transport
+                .send(SessionFrame {
+                    header: SessionHeader {
+                        connection_id: 7,
+                        sequence: 0,
+                        flags: FLAG_PONG,
+                    },
+                    payload: Bytes::new(),
+                })
+                .await
+                .expect("pairing pong should send");
+
+            // The session-start identity gate opens a TLS connection
+            // to the bootstrap endpoint before any path is
+            // established. This plaintext test server cannot serve
+            // it, so accept and drop it; the gate fails with EOF and
+            // the worker continues with per-path verification. The
+            // gate runs over the default route, so it arrives from
+            // 127.0.0.1 (not the session's 127.0.0.2 bind address)
+            // and must be consumed before the session accept below.
+            let (gate_stream, _) = listener
+                .accept()
+                .await
+                .expect("identity gate accept should succeed");
+            drop(gate_stream);
+
+            let (session_stream, session_peer_addr) = listener
+                .accept()
+                .await
+                .expect("session accept should succeed");
+            assert_eq!(session_peer_addr.ip().to_string(), "127.0.0.2");
+            let (_, session_stream) =
+                handshake_server_connection(session_stream, Some(&public_key), "").await;
+            let mut transport = NaiveTcpTransport::from_stream(session_stream);
+            let discovery_ping = transport
+                .recv()
+                .await
+                .expect("session discovery ping should arrive");
+            assert!(
+                discovery_ping.header.flags & FLAG_PING != 0,
+                "expected PING as the session's first frame"
+            );
+            transport
+                .send(SessionFrame {
+                    header: SessionHeader {
+                        connection_id: 3,
+                        sequence: discovery_ping.header.sequence,
+                        flags: FLAG_PONG,
+                    },
+                    payload: Bytes::new(),
+                })
+                .await
+                .expect("session discovery pong should send");
+            let frame = transport.recv().await.expect("session frame should arrive");
+            transport.send(frame).await.expect("echo should send");
+        });
+
+        let mut pair_config = android_client_config(
+            &addr.to_string(),
+            "",
+            "server-pub",
+            storage_dir.to_string_lossy().as_ref(),
+        );
+        pair_config.client.invite_token = "android-invite".to_owned();
+        runtime
+            .block_on(async {
+                let pair_stream = establish_naive_tcp_session(&pair_config)
+                    .await
+                    .expect("pairing connection should establish");
+                let mut pair_transport =
+                    ClientTransport::NaiveTcp(NaiveTcpTransport::from_stream(pair_stream));
+                complete_pairing_session_binding(&mut pair_transport)
+                    .await
+                    .expect("pairing session binding should complete");
+            });
+
+        // Start the session through the C-ABI, with peer sharing on.
+        let config_json = format!(
+            r#"{{
+                "serverAddress": "{addr}",
+                "resolvedServerAddress": "",
+                "serverPublicKey": "server-pub",
+                "protocols": "naive_tcp",
+                "pathCount": 1,
+                "bindAddresses": ["127.0.0.2"],
+                "cellularBindAddresses": [],
+                "peerShareEnabled": true,
+                "peerShareBindAddress": "",
+                "peerShareAdvertiseIp": "",
+                "peerShareMaxConsumers": 4,
+                "peerShareRelayBandwidthKbps": 0,
+                "diagnosticsUploadEnabled": false,
+                "diagnosticsUploadPeriodSecs": 900,
+                "appVersionCode": 0,
+                "storageDir": "{}",
+                "batterySaver": false,
+                "trafficRules": {{}}
+            }}"#,
+            storage_dir.to_string_lossy(),
+        );
+        let config_c = CString::new(config_json).expect("config should be a CString");
+        assert_eq!(
+            bonded_session_start(config_c.as_ptr()),
+            BONDED_OK,
+            "C-ABI session start should succeed"
+        );
+
+        // Wait for connected, reading the snapshot through the C-ABI
+        // and asserting the peer-share surface is present.
+        let mut snapshot_buf = vec![0u8; 8192];
+        let mut snapshot_json = String::new();
+        let connected = (0..20).any(|_| {
+            std::thread::sleep(Duration::from_millis(100));
+            let len = bonded_session_snapshot(
+                snapshot_buf.as_mut_ptr() as *mut std::os::raw::c_char,
+                snapshot_buf.len(),
+            );
+            if len > 0 {
+                snapshot_json =
+                    String::from_utf8(snapshot_buf[..len as usize].to_vec())
+                        .expect("snapshot should be UTF-8");
+                snapshot_json.contains("\"state\":\"connected\"")
+            } else {
+                false
+            }
+        });
+        assert!(connected, "C-ABI session should report connected state");
+        assert!(
+            snapshot_json.contains("\"relayedPeers\""),
+            "snapshot should carry relayedPeers: {snapshot_json}"
+        );
+        assert!(
+            snapshot_json.contains("\"paths\""),
+            "snapshot should carry paths: {snapshot_json}"
+        );
+
+        // A too-small snapshot buffer reports BUFFER_TOO_SMALL and
+        // leaves the caller to size up.
+        let mut tiny_buf = [0u8; 8];
+        assert_eq!(
+            bonded_session_snapshot(
+                tiny_buf.as_mut_ptr() as *mut std::os::raw::c_char,
+                tiny_buf.len(),
+            ),
+            BONDED_ERR_BUFFER_TOO_SMALL,
+            "too-small snapshot buffer should report buffer-too-small"
+        );
+
+        // Send a packet through the C-ABI and read the echo back
+        // through the C-ABI poll.
+        assert_eq!(
+            bonded_tun_handle_outbound(b"c-abi-smoke".as_ptr(), 11),
+            BONDED_OK,
+            "C-ABI outbound should queue"
+        );
+        let mut packet_buf = vec![0u8; 4096];
+        let echoed = (0..30)
+            .find_map(|_| {
+                std::thread::sleep(Duration::from_millis(100));
+                let len = bonded_tun_poll_inbound(packet_buf.as_mut_ptr(), packet_buf.len());
+                if len > 0 {
+                    Some(packet_buf[..len as usize].to_vec())
+                } else {
+                    None
+                }
+            })
+            .expect("inbound packet should be echoed back");
+        assert_eq!(echoed, b"c-abi-smoke");
+
+        assert_eq!(bonded_session_stop(), BONDED_OK);
         runtime
             .block_on(server_task)
             .expect("server task should join");

@@ -344,6 +344,7 @@ dependencies = [
  "jni-sys 0.4.1",
  "libc",
  "rustls",
+ "serde",
  "serde_json",
  "tokio",
  "tokio-util",
