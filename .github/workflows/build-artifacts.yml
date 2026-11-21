@@ -251,6 +251,14 @@ jobs:
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
 
+      - name: Add 127.0.0.2 loopback alias
+        # Two bind-awareness tests dial from 127.0.0.2 as a second local
+        # address. Linux treats the whole 127/8 range as loopback, so it
+        # binds there out of the box; macOS only configures 127.0.0.1,
+        # and binding 127.0.0.2 fails with EADDRNOTAVAIL (os error 49).
+        # The alias is a standard loopback configuration for the job.
+        run: sudo ifconfig lo0 alias 127.0.0.2 up
+
       # Second slice of the macOS desktop work (plan row 4.96): does
       # the Rust core build and do its tests pass on a native macOS
       # runner? The macOS analog of PR #2 (windows-core). The 2026-11-19
@@ -269,8 +277,14 @@ jobs:
       - name: Test bonded-client
         run: cargo test -p bonded-client
 
+      # The FFI result is measured independently: `if: always()` so
+      # these steps run even when the client test step fails (the
+      # client suite has known environmental failures; they must not
+      # hide the FFI verdict, which is the point of this slice).
       - name: Build bonded-ffi
+        if: always()
         run: cargo build -p bonded-ffi
 
       - name: Test bonded-ffi
+        if: always()
         run: cargo test -p bonded-ffi
