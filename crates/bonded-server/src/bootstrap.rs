@@ -1033,6 +1033,97 @@ fn peer_share_introduction_response(ctx: &BootstrapContext, body: &str) -> (Stat
             }
             Err((status, body)) => return (status, body),
         }
+
+        // Mutual introduction (4.93): the consumer that just asked
+        // for a provider may itself be a provider the original
+        // provider wants to use — but the original provider never
+        // discovers it (mDNS-only discovery, and this consumer's
+        // advertisement never arrives, e.g. the 8 Pro whose
+        // listener is unreachable from the 7a while its dial-out
+        // works). Mint a second reversed introduction with the
+        // roles swapped and push a dial-back notification to the
+        // ORIGINAL consumer (now the provider) for the ORIGINAL
+        // provider (now the consumer), so the original consumer
+        // dials the original provider and the reverse-direction
+        // leg is established in the direction that works. The
+        // original provider accepts it via the normal reversed-leg
+        // accept path (4.57), even when it already holds a leg for
+        // the peer. Needs the consumer's instance nonce (for the
+        // mutual intro's provider_instance_nonce, which forms the
+        // peer_id on accept) and at least one consumer endpoint
+        // (the provider's listener endpoint); old clients send
+        // neither, so the mutual push is skipped and behavior is
+        // exactly as before. Best effort like the first push: a
+        // signing failure or a missing live session is logged and
+        // never fails the introduction.
+        if !request.consumer_instance_nonce.is_empty()
+            && !request.consumer_endpoints.is_empty()
+        {
+            let mutual_claims = PeerShareIntroductionClaims {
+                consumer_device_public_key: request.provider_device_public_key.clone(),
+                provider_device_public_key: request.consumer_device_public_key.clone(),
+                provider_instance_nonce: request.consumer_instance_nonce.clone(),
+                provider_endpoint: request.consumer_endpoints[0].clone(),
+                listener_transport: request.listener_transport.clone(),
+                // The original provider is the listener on the
+                // mutual reversed leg, so the mutual introduction
+                // carries the ORIGINAL provider's listener cert
+                // fingerprint (the request's listener_cert_fingerprint).
+                listener_cert_fingerprint: request.listener_cert_fingerprint.clone(),
+                expires_at,
+                direction: "reverse".to_owned(),
+                consumer_endpoints: vec![request.provider_endpoint.clone()],
+            };
+            match sign_introduction_claims(ctx, mutual_claims) {
+                Ok(mutual) => {
+                    let mutual_notification = PeerShareDialBackNotification {
+                        consumer_device_public_key: request.provider_device_public_key.clone(),
+                        consumer_endpoints: vec![request.provider_endpoint.clone()],
+                        introduction: mutual,
+                    };
+                    let outcome = ctx
+                        .dial_back_push
+                        .as_ref()
+                        .map(|push| {
+                            push.push(
+                                &request.consumer_device_public_key,
+                                &mutual_notification,
+                            )
+                        })
+                        .unwrap_or(DialBackPushOutcome::NoLiveSession);
+                    match outcome {
+                        DialBackPushOutcome::Pushed => {
+                            info!(
+                                consumer = %mutual_notification.consumer_device_public_key,
+                                provider = %request.consumer_device_public_key,
+                                "pushed mutual dial-back notification to consumer session"
+                            );
+                        }
+                        DialBackPushOutcome::NoLiveSession => {
+                            info!(
+                                consumer = %mutual_notification.consumer_device_public_key,
+                                provider = %request.consumer_device_public_key,
+                                "mutual dial-back notification dropped: consumer has no live session"
+                            );
+                        }
+                        DialBackPushOutcome::RateLimited => {
+                            warn!(
+                                consumer = %mutual_notification.consumer_device_public_key,
+                                provider = %request.consumer_device_public_key,
+                                "mutual dial-back notification dropped: rate-limited"
+                            );
+                        }
+                    }
+                }
+                Err((status, body)) => {
+                    warn!(
+                        status = %status.as_u16(),
+                        body = %body,
+                        "mutual introduction signing failed; continuing without mutual dial-back"
+                    );
+                }
+            }
+        }
     }
 
     match serde_json::to_string(&response) {
@@ -1629,6 +1720,7 @@ mod tests {
             dial_back: false,
             consumer_endpoints: Vec::new(),
             consumer_listener_cert_fingerprint: String::new(),
+            consumer_instance_nonce: String::new(),
         };
 
         let (status, _) = route_bootstrap_request(
@@ -1947,6 +2039,7 @@ mod tests {
             dial_back: false,
             consumer_endpoints: Vec::new(),
             consumer_listener_cert_fingerprint: String::new(),
+            consumer_instance_nonce: String::new(),
         };
 
         let (status, body) = route_bootstrap_request(
@@ -2015,6 +2108,9 @@ mod tests {
             } else {
                 String::new()
             },
+            // The helper leaves the nonce empty (old-client shape);
+            // the mutual-push test sets it after building.
+            consumer_instance_nonce: String::new(),
         };
         request.consumer_signature = sign_bytes(
             consumer,
@@ -2162,6 +2258,148 @@ mod tests {
             &notification.introduction.server_signature,
         )
         .expect("reversed introduction signature should verify");
+    }
+
+    /// Mutual introduction (4.93): when the consumer sends its
+    /// instance nonce, the server ALSO pushes a dial-back
+    /// notification to the consumer's own live session, naming the
+    /// original provider as the consumer and carrying a second
+    /// reversed introduction with the roles swapped — so the
+    /// original consumer dials the original provider and the
+    /// reverse-direction leg is established in the direction that
+    /// works.
+    #[tokio::test]
+    async fn peer_share_introduction_with_nonce_pushes_mutual_dial_back() {
+        use bonded_core::peer_share::PeerShareDialBackNotification;
+
+        let consumer = DeviceKeypair::generate();
+        let provider = DeviceKeypair::generate();
+
+        // BOTH devices have live sessions: the provider receives
+        // the original dial-back, the consumer receives the mutual
+        // one.
+        let sessions = SessionRegistry::default();
+        let provider_handle = sessions.register_client(provider.public_key_b64.clone());
+        let (provider_router, provider_fwd_tx) = SessionOutboundRouter::new();
+        let (provider_transport_tx, mut provider_rx) =
+            mpsc::unbounded_channel::<SessionFrame>();
+        provider_router.add_transport(1, provider_transport_tx);
+        let provider_forwarder = Arc::new(SmoltcpForwarder::new(
+            provider_handle.session_id,
+            provider_fwd_tx,
+            Arc::new(AtomicU64::new(0)),
+            std::net::SocketAddr::from(([192, 0, 2, 53], 53)),
+        ));
+        let consumer_handle = sessions.register_client(consumer.public_key_b64.clone());
+        let (consumer_router, consumer_fwd_tx) = SessionOutboundRouter::new();
+        let (consumer_transport_tx, mut consumer_rx) =
+            mpsc::unbounded_channel::<SessionFrame>();
+        consumer_router.add_transport(1, consumer_transport_tx);
+        let consumer_forwarder = Arc::new(SmoltcpForwarder::new(
+            consumer_handle.session_id,
+            consumer_fwd_tx,
+            Arc::new(AtomicU64::new(0)),
+            std::net::SocketAddr::from(([192, 0, 2, 53], 53)),
+        ));
+        let forwarders: Arc<RwLock<HashMap<u64, Arc<SessionContext>>>> =
+            Arc::new(RwLock::new(HashMap::from([
+                (
+                    provider_handle.session_id,
+                    Arc::new(SessionContext {
+                        forwarder: provider_forwarder,
+                        router: provider_router,
+                    }),
+                ),
+                (
+                    consumer_handle.session_id,
+                    Arc::new(SessionContext {
+                        forwarder: consumer_forwarder,
+                        router: consumer_router,
+                    }),
+                ),
+            ])));
+        let push = Arc::new(crate::dial_back::DialBackPush::new(
+            sessions, forwarders,
+        ));
+        let ctx = dial_back_test_ctx(&consumer, &provider, Some(push));
+        let server_key = ctx.server_identity.public_key_b64.clone();
+
+        let mut request =
+            signed_introduction_request(&consumer, &provider.public_key_b64, true);
+        // The nonce is a dial-back field: the signature covers only
+        // the six core fields, so it can be set after signing.
+        request.consumer_instance_nonce = "consumer-nonce-1".to_owned();
+        let (status, body) = route_bootstrap_request(
+            "POST",
+            "/v1/bootstrap/peer-share/introduction",
+            &serde_json::to_string(&request).expect("request should serialize"),
+            ctx.as_ref(),
+            None,
+        );
+        assert_eq!(status, StatusCode::OK);
+
+        // The provider's session receives the original dial-back
+        // (the provider dials back to the consumer).
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(2), provider_rx.recv())
+            .await
+            .expect("original push should deliver promptly")
+            .expect("provider transport should receive the notification");
+        let notification = PeerShareDialBackNotification::from_control_frame(&frame)
+            .expect("pushed frame should parse as a dial-back notification");
+        assert_eq!(
+            notification.consumer_device_public_key,
+            consumer.public_key_b64
+        );
+        assert!(notification.introduction.introduction.is_reverse());
+
+        // The consumer's session receives the MUTUAL dial-back:
+        // the original provider is now the consumer, the original
+        // consumer is now the provider, and the introduction is
+        // reversed with the consumer's instance nonce.
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(2), consumer_rx.recv())
+            .await
+            .expect("mutual push should deliver promptly")
+            .expect("consumer transport should receive the notification");
+        let mutual = PeerShareDialBackNotification::from_control_frame(&frame)
+            .expect("pushed frame should parse as a dial-back notification");
+        assert_eq!(
+            mutual.consumer_device_public_key,
+            provider.public_key_b64
+        );
+        assert_eq!(
+            mutual.consumer_endpoints,
+            vec!["192.168.1.20:54443".to_owned()]
+        );
+        let claims = &mutual.introduction.introduction;
+        assert!(claims.is_reverse());
+        assert_eq!(
+            claims.consumer_device_public_key,
+            provider.public_key_b64
+        );
+        assert_eq!(
+            claims.provider_device_public_key,
+            consumer.public_key_b64
+        );
+        assert_eq!(claims.provider_instance_nonce, "consumer-nonce-1");
+        assert_eq!(claims.provider_endpoint, "192.168.43.10:54443");
+        // The mutual listener cert is the ORIGINAL provider's: the
+        // original provider is the listener on this leg.
+        assert_eq!(
+            claims.listener_cert_fingerprint,
+            "sha256:provider-listener"
+        );
+        assert_eq!(
+            claims.consumer_endpoints,
+            vec!["192.168.1.20:54443".to_owned()]
+        );
+        verify_signature(
+            &server_key,
+            &claims
+                .signing_payload()
+                .expect("claims should serialize"),
+            &mutual.introduction.server_signature,
+        )
+        .expect("mutual introduction signature should verify");
     }
 
     #[test]

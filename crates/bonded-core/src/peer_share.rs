@@ -76,6 +76,15 @@ pub struct PeerShareIntroductionRequest {
     /// request without it.
     #[serde(default)]
     pub consumer_listener_cert_fingerprint: String,
+    /// Instance nonce of the consumer's own peer listener (4.93).
+    /// The server uses it as `provider_instance_nonce` when minting
+    /// the MUTUAL reversed introduction (roles swapped), so the
+    /// dialer and the listener form the correct peer_id for the
+    /// reverse-direction leg. Only meaningful with `dial_back`;
+    /// empty (old clients) means the server skips the mutual push
+    /// and behaves exactly as before.
+    #[serde(default)]
+    pub consumer_instance_nonce: String,
 }
 
 fn default_claims_direction() -> String {
@@ -387,6 +396,7 @@ mod tests {
             dial_back: false,
             consumer_endpoints: Vec::new(),
             consumer_listener_cert_fingerprint: String::new(),
+            consumer_instance_nonce: String::new(),
         };
 
         let payload =
@@ -412,6 +422,7 @@ mod tests {
             dial_back: true,
             consumer_endpoints: vec!["192.168.43.10:54443".to_owned()],
             consumer_listener_cert_fingerprint: "sha256:consumer-listener".to_owned(),
+            consumer_instance_nonce: "consumer-nonce-1".to_owned(),
         };
 
         let payload =
@@ -420,6 +431,7 @@ mod tests {
         assert!(!payload.contains("dial_back"));
         assert!(!payload.contains("consumer_endpoints"));
         assert!(!payload.contains("consumer_listener_cert_fingerprint"));
+        assert!(!payload.contains("consumer_instance_nonce"));
 
         // ...but the fields themselves round-trip through JSON, so the
         // server sees the flag and the endpoints.

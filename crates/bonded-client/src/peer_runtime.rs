@@ -1662,6 +1662,7 @@ pub async fn start_peer_share_runtime(
                 consumer_listener_cert_fingerprint: identity
                     .listener_cert_fingerprint
                     .clone(),
+                consumer_instance_nonce: identity.instance_nonce.clone(),
             }),
             _ => None,
         };
@@ -2752,6 +2753,11 @@ async fn request_peer_share_introduction(
 pub struct DialBackParams {
     pub consumer_endpoints: Vec<String>,
     pub consumer_listener_cert_fingerprint: String,
+    /// Instance nonce of this device's own peer listener (4.93):
+    /// the server uses it as `provider_instance_nonce` when minting
+    /// the mutual reversed introduction (roles swapped), so the
+    /// reverse-direction leg gets the correct peer_id.
+    pub consumer_instance_nonce: String,
 }
 
 fn build_peer_introduction_request(
@@ -2774,6 +2780,9 @@ fn build_peer_introduction_request(
             .unwrap_or_default(),
         consumer_listener_cert_fingerprint: dial_back
             .map(|params| params.consumer_listener_cert_fingerprint.clone())
+            .unwrap_or_default(),
+        consumer_instance_nonce: dial_back
+            .map(|params| params.consumer_instance_nonce.clone())
             .unwrap_or_default(),
     };
     request.consumer_signature = sign_bytes(consumer_keypair, &request.signed_payload()?)?;
@@ -3522,6 +3531,7 @@ mod tests {
                 "10.0.0.5:54443".to_owned(),
             ],
             consumer_listener_cert_fingerprint: "sha256:consumer-listener".to_owned(),
+            consumer_instance_nonce: "consumer-nonce-1".to_owned(),
         };
 
         let request =
@@ -3539,6 +3549,7 @@ mod tests {
             request.consumer_listener_cert_fingerprint,
             "sha256:consumer-listener"
         );
+        assert_eq!(request.consumer_instance_nonce, "consumer-nonce-1");
         // The dial-back fields round-trip through JSON (the server
         // reads them from the request body) while the signature
         // still covers only the six core fields.
