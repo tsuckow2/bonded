@@ -234,3 +234,43 @@ jobs:
 
       - name: Test bonded-client
         run: cargo test -p bonded-client
+
+  macos-core:
+    name: macOS Rust Core Build
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.88.0
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      # Second slice of the macOS desktop work (plan row 4.96): does
+      # the Rust core build and do its tests pass on a native macOS
+      # runner? The macOS analog of PR #2 (windows-core). The 2026-11-19
+      # macOS cross-compile check stopped at the C toolchain
+      # (aws-lc-sys runs host cc with Apple-only flags) before any Rust
+      # code was type-checked, so the real porting surface is still
+      # unmeasured — this job measures it natively, where the Apple
+      # toolchain exists. It also builds + tests bonded-ffi, which
+      # carries the new plain C-ABI for desktop shells (4.95): proving
+      # the FFI compiles on macOS is the point of this slice. No
+      # Npcap-style native dependency is needed on macOS (pnet_datalink
+      # links the system libpcap; the tun crate knows utun).
+      - name: Build bonded-client
+        run: cargo build -p bonded-client
+
+      - name: Test bonded-client
+        run: cargo test -p bonded-client
+
+      - name: Build bonded-ffi
+        run: cargo build -p bonded-ffi
+
+      - name: Test bonded-ffi
+        run: cargo test -p bonded-ffi
