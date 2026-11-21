@@ -234,3 +234,77 @@ jobs:
 
       - name: Test bonded-client
         run: cargo test -p bonded-client
+
+  macos-core:
+    name: macOS Rust Core Build
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.88.0
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Add 127.0.0.2/127.0.0.3 loopback aliases
+        # Bind-awareness tests dial from 127.0.0.2 and 127.0.0.3 as
+        # second/third local addresses (bonded-client's two bind tests
+        # use .2; bonded-ffi's two-path session tests use .2 + .3).
+        # Linux treats the whole 127/8 range as loopback, so they bind
+        # out of the box; macOS only configures 127.0.0.1, and binding
+        # the others fails with EADDRNOTAVAIL (os error 49). The aliases
+        # are a standard loopback configuration for the job.
+        run: sudo ifconfig lo0 alias 127.0.0.2 up && sudo ifconfig lo0 alias 127.0.0.3 up
+
+      # Second slice of the macOS desktop work (plan row 4.96): does
+      # the Rust core build and do its tests pass on a native macOS
+      # runner? The macOS analog of PR #2 (windows-core). The 2026-11-19
+      # macOS cross-compile check stopped at the C toolchain
+      # (aws-lc-sys runs host cc with Apple-only flags) before any Rust
+      # code was type-checked, so the real porting surface is still
+      # unmeasured — this job measures it natively, where the Apple
+      # toolchain exists. It also builds + tests bonded-ffi, which
+      # carries the new plain C-ABI for desktop shells (4.95): proving
+      # the FFI compiles on macOS is the point of this slice. No
+      # Npcap-style native dependency is needed on macOS (pnet_datalink
+      # links the system libpcap; the tun crate knows utun).
+      #
+      # macOS BASELINE (run 44873027979, attempts 1+2, 2026-11-20,
+      # identical): the core builds; bonded-client 114/118, bonded-ffi
+      # 44/44. The 4 client failures are the QUIC/WSS environmental
+      # family ("closed by peer: 0" / "deadline has elapsed"):
+      # peer_listener reversed_introduction + signed_introduction and
+      # client_integration multipath_can_mix_websocket_and_naive_tcp
+      # match the Linux sandbox + Windows baseline sets by name; the
+      # 4th, mixed_websocket_quic_failover_continues_exchange, is the
+      # same family (on Linux/Windows the plain
+      # mixed_websocket_quic_failover fails instead — the plain one
+      # passes on macOS). interfaces_can_be_enumerated PASSES on macOS
+      # (system libpcap), unlike Windows, and all 3 h3_bootstrap tests
+      # pass (they fail in the Linux sandbox), so QUIC itself works;
+      # the 4 failures are a TLS/handshake investigation for the
+      # desktop work, not a build problem. Two bind-awareness tests
+      # need the 127.0.0.2/127.0.0.3 lo0 aliases (macOS configures
+      # only 127.0.0.1; Linux treats all of 127/8 as loopback).
+      - name: Build bonded-client
+        run: cargo build -p bonded-client
+
+      - name: Test bonded-client
+        run: cargo test -p bonded-client
+
+      # The FFI result is measured independently: `if: always()` so
+      # these steps run even when the client test step fails (the
+      # client suite has known environmental failures; they must not
+      # hide the FFI verdict, which is the point of this slice).
+      - name: Build bonded-ffi
+        if: always()
+        run: cargo build -p bonded-ffi
+
+      - name: Test bonded-ffi
+        if: always()
+        run: cargo test -p bonded-ffi
