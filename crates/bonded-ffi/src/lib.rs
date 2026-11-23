@@ -2245,11 +2245,13 @@ fn start_android_session(
             };
             let mut active_index = 0_usize;
             // Adaptive traffic mode (4.100): one AdaptiveFlow per
-            // flow, keyed by flow hash, in the table the pin point
-            // below consults for every packet. The epoch is the
-            // session's monotonic clock for decide's now_ms; the
-            // table itself is created per session, so a flow never
-            // carries adaptive state across a restart.
+            // flow, keyed by the direction-independent flow key (so
+            // a reply matches the entry its outbound packets
+            // created), in the table the pin point below consults
+            // for every packet. The epoch is the session's
+            // monotonic clock for decide's now_ms; the table itself
+            // is created per session, so a flow never carries
+            // adaptive state across a restart.
             let mut adaptive_flows = bonded_core::adaptive::AdaptiveFlowTable::new();
             let adaptive_epoch = Instant::now();
             let mut session = SessionState::new(session_id);
@@ -3283,6 +3285,22 @@ fn start_android_session(
                                         // Inbound user traffic resets the idle clock.
                                         last_traffic = Instant::now();
                                         let payload = frame.payload.to_vec();
+                                        // Adaptive (4.101): count the
+                                        // return-path packet toward
+                                        // its flow's cumulative
+                                        // bytes, so a download's
+                                        // inbound stream drives its
+                                        // bulk classification (its
+                                        // outbound ACKs alone never
+                                        // would). Counted once,
+                                        // whichever delivery route
+                                        // below takes it; only a
+                                        // flow the table already
+                                        // tracks is counted.
+                                        adaptive_flows.note_inbound(
+                                            &payload,
+                                            adaptive_epoch.elapsed().as_millis() as u64,
+                                        );
                                         let payload_len = payload.len() as u64;
                                         let delivered_to_tun = {
                                             #[cfg(unix)]
@@ -4669,6 +4687,13 @@ mod tests {
         use super::SessionWakeupStats;
         use std::sync::Arc;
 
+        // Serialize with the session tests (4.101): they clear the
+        // process-global PATH_GRADES through start_android_session,
+        // and one of them clearing the grades between this test's
+        // set and assert failed it intermittently. See
+        // SESSION_TEST_LOCK.
+        let _guard = session_test_lock();
+
         // Grade JSON is a bare array in snapshot paths-list order:
         // one grade total (0–100) per transport vec index, null
         // when the path has no grade yet.
@@ -5023,7 +5048,14 @@ mod tests {
     }
 
     /// The session tests drive a process-global session slot; serialize
-    /// them so they cannot interleave workers and snapshots.
+    /// them so they cannot interleave workers and snapshots. The grade
+    /// test takes it too (4.101): the session tests clear the
+    /// process-global PATH_GRADES through `start_android_session`,
+    /// which raced the grade test's set-then-assert and failed it
+    /// intermittently (left: `[]` vs right: `[Some(84), None,
+    /// Some(71)]`). Production `set_path_grades` /
+    /// `path_grades_snapshot` behaviour is unchanged — only the
+    /// tests serialize.
     static SESSION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     pub(crate) fn session_test_lock() -> std::sync::MutexGuard<'static, ()> {

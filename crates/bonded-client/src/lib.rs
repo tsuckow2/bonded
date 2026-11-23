@@ -13,6 +13,7 @@ use bonded_core::session::{
     SessionFrame, SessionHeader, SessionState, SessionStateError, FLAG_MULTIPATH_RECV,
     FLAG_PING, FLAG_PONG, FLAG_REDUNDANT,
 };
+use bonded_core::traffic_mode::PathSignal;
 use bonded_core::transport::{
     NaiveTcpTransport, QuicTransport, Transport, WebSocketTlsTransport, WireGuardTransport,
 };
@@ -2768,6 +2769,37 @@ async fn recv_batch(
 }
 
 #[cfg(target_os = "linux")]
+/// Build the per-transport signals for one packet's pin decision
+/// on the Linux CLI (4.101): RTT from the heartbeat ping/pong
+/// round trip, loss from the QUIC counters in `wire_stats`
+/// (lost/sent — the same shape as the FFI's `path_signals`). No
+/// grades: grade computation lives in the Dart UI, so the CLI
+/// ranks on RTT then loss (the engine's BestTransport order with
+/// unknown grades) and degrades on loss spikes only. Pure over its
+/// inputs so the loss math is unit-testable without transports.
+fn cli_path_signals(
+    wire_stats: &[Option<bonded_core::transport::WireStats>],
+    rtt_by_index: &std::collections::HashMap<usize, u64>,
+) -> Vec<PathSignal> {
+    wire_stats
+        .iter()
+        .enumerate()
+        .map(|(index, stats)| {
+            let loss_rate = stats.as_ref().and_then(|stats| {
+                match (stats.quic_lost_packets, stats.quic_sent_packets) {
+                    (Some(lost), Some(sent)) if sent > 0 => Some(lost as f64 / sent as f64),
+                    _ => None,
+                }
+            });
+            PathSignal {
+                rtt_ms: rtt_by_index.get(&index).copied(),
+                loss_rate,
+                grade: None,
+            }
+        })
+        .collect()
+}
+
 async fn run_linux_packet_loop(
     tun_name: &str,
     transports: Vec<ClientTransport>,
@@ -2849,6 +2881,19 @@ async fn run_linux_packet_loop(
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_pong_by_index: std::collections::HashMap<usize, Instant> =
         (0..transports.len()).map(|i| (i, Instant::now())).collect();
+    // Signals for the adaptive table (4.101): when each path's last
+    // heartbeat ping went out, and the RTT the last pong measured
+    // for it. The ping send time is recorded per index — standbys
+    // are pinged on a 60 s cadence while the active path is pinged
+    // every 5 s, so one shared timestamp (the FFI's shape, where
+    // every path is pinged on the same tick) would attribute a
+    // standby's pong to the active path's ping. Both maps start
+    // empty: no RTT exists until a pong answers a ping sent after
+    // session start.
+    let mut last_ping_sent_by_index: std::collections::HashMap<usize, Instant> =
+        std::collections::HashMap::new();
+    let mut last_rtt_by_index: std::collections::HashMap<usize, u64> =
+        std::collections::HashMap::new();
     let mut last_transport_count = transports.len();
     let mut last_traffic = Instant::now();
     let mut last_transport_change = Instant::now();
@@ -2862,15 +2907,14 @@ async fn run_linux_packet_loop(
     // slice, so the loop below runs the default engine — today's
     // flow-hash spreading, unchanged.
     let traffic_engine = bonded_core::traffic_mode::TrafficModeEngine::default();
-    // Adaptive traffic mode (4.100): one AdaptiveFlow per flow, in
+    // Adaptive traffic mode (4.100, signals 4.101): one AdaptiveFlow per flow, in
     // the table the pin point below consults for every packet — the
     // same call the Android worker makes, so the two pin points
-    // cannot drift. The CLI feeds it no signals yet (no grades /
-    // RTT feed in the CLI, so it passes the same empty slice the
-    // engine orders got before): an adaptive flow here starts on
-    // leg 0 and stays there until CLI signal input lands — the same
-    // inert-until-input posture the redundant branch had under the
-    // default engine. The epoch is the loop's monotonic clock for
+    // cannot drift. The CLI feeds it the per-path signals built at
+    // the pin point below (heartbeat RTT + QUIC loss; no grades —
+    // grade computation lives in the Dart UI), so an adaptive flow
+    // here ranks on RTT then loss instead of starting on leg 0 and
+    // staying there. The epoch is the loop's monotonic clock for
     // decide's now_ms.
     let mut adaptive_flows = bonded_core::adaptive::AdaptiveFlowTable::new();
     let adaptive_epoch = Instant::now();
@@ -2890,22 +2934,34 @@ async fn run_linux_packet_loop(
                 last_traffic = Instant::now();
 
                 let packet = Bytes::copy_from_slice(&tun_buf[..read]);
-                // Adaptive (4.100): the pin comes from the per-flow
+                // Adaptive (4.100, signals 4.101): the pin comes from the per-flow
                 // table — one call that resolves the mode and, when
                 // it is adaptive, applies the flow's decision (stay
                 // / move / spread / duplicate), fed with this
-                // packet's length, the (currently empty) signals,
-                // and the loop clock. The same call the Android
+                // packet's length, the live signals built just
+                // below, and the loop clock. The same call the Android
                 // worker makes, so the two pin points cannot drift.
                 // A flow pinned by a rule to another mode never
                 // reaches the table; `duplicate` is true exactly
                 // for a redundant flow or an adaptive handover.
+                // Signals (4.101): the CLI's per-path signals —
+                // heartbeat RTT + QUIC loss — so adaptive flows
+                // rank on RTT then loss and degrade on loss spikes.
+                // No grades: grade computation lives in the Dart
+                // UI. Built fresh per packet from the live
+                // counters, the same shape as the FFI's
+                // path_signals.
+                let wire_stats: Vec<_> = transports
+                    .iter()
+                    .map(|transport| transport.wire_stats())
+                    .collect();
+                let signals = cli_path_signals(&wire_stats, &last_rtt_by_index);
                 let pin = adaptive_flows.pin_for_packet(
                     &traffic_engine,
                     &packet,
                     transports.len(),
                     active_index,
-                    &[],
+                    &signals,
                     adaptive_epoch.elapsed().as_millis() as u64,
                 );
                 // Redundant (4.54): a flow in this mode is NOT pinned
@@ -3025,6 +3081,12 @@ async fn run_linux_packet_loop(
                     last_pong_by_index = (0..transports.len())
                         .map(|i| (i, Instant::now()))
                         .collect();
+                    // The RTT maps are index-keyed too: a shifted
+                    // index would inherit the wrong path's ping time
+                    // and RTT, so clear them — the next pong on each
+                    // path re-measures its RTT within one interval.
+                    last_ping_sent_by_index.clear();
+                    last_rtt_by_index.clear();
                     last_transport_count = transports.len();
                     last_transport_change = Instant::now();
                     // A changed transport set is pinged in full on
@@ -3072,6 +3134,9 @@ async fn run_linux_packet_loop(
                     if index != active_index && !ping_standbys {
                         continue;
                     }
+                    // RTT (4.101): record when this path's ping went
+                    // out, so its pong measures the round trip.
+                    last_ping_sent_by_index.insert(index, Instant::now());
                     if let Err(err) = transports[index].send(ping.clone()).await {
                         warn!(path = index, error = %err, "heartbeat ping send failed, dropping path");
                         failed.push(index);
@@ -3154,6 +3219,20 @@ async fn run_linux_packet_loop(
                             // out of the session reorder buffer and off the TUN device.
                             if frame.header.flags & FLAG_PONG != 0 {
                                 last_pong_by_index.insert(index, Instant::now());
+                                // RTT (4.101): the pong answers the
+                                // last ping sent on this index. A
+                                // pong arriving after the next ping
+                                // went out overstates the RTT by up
+                                // to one interval — the same
+                                // tradeoff the FFI's shared
+                                // timestamp makes — and a slow path
+                                // ranking last is the safe direction.
+                                if let Some(sent) = last_ping_sent_by_index.get(&index) {
+                                    last_rtt_by_index.insert(
+                                        index,
+                                        sent.elapsed().as_millis() as u64,
+                                    );
+                                }
                                 continue;
                             }
                             // Inbound user traffic resets the idle clock.
@@ -3179,6 +3258,18 @@ async fn run_linux_packet_loop(
                                 Err(err) => return Err(err.into()),
                             };
                             for packet in ready {
+                                // Adaptive (4.101): count the
+                                // return-path packet toward its
+                                // flow's cumulative bytes, so a
+                                // download's inbound stream drives
+                                // its bulk classification (its
+                                // outbound ACKs alone never would).
+                                // Only a flow the table already
+                                // tracks is counted.
+                                adaptive_flows.note_inbound(
+                                    &packet.payload,
+                                    adaptive_epoch.elapsed().as_millis() as u64,
+                                );
                                 let _ = device.send(&packet.payload).await?;
                             }
                         }
@@ -3442,5 +3533,54 @@ mod tests {
             "race waited out the grace: {:?}",
             start.elapsed()
         );
+    }
+
+    #[test]
+    fn cli_path_signals_loss_and_rtt() {
+        use bonded_core::transport::WireStats;
+        use std::collections::HashMap;
+        // Path 0: QUIC with loss 3/100 and a measured RTT.
+        // Path 1: TCP (no QUIC counters) and no RTT yet.
+        // Path 2: QUIC with no packets sent yet (no rate).
+        let stats = vec![
+            Some(WireStats {
+                quic_lost_packets: Some(3),
+                quic_sent_packets: Some(100),
+                ..Default::default()
+            }),
+            Some(WireStats {
+                quic_lost_packets: None,
+                quic_sent_packets: None,
+                ..Default::default()
+            }),
+            Some(WireStats {
+                quic_lost_packets: Some(0),
+                quic_sent_packets: Some(0),
+                ..Default::default()
+            }),
+        ];
+        let mut rtt = HashMap::new();
+        rtt.insert(0, 12u64);
+        let signals = super::cli_path_signals(&stats, &rtt);
+        assert_eq!(signals.len(), 3);
+        // Path 0: RTT 12 ms, loss 3/100, no grade (the CLI has no
+        // grader — grades stay unknown).
+        assert_eq!(signals[0].rtt_ms, Some(12));
+        assert_eq!(signals[0].loss_rate, Some(0.03));
+        assert_eq!(signals[0].grade, None);
+        // Path 1: nothing measured yet — all unknown, never a
+        // fabricated 0.
+        assert_eq!(signals[1].rtt_ms, None);
+        assert_eq!(signals[1].loss_rate, None);
+        assert_eq!(signals[1].grade, None);
+        // Path 2: no packets sent, so no loss rate exists.
+        assert_eq!(signals[2].rtt_ms, None);
+        assert_eq!(signals[2].loss_rate, None);
+        // A transport with no wire stats at all is all-unknown.
+        let signals = super::cli_path_signals(&[None], &HashMap::new());
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].rtt_ms, None);
+        assert_eq!(signals[0].loss_rate, None);
+        assert_eq!(signals[0].grade, None);
     }
 }

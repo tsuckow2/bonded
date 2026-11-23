@@ -84,13 +84,39 @@
 //! promotion or a handover land on the packet that crosses the
 //! threshold instead of waiting for the next tick.
 //!
+//! Decision logging (4.101): [`AdaptiveFlowTable::pin_for_packet`]
+//! logs every decision change — a promotion, a move, a handover —
+//! at INFO through `tracing`, so it reaches logcat on Android (the
+//! FFI's `LogcatSubscriber` passes INFO and above) and the CLI's
+//! stdout logger. One line per change, never per packet:
+//! [`AdaptiveDecision::Stay`] is never logged. The line is
+//! `adaptive decision flow=0x… decision=… bytes_total=… age_ms=…`;
+//! the flow key is the direction-independent key below, so one
+//! flow's lines correlate across its lifetime.
+//!
+//! Inbound bytes (4.101): a flow's cumulative bytes count both
+//! directions — the pin points feed outbound lengths through
+//! [`AdaptiveFlowTable::pin_for_packet`] and inbound lengths
+//! through [`AdaptiveFlowTable::note_inbound`]. The table is keyed
+//! by the direction-independent [`flow_key`] (canonical endpoint
+//! order), so a reply matches the entry its outbound packets
+//! created; a packet whose tuple cannot be parsed falls back to
+//! [`flow_hash`].
+//!
 //! # Open questions (for the real implementation, not this POC)
 //!
-//! * **Demotion:** a bulk flow that goes quiet stays spread for the
-//!   rest of its life. Demoting it back to a single leg would save
-//!   nothing (a quiet flow sends little) and risks flapping between
-//!   spread and single; the POC does not demote. Whether the real
-//!   implementation should demote after a long idle period is open.
+//! * **Demotion (4.101, resolved):** a spread flow that moves no
+//!   bytes for [`DEMOTE_IDLE_MS`] (30 s) demotes back to a single
+//!   leg — the best leg by the current ranking — as an
+//!   [`AdaptiveDecision::MoveTo`]. The quiet period is measured
+//!   from the last `decide` that saw the byte total grow, so the
+//!   packet that ends a quiet period still sees the quiet that
+//!   preceded it. A demotion is a decision change, so it is gated
+//!   by the same [`MIN_DECISION_INTERVAL_MS`] hysteresis as every
+//!   other change; in practice the 30 s threshold (6x the
+//!   interval) is what damps it — any change implies recent
+//!   activity, so the interval never binds a demotion. A demoted
+//!   flow must re-clear the bulk floors to promote again.
 //! * **Cold start:** a flow created before any signals exist starts
 //!   on leg 0. When signals first arrive and another leg is clearly
 //!   ahead (by [`MOVE_GRADE_GAP`]), the policy (re)places it — see
@@ -102,7 +128,7 @@
 
 use std::collections::HashMap;
 
-use crate::flow::flow_hash;
+use crate::flow::{flow_hash, flow_key};
 use crate::traffic_mode::{PathSignal, TrafficMode, TrafficModeEngine};
 
 /// A flow is bulk once it has moved at least this many bytes
@@ -162,6 +188,21 @@ pub const MOVE_LOSS_OK_RATE: f64 = 0.02;
 /// (500 ms). Brief by design: duplication is 2x traffic, so it
 /// covers the gap and then stops.
 pub const DUPLICATE_WINDOW_MS: u64 = 500;
+
+/// How long a spread flow must move no bytes before it demotes
+/// back to a single leg (30 s, 4.101). A bulk flow silent that
+/// long is done or stalled, not bursty — a download that pauses
+/// 30 s is not coming back as the same burst — so demoting costs
+/// nothing while it is quiet and saves the reordering cost when it
+/// resumes. 30 s is 15x the [`BULK_MIN_AGE_MS`] promotion floor
+/// and half the session idle interval (60 s, `heartbeat`
+/// `IDLE_INTERVAL`): long enough that TCP think time, a slow
+/// server, or a user reading never trips it, short enough that a
+/// finished download demotes promptly. A demoted flow must
+/// re-clear the bulk floors to promote again, so the quiet period
+/// itself — not the hysteresis interval — is what prevents
+/// flapping.
+pub const DEMOTE_IDLE_MS: u64 = 30_000;
 
 /// The placement a flow currently has.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -247,6 +288,16 @@ pub struct AdaptiveFlow {
     /// first call that brings signals (re)places it if another leg
     /// is clearly ahead.
     seen_signals: bool,
+    /// The byte total `decide` last saw, and when it last grew —
+    /// the activity clock for spread demotion (4.101). A flow that
+    /// keeps moving bytes advances `last_activity_ms` on every
+    /// decide; a flow that goes quiet keeps its old timestamp, so
+    /// the Spread arm can demote it after [`DEMOTE_IDLE_MS`].
+    /// Initialized to the creation time: a flow that never moves
+    /// any bytes is quiet from birth, but it also never promotes,
+    /// so demotion never applies to it.
+    last_bytes_total: u64,
+    last_activity_ms: u64,
 }
 
 impl AdaptiveFlow {
@@ -270,6 +321,8 @@ impl AdaptiveFlow {
             recorded_loss: None,
             pinned_mode,
             seen_signals: !signals.is_empty(),
+            last_bytes_total: 0,
+            last_activity_ms: now_ms,
         };
         flow.set_baseline(signals, first_leg);
         flow
@@ -290,7 +343,8 @@ impl AdaptiveFlow {
     /// the flow's state to match the returned decision, so repeated
     /// calls are consistent. See the module docs for the order the
     /// checks run in: pinned → settle a duplication window →
-    /// hysteresis → degradation → bulk promotion → spread re-rank.
+    /// hysteresis → degradation → bulk promotion → spread re-rank
+    /// or demotion when quiet.
     pub fn decide(
         &mut self,
         obs: &FlowObservation,
@@ -302,6 +356,20 @@ impl AdaptiveFlow {
         // signals.
         if self.pinned_mode.is_some() {
             return AdaptiveDecision::Pinned;
+        }
+
+        // Activity clock (4.101): whether this flow has gone quiet
+        // is measured from the last decide that saw its byte total
+        // grow — computed BEFORE this call's total is recorded, so
+        // the packet that ends a quiet period still sees the quiet
+        // that preceded it. The update runs here, before every
+        // early return below, so a flow whose packets keep arriving
+        // inside a hysteresis window still counts as active: only
+        // a flow with no byte growth at all goes quiet.
+        let quiet = now_ms.saturating_sub(self.last_activity_ms) >= DEMOTE_IDLE_MS;
+        if obs.bytes_total > self.last_bytes_total {
+            self.last_bytes_total = obs.bytes_total;
+            self.last_activity_ms = now_ms;
         }
 
         // 2. Duplicating: inside the window, keep duplicating; past
@@ -374,11 +442,31 @@ impl AdaptiveFlow {
             return AdaptiveDecision::Stay;
         }
 
-        // 5. Spread: re-rank the spread set. A degraded leg is
-        // replaced by the new top two — no duplication is needed,
-        // the flow already covers two legs and the good one keeps
-        // carrying it.
+        // 5. Spread: demote when quiet, else re-rank the spread
+        // set. A degraded leg is replaced by the new top two — no
+        // duplication is needed, the flow already covers two legs
+        // and the good one keeps carrying it.
         if let Strategy::Spread(legs) = &self.strategy {
+            // Demotion (4.101): a spread flow that has moved no
+            // bytes for DEMOTE_IDLE_MS goes back to a single leg —
+            // the best one by the current ranking. A quiet flow
+            // sends nothing to spread, so demoting saves the
+            // reordering cost when it resumes. This is a decision
+            // change, so the hysteresis gate above already applied;
+            // in practice the 30 s quiet period (6x the interval)
+            // is the damping, since any change implies recent
+            // activity. A demoted flow must re-clear the bulk
+            // floors to promote again.
+            if quiet {
+                let best = best_transport_ranking(signals)
+                    .into_iter()
+                    .next()
+                    .unwrap_or(0);
+                self.strategy = Strategy::Single(best);
+                self.last_change_ms = Some(now_ms);
+                self.set_baseline(signals, best);
+                return AdaptiveDecision::MoveTo(best);
+            }
             let top_two = top_two_legs(signals);
             if top_two.len() >= 2 && top_two != *legs {
                 self.strategy = Strategy::Spread(top_two.clone());
@@ -564,13 +652,28 @@ pub struct AdaptivePin {
 }
 
 /// One flow's entry in the table: its adaptive state, its
-/// cumulative observed bytes (both directions, as the caller
-/// counts them — here, the uplink packet lengths the pin point
-/// sees), and when it was last seen (for eviction).
+/// cumulative observed bytes (both directions — the uplink packet
+/// lengths the pin point sees plus the return-path lengths fed
+/// through [`AdaptiveFlowTable::note_inbound`]), and when it was
+/// last seen (for eviction).
 struct AdaptiveFlowEntry {
     flow: AdaptiveFlow,
     bytes_total: u64,
     last_seen_ms: u64,
+}
+
+/// The table key for a packet: the direction-independent
+/// [`flow_key`] when the tuple parses, so an uplink packet and its
+/// reply share one entry — that is what lets
+/// [`AdaptiveFlowTable::note_inbound`] count a download's inbound
+/// bytes toward the flow its outbound packets created. A packet
+/// whose tuple cannot be parsed (truncated, non-IP) has no
+/// canonical key and falls back to [`flow_hash`]; its two
+/// directions key separately, so its inbound bytes are not
+/// counted — an accepted corner, since the bulk thresholds are
+/// about IP flows.
+fn table_key(packet: &[u8]) -> u64 {
+    flow_key(packet).unwrap_or_else(|| flow_hash(packet))
 }
 
 /// Maximum flows tracked per session (4.100). A phone VPN sees
@@ -631,6 +734,12 @@ impl AdaptiveFlowTable {
     /// `DuplicateThrough` fans the packet out to the handover legs
     /// (`duplicate` true) until the window settles, when the next
     /// decide returns `MoveTo` on the new leg.
+    ///
+    /// Every decision change is logged at INFO (4.101) — one line
+    /// per change, never per packet — so a promotion or handover is
+    /// directly observable in logcat/diagnostics:
+    /// `adaptive decision flow=0x… decision=… bytes_total=… age_ms=…`.
+    /// `Stay` is never logged.
     pub fn pin_for_packet(
         &mut self,
         engine: &TrafficModeEngine,
@@ -647,7 +756,7 @@ impl AdaptiveFlowTable {
                 duplicate: mode == TrafficMode::Redundant,
             };
         }
-        let key = flow_hash(packet);
+        let key = table_key(packet);
         if !self.flows.contains_key(&key) {
             if self.flows.len() >= ADAPTIVE_MAX_FLOWS {
                 if let Some(oldest) = self
@@ -679,9 +788,44 @@ impl AdaptiveFlowTable {
         // The returned decision is already reflected in the flow's
         // strategy — decide updates state to match — so the
         // placement below reads the strategy, not the decision.
-        let _decision = entry.flow.decide(&obs, signals, now_ms);
+        // The decision itself is logged here (4.101): one line per
+        // decision change, at INFO so it reaches logcat on Android
+        // and the CLI's stdout logger. Stay is never logged — a
+        // line per packet would spam diagnostics. The flow key is
+        // the direction-independent table key, so one flow's lines
+        // correlate across its lifetime.
+        let decision = entry.flow.decide(&obs, signals, now_ms);
+        if decision != AdaptiveDecision::Stay {
+            tracing::info!(
+                flow = format!("{key:#018x}"),
+                decision = ?decision,
+                bytes_total = entry.bytes_total,
+                age_ms = now_ms.saturating_sub(entry.flow.started_ms),
+                "adaptive decision"
+            );
+        }
         let strategy = entry.flow.strategy.clone();
         adaptive_candidates(&strategy, count, active_index, signals)
+    }
+
+    /// Count an inbound (return-path) packet toward its flow's
+    /// cumulative bytes (4.101). Only a flow the table already
+    /// tracks — created by its outbound packets — is counted: an
+    /// inbound packet for an unknown flow has no adaptive state
+    /// and must not create one (the client never sent on it, so
+    /// there is no placement to decide). The direction-independent
+    /// key is what matches the reply to the flow its outbound
+    /// packets created. The next outbound packet (typically an
+    /// ACK) runs `decide` with the new total, so a bulk download
+    /// promotes on its ACKs even though its outbound stream is a
+    /// trickle. Also refreshes the entry's last-seen time, so an
+    /// active download is not evicted as idle while its inbound
+    /// traffic flows.
+    pub fn note_inbound(&mut self, packet: &[u8], now_ms: u64) {
+        if let Some(entry) = self.flows.get_mut(&table_key(packet)) {
+            entry.bytes_total = entry.bytes_total.saturating_add(packet.len() as u64);
+            entry.last_seen_ms = now_ms;
+        }
     }
 }
 
@@ -1424,20 +1568,108 @@ mod tests {
     /// length as the flow's observed bytes, so the padding is what
     /// drives the bulk thresholds in the table tests.
     fn udp_packet(dst: [u8; 4], src_port: u16, len: usize) -> Vec<u8> {
+        udp_packet_between([192, 0, 2, 1], src_port, dst, 443, len)
+    }
+
+    /// Build an IPv4 UDP packet from `src:src_port` to
+    /// `dst:dst_port`, padded to `len` bytes total.
+    fn udp_packet_between(
+        src: [u8; 4],
+        src_port: u16,
+        dst: [u8; 4],
+        dst_port: u16,
+        len: usize,
+    ) -> Vec<u8> {
         let mut packet = vec![0u8; len.max(28)];
         packet[0] = 0x45; // version 4, IHL 20
         packet[9] = 17; // UDP
-        packet[12..16].copy_from_slice(&[192, 0, 2, 1]);
+        packet[12..16].copy_from_slice(&src);
         packet[16..20].copy_from_slice(&dst);
         packet[20..22].copy_from_slice(&src_port.to_be_bytes());
-        packet[22..24].copy_from_slice(&443u16.to_be_bytes());
+        packet[22..24].copy_from_slice(&dst_port.to_be_bytes());
         packet
+    }
+
+    /// Build the reply to [`udp_packet`]: the same 5-tuple in the
+    /// reverse direction (server `dst:443` back to the client
+    /// `192.0.2.1:src_port`). The direction-independent table key
+    /// matches it to the flow the outbound packet created, so
+    /// [`AdaptiveFlowTable::note_inbound`] counts it toward that
+    /// flow's bytes.
+    fn udp_reply_packet(dst: [u8; 4], src_port: u16, len: usize) -> Vec<u8> {
+        udp_packet_between(dst, 443, [192, 0, 2, 1], src_port, len)
     }
 
     fn adaptive_engine() -> TrafficModeEngine {
         TrafficModeEngine {
             default_mode: TrafficMode::Adaptive,
             rules: vec![],
+        }
+    }
+
+    /// A minimal `tracing` subscriber that captures formatted
+    /// events into a shared vec, so the decision-logging test can
+    /// assert a decision produces a log record without a log
+    /// backend. No new dependency: the test implements the
+    /// `Subscriber` trait by hand.
+    struct CapturingSubscriber {
+        events: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl tracing::Subscriber for CapturingSubscriber {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Visitor {
+                text: String,
+            }
+            impl tracing::field::Visit for Visitor {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.text.push_str(&format!(" {}={value:?}", field.name()));
+                }
+
+                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                    self.text.push_str(&format!(" {}={value}", field.name()));
+                }
+
+                fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+                    self.text.push_str(&format!(" {}={value}", field.name()));
+                }
+
+                fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+                    self.text.push_str(&format!(" {}={value}", field.name()));
+                }
+
+                fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+                    self.text.push_str(&format!(" {}={value}", field.name()));
+                }
+            }
+            let mut visitor = Visitor {
+                text: String::new(),
+            };
+            event.record(&mut visitor);
+            self.events
+                .lock()
+                .expect("captured events lock poisoned")
+                .push(visitor.text);
         }
     }
 
@@ -1582,5 +1814,251 @@ mod tests {
             table.pin_for_packet(&engine, &packet, 3, 0, &signals, i as u64);
         }
         assert_eq!(table.len(), ADAPTIVE_MAX_FLOWS);
+    }
+
+    #[test]
+    fn table_logs_a_decision_change_and_not_a_stay() {
+        // The decision log is the only way a promotion or handover
+        // is directly observable: drive the same download as the
+        // promotion test through the table under a capturing
+        // subscriber and assert exactly one line, on the promotion
+        // tick — none on the Stay ticks before it.
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = CapturingSubscriber {
+            events: events.clone(),
+        };
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!("probe");
+            assert!(
+                events.lock().expect("events lock").iter().any(|e| e.contains("probe")),
+                "the capturing subscriber must see a direct probe event"
+            );
+            events.lock().expect("events lock").clear();
+            let engine = adaptive_engine();
+            let signals = three_good_signals();
+            let mut table = AdaptiveFlowTable::new();
+            let packet = udp_packet([93, 184, 216, 34], 51000, 350_000);
+            for now_ms in [0u64, 500, 1_000, 1_500] {
+                table.pin_for_packet(&engine, &packet, 3, 0, &signals, now_ms);
+            }
+            assert!(
+                events.lock().expect("events lock").is_empty(),
+                "Stay must not log: a line per packet would spam diagnostics"
+            );
+            // Rebuild the callsite interest cache HERE, after the
+            // Stay ticks — not at the top of the closure. The
+            // `pin_for_packet` callsite's interest is cached
+            // globally the first time any test thread hits it
+            // (NEVER under the no-op dispatcher), and installing a
+            // thread-local subscriber does not rebuild it. A
+            // rebuild before the first pin call is a no-op when the
+            // callsite is still unregistered, and another thread's
+            // first hit after it caches NEVER again — the test
+            // flaked exactly this way (3/6 full-suite runs). By
+            // this point the callsite is certainly registered (the
+            // Stay ticks above hit it), so this rebuild
+            // deterministically re-evaluates it against this
+            // subscriber; nothing re-registers or rebuilds after
+            // it, so the promotion line below is captured every run.
+            tracing::callsite::rebuild_interest_cache();
+            // At t = 2000 ms (1.75 MiB, 875 KiB/s) the flow
+            // promotes: exactly one line.
+            table.pin_for_packet(&engine, &packet, 3, 0, &signals, 2_000);
+            let events = events.lock().expect("events lock");
+            assert_eq!(
+                events.len(),
+                1,
+                "one decision change must log exactly one line, got {events:?}"
+            );
+            assert!(
+                events[0].contains("adaptive decision"),
+                "the line must name the event: {}",
+                events[0]
+            );
+            assert!(
+                events[0].contains("PromoteToSpread"),
+                "the line must name the decision: {}",
+                events[0]
+            );
+            assert!(
+                events[0].contains("flow=0x"),
+                "the line must carry the flow key: {}",
+                events[0]
+            );
+            assert!(
+                events[0].contains("bytes_total=1750000"),
+                "the line must carry the cumulative bytes: {}",
+                events[0]
+            );
+            assert!(
+                events[0].contains("age_ms=2000"),
+                "the line must carry the flow age: {}",
+                events[0]
+            );
+        });
+    }
+
+    #[test]
+    fn table_counts_inbound_bytes_toward_bulk() {
+        // The bench case (4.100): a download's outbound stream is
+        // ACKs — here 1 KiB per 500 ms tick, 5 KiB over 2.5 s,
+        // far under every bulk floor — while its inbound stream
+        // carries 350 KiB per tick. With outbound bytes only the
+        // flow never promotes; with both directions it promotes at
+        // t = 2000 ms (1.75 MiB, 875 KiB/s), exactly like the
+        // outbound-only download in table_promotes_bulk_flow_to_spread.
+        let engine = adaptive_engine();
+        let signals = three_good_signals();
+        let outbound = udp_packet([93, 184, 216, 34], 51000, 1_000);
+        let inbound = udp_reply_packet([93, 184, 216, 34], 51000, 350_000);
+
+        // Control: the ACK-only flow never promotes.
+        let mut table = AdaptiveFlowTable::new();
+        let mut pins = Vec::new();
+        for now_ms in [0u64, 500, 1_000, 1_500, 2_000, 2_500] {
+            pins.push(table.pin_for_packet(&engine, &outbound, 3, 0, &signals, now_ms));
+        }
+        assert!(
+            pins.iter().all(|pin| !pin.duplicate),
+            "an ACK-only flow must never spread or duplicate"
+        );
+        assert_eq!(table.len(), 1);
+
+        // The same ACK stream with the download's inbound bytes
+        // counted: promotes at t = 2000 ms.
+        let mut table = AdaptiveFlowTable::new();
+        let mut pins = Vec::new();
+        for now_ms in [0u64, 500, 1_000, 1_500, 2_000, 2_500] {
+            table.note_inbound(&inbound, now_ms);
+            pins.push(table.pin_for_packet(&engine, &outbound, 3, 0, &signals, now_ms));
+        }
+        for pin in &pins[0..4] {
+            assert_eq!(pin.candidates, vec![0, 1, 2]);
+            assert!(!pin.duplicate);
+        }
+        assert_eq!(pins[4].candidates, vec![0, 1, 2]);
+        assert!(!pins[4].duplicate);
+        assert_eq!(pins[5].candidates, vec![0, 1, 2]);
+        assert!(!pins[5].duplicate);
+    }
+
+    #[test]
+    fn note_inbound_ignores_unknown_flows() {
+        // An inbound packet for a flow the table never saw
+        // outbound must not create an entry: the client never
+        // sent on it, so there is no placement to decide.
+        let mut table = AdaptiveFlowTable::new();
+        let inbound = udp_reply_packet([93, 184, 216, 34], 51000, 350_000);
+        table.note_inbound(&inbound, 1_000);
+        assert_eq!(table.len(), 0);
+        table.note_inbound(&inbound, 2_000);
+        assert_eq!(table.len(), 0);
+    }
+
+    #[test]
+    fn quiet_spread_flow_demotes_to_a_single_leg_after_the_idle_threshold() {
+        // Promote first: 2 MiB over 3 s.
+        let signals = three_good_signals();
+        let mut flow = AdaptiveFlow::new(&signals, 0, None);
+        let d = flow.decide(
+            &FlowObservation {
+                bytes_total: 2 * BULK_BYTES,
+            },
+            &signals,
+            3_000,
+        );
+        assert_eq!(d, AdaptiveDecision::PromoteToSpread(vec![0, 1]));
+        assert_eq!(flow.strategy, Strategy::Spread(vec![0, 1]));
+
+        // Still active at t = 8000 ms (bytes grew to 10 MiB):
+        // stays spread.
+        let d = flow.decide(
+            &FlowObservation {
+                bytes_total: 10 * BULK_BYTES,
+            },
+            &signals,
+            8_000,
+        );
+        assert_eq!(d, AdaptiveDecision::Stay);
+        assert_eq!(flow.strategy, Strategy::Spread(vec![0, 1]));
+
+        // Quiet for exactly DEMOTE_IDLE_MS (no byte growth since
+        // t = 8000): the next decide demotes to the best leg.
+        let d = flow.decide(
+            &FlowObservation {
+                bytes_total: 10 * BULK_BYTES,
+            },
+            &signals,
+            8_000 + DEMOTE_IDLE_MS,
+        );
+        assert_eq!(
+            d,
+            AdaptiveDecision::MoveTo(0),
+            "a flow quiet for 30 s must demote to a single leg"
+        );
+        assert_eq!(flow.strategy, Strategy::Single(0));
+        assert_eq!(flow.recorded_grade, Some(90));
+
+        // And the demotion respects the hysteresis interval: 1 s
+        // later the flow must not instantly re-promote, even
+        // though its byte total still clears the bulk floors — a
+        // resumed bulk flow re-promotes only after the interval,
+        // on fresh byte growth.
+        let d = flow.decide(
+            &FlowObservation {
+                bytes_total: 10 * BULK_BYTES,
+            },
+            &signals,
+            8_000 + DEMOTE_IDLE_MS + 1_000,
+        );
+        assert_eq!(
+            d,
+            AdaptiveDecision::Stay,
+            "a flow demoted 1 s ago must not instantly re-promote"
+        );
+        assert_eq!(flow.strategy, Strategy::Single(0));
+    }
+
+    #[test]
+    fn brief_quiet_does_not_demote_a_spread_flow() {
+        // Promote first: 2 MiB over 3 s.
+        let signals = three_good_signals();
+        let mut flow = AdaptiveFlow::new(&signals, 0, None);
+        let d = flow.decide(
+            &FlowObservation {
+                bytes_total: 2 * BULK_BYTES,
+            },
+            &signals,
+            3_000,
+        );
+        assert_eq!(d, AdaptiveDecision::PromoteToSpread(vec![0, 1]));
+
+        // 10 s of quiet (no byte growth since t = 3000): under
+        // the 30 s threshold, stays spread.
+        let d = flow.decide(
+            &FlowObservation {
+                bytes_total: 2 * BULK_BYTES,
+            },
+            &signals,
+            13_000,
+        );
+        assert_eq!(
+            d,
+            AdaptiveDecision::Stay,
+            "10 s of quiet must not demote a spread flow"
+        );
+        assert_eq!(flow.strategy, Strategy::Spread(vec![0, 1]));
+
+        // When it resumes it is still spread — the brief quiet
+        // did not demote it, so no re-promotion is due.
+        let d = flow.decide(
+            &FlowObservation {
+                bytes_total: 3 * BULK_BYTES,
+            },
+            &signals,
+            14_000,
+        );
+        assert_eq!(d, AdaptiveDecision::Stay);
+        assert_eq!(flow.strategy, Strategy::Spread(vec![0, 1]));
     }
 }
