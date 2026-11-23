@@ -13,7 +13,6 @@ use bonded_core::session::{
     SessionFrame, SessionHeader, SessionState, SessionStateError, FLAG_MULTIPATH_RECV,
     FLAG_PING, FLAG_PONG, FLAG_REDUNDANT,
 };
-#[cfg(target_os = "linux")]
 use bonded_core::transport::{
     NaiveTcpTransport, QuicTransport, Transport, WebSocketTlsTransport, WireGuardTransport,
 };
