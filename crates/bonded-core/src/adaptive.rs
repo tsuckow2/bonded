@@ -61,21 +61,28 @@
 //!
 //! # What this is NOT
 //!
-//! This is the policy module + its simulation tests, nothing else.
-//! There is no `TrafficMode::Adaptive` variant, no change to
-//! [`TrafficModeEngine`], no wiring into the flow-pin points (the
-//! Linux client loop / the Android worker), the FFI, the Android
-//! app, or the server. The caller is responsible for feeding the
-//! policy: create one [`AdaptiveFlow`] per flow (at the same point
-//! it would resolve the flow's mode), call
-//! [`AdaptiveFlow::decide`] on its poll tick with the flow's
-//! cumulative bytes and the current per-transport signals (built
-//! the same way the FFI's `path_signals` builds them — grades from
+//! This module is the policy + its simulation tests, and (since
+//! 4.100) the per-flow table the pin points consult. It is still
+//! data-only: it knows nothing about transports, sessions, or the
+//! UI — only flow placement, observations, and the signals the
+//! caller hands it. The caller is responsible for feeding the
+//! policy: [`AdaptiveFlowTable::pin_for_packet`] takes one packet,
+//! resolves its mode through the engine, and — only when the mode
+//! is [`TrafficMode::Adaptive`] — consults one [`AdaptiveFlow`]
+//! for that flow (created at the same point the mode is resolved
+//! today) with the flow's cumulative bytes and the current
+//! per-transport signals (built the same way the FFI's
+//! `path_signals` builds them — grades from
 //! `path_grades_snapshot`, RTT from the last heartbeat pong, loss
-//! from the QUIC counters), and apply the returned
+//! from the QUIC counters), and applies the returned
 //! [`AdaptiveDecision`]. Times are milliseconds on a monotonic
 //! clock supplied by the caller, so the policy is testable without
-//! wall time.
+//! wall time. `decide` runs on every packet of an adaptive flow,
+//! not just on a poll tick: the hysteresis interval makes that
+//! cheap and stable (a packet inside the window returns
+//! [`AdaptiveDecision::Stay`]), and it is what lets a bulk
+//! promotion or a handover land on the packet that crosses the
+//! threshold instead of waiting for the next tick.
 //!
 //! # Open questions (for the real implementation, not this POC)
 //!
@@ -93,6 +100,9 @@
 //!   settles. The window is short enough that this is acceptable
 //!   for the POC; the real implementation may want to re-check.
 
+use std::collections::HashMap;
+
+use crate::flow::flow_hash;
 use crate::traffic_mode::{PathSignal, TrafficMode, TrafficModeEngine};
 
 /// A flow is bulk once it has moved at least this many bytes
@@ -535,10 +545,235 @@ fn top_two_legs(signals: &[PathSignal]) -> Vec<usize> {
         .collect()
 }
 
+/// What the pin points do with one packet.
+///
+/// `candidates` is the ordered try-list (first entry tried first;
+/// on send failure the caller tries the next, the existing failover
+/// discipline). `duplicate` says the packet is fanned out to the
+/// candidate set instead of tried in turn — the redundant
+/// discipline — and the caller flags the frame
+/// `FLAG_REDUNDANT` so the server fans the return traffic out the
+/// same way. It is true for a flow in [`TrafficMode::Redundant`]
+/// and for an adaptive flow inside a degradation handover
+/// ([`AdaptiveDecision::DuplicateThrough`]); every other adaptive
+/// placement is a try-list, not a fan-out.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdaptivePin {
+    pub candidates: Vec<usize>,
+    pub duplicate: bool,
+}
+
+/// One flow's entry in the table: its adaptive state, its
+/// cumulative observed bytes (both directions, as the caller
+/// counts them — here, the uplink packet lengths the pin point
+/// sees), and when it was last seen (for eviction).
+struct AdaptiveFlowEntry {
+    flow: AdaptiveFlow,
+    bytes_total: u64,
+    last_seen_ms: u64,
+}
+
+/// Maximum flows tracked per session (4.100). A phone VPN sees
+/// hundreds of flows in a session; 4096 is headroom, not a target.
+/// Past it the least-recently-seen flow is evicted — its next
+/// packet just creates a fresh flow (a cold start on the best
+/// leg), it is never dropped.
+pub const ADAPTIVE_MAX_FLOWS: usize = 4096;
+
+/// One [`AdaptiveFlow`] per flow, keyed by flow hash — the table
+/// the two pin points share (4.100). The Linux client loop and the
+/// Android worker both call [`AdaptiveFlowTable::pin_for_packet`]
+/// for every packet, so the same adaptive application logic runs
+/// in both places and the pin points cannot drift.
+///
+/// A flow's table entry is created on its first packet (on the
+/// best-graded leg, or leg 0 with no signals yet) and fed on every
+/// packet after that: the packet's length joins its cumulative
+/// bytes and [`AdaptiveFlow::decide`] runs with the current
+/// signals and the caller's monotonic clock. Flows whose resolved
+/// mode is not adaptive never get an entry — a rule pinning a flow
+/// to another mode is never touched by the policy, because the
+/// table is never consulted for it.
+#[derive(Default)]
+pub struct AdaptiveFlowTable {
+    flows: HashMap<u64, AdaptiveFlowEntry>,
+}
+
+impl AdaptiveFlowTable {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Flows currently tracked.
+    pub fn len(&self) -> usize {
+        self.flows.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.flows.is_empty()
+    }
+
+    /// Pin one packet: the single entry point both pin points use.
+    ///
+    /// The engine resolves the packet's mode from its destination
+    /// IP. When the mode is not [`TrafficMode::Adaptive`] the
+    /// engine's own order stands untouched — `duplicate` is true
+    /// exactly when the mode is [`TrafficMode::Redundant`] — so a
+    /// per-domain/IP rule pinning a flow to another mode, or a
+    /// non-adaptive default mode, is never overridden by the
+    /// policy. When the mode IS adaptive, the flow's entry decides
+    /// and the decision is applied: `Stay` keeps the current
+    /// placement (first candidate is the current leg, the rest are
+    /// the best-transport ranking as failover); `MoveTo(leg)`
+    /// re-pins the flow to that leg; `PromoteToSpread(legs)` orders
+    /// the spread legs first (the bandwidth-boost ordering over
+    /// those legs), then the remaining transports as failover;
+    /// `DuplicateThrough` fans the packet out to the handover legs
+    /// (`duplicate` true) until the window settles, when the next
+    /// decide returns `MoveTo` on the new leg.
+    pub fn pin_for_packet(
+        &mut self,
+        engine: &TrafficModeEngine,
+        packet: &[u8],
+        count: usize,
+        active_index: usize,
+        signals: &[PathSignal],
+        now_ms: u64,
+    ) -> AdaptivePin {
+        let mode = engine.mode_for_packet(packet);
+        if mode != TrafficMode::Adaptive {
+            return AdaptivePin {
+                candidates: engine.order_for_packet(packet, count, active_index, signals),
+                duplicate: mode == TrafficMode::Redundant,
+            };
+        }
+        let key = flow_hash(packet);
+        if !self.flows.contains_key(&key) {
+            if self.flows.len() >= ADAPTIVE_MAX_FLOWS {
+                if let Some(oldest) = self
+                    .flows
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.last_seen_ms)
+                    .map(|(key, _)| *key)
+                {
+                    self.flows.remove(&oldest);
+                }
+            }
+            self.flows.insert(
+                key,
+                AdaptiveFlowEntry {
+                    flow: AdaptiveFlow::new(signals, now_ms, None),
+                    bytes_total: 0,
+                    last_seen_ms: now_ms,
+                },
+            );
+        }
+        let entry = self.flows.get_mut(&key).expect("flow just inserted");
+        entry.bytes_total = entry
+            .bytes_total
+            .saturating_add(packet.len() as u64);
+        entry.last_seen_ms = now_ms;
+        let obs = FlowObservation {
+            bytes_total: entry.bytes_total,
+        };
+        // The returned decision is already reflected in the flow's
+        // strategy — decide updates state to match — so the
+        // placement below reads the strategy, not the decision.
+        let _decision = entry.flow.decide(&obs, signals, now_ms);
+        let strategy = entry.flow.strategy.clone();
+        adaptive_candidates(&strategy, count, active_index, signals)
+    }
+}
+
+/// Turn a flow's current strategy into the pin point's try-list
+/// (and fan-out flag). The best-transport ranking over the full
+/// transport set supplies the failover order behind the current
+/// placement and the remaining legs behind a spread set, so a
+/// send failure still fails over instead of dropping the packet.
+/// Legs that no longer exist in the transport set (it shrank
+/// since the flow was placed) are filtered out; with no
+/// transports at all the active transport is the only candidate,
+/// the same empty-set shape as the engine's orders.
+fn adaptive_candidates(
+    strategy: &Strategy,
+    count: usize,
+    active_index: usize,
+    signals: &[PathSignal],
+) -> AdaptivePin {
+    if count == 0 {
+        return AdaptivePin {
+            candidates: vec![active_index],
+            duplicate: false,
+        };
+    }
+    let ranked = TrafficModeEngine::default().order_candidates(
+        TrafficMode::BestTransport,
+        0,
+        count,
+        active_index,
+        signals,
+    );
+    match strategy {
+        Strategy::Single(leg) => {
+            let mut candidates = Vec::new();
+            if *leg < count {
+                candidates.push(*leg);
+            }
+            for index in ranked {
+                if !candidates.contains(&index) {
+                    candidates.push(index);
+                }
+            }
+            if !candidates.contains(&active_index) {
+                candidates.push(active_index);
+            }
+            AdaptivePin {
+                candidates,
+                duplicate: false,
+            }
+        }
+        Strategy::Spread(legs) => {
+            let mut candidates: Vec<usize> =
+                legs.iter().copied().filter(|leg| *leg < count).collect();
+            for index in ranked {
+                if !candidates.contains(&index) {
+                    candidates.push(index);
+                }
+            }
+            if !candidates.contains(&active_index) {
+                candidates.push(active_index);
+            }
+            AdaptivePin {
+                candidates,
+                duplicate: false,
+            }
+        }
+        Strategy::Duplicating { from, to, .. } => {
+            let legs: Vec<usize> = [*from, *to]
+                .into_iter()
+                .filter(|leg| *leg < count)
+                .collect();
+            if legs.is_empty() {
+                // Both handover legs vanished: fall back to the
+                // ranking as a single send, not a fan-out to
+                // nothing.
+                return AdaptivePin {
+                    candidates: ranked,
+                    duplicate: false,
+                };
+            }
+            AdaptivePin {
+                candidates: legs,
+                duplicate: true,
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::traffic_mode::PathSignal;
+    use crate::traffic_mode::{PathSignal, TrafficRule};
 
     fn signal(grade: Option<u8>, rtt_ms: Option<u64>, loss_rate: Option<f64>) -> PathSignal {
         PathSignal {
@@ -1182,5 +1417,170 @@ mod tests {
         );
         assert_eq!(d, AdaptiveDecision::Stay);
         assert_eq!(flow.strategy, Strategy::Single(0));
+    }
+
+    /// Build an IPv4 UDP packet to `dst` from `src_port`, padded
+    /// to `len` bytes total. The pin point counts the packet's
+    /// length as the flow's observed bytes, so the padding is what
+    /// drives the bulk thresholds in the table tests.
+    fn udp_packet(dst: [u8; 4], src_port: u16, len: usize) -> Vec<u8> {
+        let mut packet = vec![0u8; len.max(28)];
+        packet[0] = 0x45; // version 4, IHL 20
+        packet[9] = 17; // UDP
+        packet[12..16].copy_from_slice(&[192, 0, 2, 1]);
+        packet[16..20].copy_from_slice(&dst);
+        packet[20..22].copy_from_slice(&src_port.to_be_bytes());
+        packet[22..24].copy_from_slice(&443u16.to_be_bytes());
+        packet
+    }
+
+    fn adaptive_engine() -> TrafficModeEngine {
+        TrafficModeEngine {
+            default_mode: TrafficMode::Adaptive,
+            rules: vec![],
+        }
+    }
+
+    #[test]
+    fn table_pins_interactive_flow_to_best_leg() {
+        // A short flow under the adaptive default: every packet
+        // stays on the best-graded leg (0), with the other legs
+        // behind it as failover — never a fan-out.
+        let engine = adaptive_engine();
+        let signals = three_good_signals();
+        let mut table = AdaptiveFlowTable::new();
+        let packet = udp_packet([93, 184, 216, 34], 51000, 1_000);
+        for now_ms in [0u64, 100, 200, 500, 1_000] {
+            let pin = table.pin_for_packet(&engine, &packet, 3, 0, &signals, now_ms);
+            assert_eq!(pin.candidates, vec![0, 1, 2]);
+            assert!(!pin.duplicate);
+        }
+        assert_eq!(table.len(), 1);
+        // Empty transport set: the active transport is the only
+        // candidate, the same empty-set shape as the engine.
+        let pin = table.pin_for_packet(&engine, &packet, 0, 3, &signals, 2_000);
+        assert_eq!(pin.candidates, vec![3]);
+        assert!(!pin.duplicate);
+    }
+
+    #[test]
+    fn table_promotes_bulk_flow_to_spread() {
+        // The same download as the policy test, driven through the
+        // table with real packet lengths: 350 KiB per 500 ms tick.
+        let engine = adaptive_engine();
+        let signals = three_good_signals();
+        let mut table = AdaptiveFlowTable::new();
+        let packet = udp_packet([93, 184, 216, 34], 51000, 350_000);
+        let mut pins = Vec::new();
+        for now_ms in [0u64, 500, 1_000, 1_500, 2_000, 2_500] {
+            pins.push(table.pin_for_packet(&engine, &packet, 3, 0, &signals, now_ms));
+        }
+        // Under the 2 s age floor the flow stays single on leg 0.
+        for pin in &pins[0..4] {
+            assert_eq!(pin.candidates, vec![0, 1, 2]);
+            assert!(!pin.duplicate);
+        }
+        // At t = 2000 ms (1.75 MiB, 875 KiB/s) it promotes: the
+        // spread legs [0, 1] lead, leg 2 follows as failover.
+        assert_eq!(pins[4].candidates, vec![0, 1, 2]);
+        assert!(!pins[4].duplicate);
+        // ... and it stays spread while the signals are stable.
+        assert_eq!(pins[5].candidates, vec![0, 1, 2]);
+        assert!(!pins[5].duplicate);
+    }
+
+    #[test]
+    fn table_duplicates_through_degradation_then_settles() {
+        let engine = adaptive_engine();
+        let mut signals = three_good_signals();
+        let mut table = AdaptiveFlowTable::new();
+        let packet = udp_packet([93, 184, 216, 34], 51000, 10_000);
+        // Healthy first: single leg, no fan-out.
+        let pin = table.pin_for_packet(&engine, &packet, 3, 0, &signals, 1_000);
+        assert_eq!(pin.candidates, vec![0, 1, 2]);
+        assert!(!pin.duplicate);
+        // Leg 0 collapses 90 -> 60 at t = 2000 ms: duplicate
+        // through the handover on [0, 1].
+        signals[0] = signal(Some(60), Some(200), Some(0.05));
+        let pin = table.pin_for_packet(&engine, &packet, 3, 0, &signals, 2_000);
+        assert_eq!(pin.candidates, vec![0, 1]);
+        assert!(pin.duplicate, "the handover must fan out, got {pin:?}");
+        // Inside the window it keeps duplicating.
+        let pin = table.pin_for_packet(&engine, &packet, 3, 0, &signals, 2_200);
+        assert_eq!(pin.candidates, vec![0, 1]);
+        assert!(pin.duplicate);
+        // Past the window it settles on leg 1 — single send again.
+        let pin = table.pin_for_packet(&engine, &packet, 3, 0, &signals, 2_500);
+        assert_eq!(pin.candidates, vec![1, 0, 2]);
+        assert!(!pin.duplicate);
+    }
+
+    fn subnet_rule(id: &str, target: &str, mode: TrafficMode) -> TrafficRule {
+        use crate::traffic_mode::TrafficRuleKind;
+        TrafficRule {
+            id: id.to_string(),
+            kind: TrafficRuleKind::Subnet,
+            target: target.to_string(),
+            resolved_ips: vec![],
+            mode,
+        }
+    }
+
+    #[test]
+    fn table_pin_for_packet_never_overrides_a_pinned_rule() {
+        // Default adaptive, but 10.0.0.0/8 is pinned to Redundant:
+        // a packet to 10.1.2.3 fans out on all transports (the
+        // rule's mode), and the adaptive policy never sees it — no
+        // table entry is created for that flow.
+        let engine = TrafficModeEngine {
+            default_mode: TrafficMode::Adaptive,
+            rules: vec![subnet_rule("s", "10.0.0.0/8", TrafficMode::Redundant)],
+        };
+        let signals = three_good_signals();
+        let mut table = AdaptiveFlowTable::new();
+        let pinned = udp_packet([10, 1, 2, 3], 51000, 10_000);
+        let pin = table.pin_for_packet(&engine, &pinned, 3, 0, &signals, 1_000);
+        assert_eq!(pin.candidates, vec![0, 1, 2]);
+        assert!(pin.duplicate, "a redundant rule must fan out");
+        assert_eq!(table.len(), 0, "a pinned flow must not get an adaptive entry");
+        // The same engine, an unmatched destination: adaptive
+        // applies — best leg first, no fan-out.
+        let free = udp_packet([203, 0, 113, 1], 51000, 10_000);
+        let pin = table.pin_for_packet(&engine, &free, 3, 0, &signals, 1_000);
+        assert_eq!(pin.candidates, vec![0, 1, 2]);
+        assert!(!pin.duplicate);
+        assert_eq!(table.len(), 1);
+
+        // The mirror: default Redundant, but 10.0.0.0/8 is pinned
+        // to Adaptive — the rule's flow is adaptive (best leg, no
+        // fan-out) while every other flow fans out.
+        let engine = TrafficModeEngine {
+            default_mode: TrafficMode::Redundant,
+            rules: vec![subnet_rule("s", "10.0.0.0/8", TrafficMode::Adaptive)],
+        };
+        let mut table = AdaptiveFlowTable::new();
+        let pin = table.pin_for_packet(&engine, &pinned, 3, 0, &signals, 1_000);
+        assert_eq!(pin.candidates, vec![0, 1, 2]);
+        assert!(!pin.duplicate, "an adaptive rule must not fan out");
+        assert_eq!(table.len(), 1);
+        let pin = table.pin_for_packet(&engine, &free, 3, 0, &signals, 1_000);
+        assert_eq!(pin.candidates, vec![0, 1, 2]);
+        assert!(pin.duplicate, "the redundant default must fan out");
+        assert_eq!(table.len(), 1, "a redundant flow must not get an adaptive entry");
+    }
+
+    #[test]
+    fn table_evicts_least_recently_seen_flow_when_full() {
+        let engine = adaptive_engine();
+        let signals = three_good_signals();
+        let mut table = AdaptiveFlowTable::new();
+        // One more flow than the cap, each on its own port, seen in
+        // order: the first flow is the least recently seen and must
+        // be the one evicted.
+        for i in 0..=ADAPTIVE_MAX_FLOWS {
+            let packet = udp_packet([93, 184, 216, 34], i as u16, 100);
+            table.pin_for_packet(&engine, &packet, 3, 0, &signals, i as u64);
+        }
+        assert_eq!(table.len(), ADAPTIVE_MAX_FLOWS);
     }
 }

@@ -74,6 +74,26 @@ void main() {
     expect(find.text('Add rule'), findsOneWidget);
   });
 
+  testWidgets('default-mode picker offers Adaptive and saves it', (
+    WidgetTester tester,
+  ) async {
+    await pumpScreen(tester);
+
+    // The default-mode dropdown lists Adaptive as a real mode.
+    await tester.tap(find.text('Default (flow spreading)'));
+    await tester.pumpAndSettle();
+    expect(find.text('Adaptive (per-flow)'), findsOneWidget);
+
+    // Picking it saves `adaptive` as the default mode — opt-in,
+    // never the default unless the user picks it.
+    await tester.tap(find.text('Adaptive (per-flow)'));
+    await tester.pumpAndSettle();
+    final saved = jsonDecode(
+      storedSettings['trafficRulesJson'] as String,
+    ) as Map<String, dynamic>;
+    expect(saved['defaultMode'], 'adaptive');
+  });
+
   testWidgets('lists a rule with its mode and resolved IPs', (
     WidgetTester tester,
   ) async {
@@ -126,16 +146,16 @@ void main() {
     expect(find.textContaining('could not resolve'), findsOneWidget);
   });
 
-  testWidgets('no mode shows the fallback note any more (all five implemented)', (
+  testWidgets('no mode shows the fallback note any more (all six implemented)', (
     WidgetTester tester,
   ) async {
-    // 4.54 implemented the last mode, so the fallback note — which
+    // 4.100 implemented the last mode, so the fallback note — which
     // used to appear for `redundant` — must show for no mode now.
-    // `redundant` as the default mode is the sharpest case: it was
+    // `adaptive` as the default mode is the sharpest case: it was
     // the last unimplemented one.
     storedSettings = settingsMap(
       trafficRulesJson: jsonEncode({
-        'defaultMode': 'redundant',
+        'defaultMode': 'adaptive',
         'rules': <Map<String, dynamic>>[],
       }),
     );

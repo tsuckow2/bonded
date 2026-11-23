@@ -2244,6 +2244,14 @@ fn start_android_session(
                 None
             };
             let mut active_index = 0_usize;
+            // Adaptive traffic mode (4.100): one AdaptiveFlow per
+            // flow, keyed by flow hash, in the table the pin point
+            // below consults for every packet. The epoch is the
+            // session's monotonic clock for decide's now_ms; the
+            // table itself is created per session, so a flow never
+            // carries adaptive state across a restart.
+            let mut adaptive_flows = bonded_core::adaptive::AdaptiveFlowTable::new();
+            let adaptive_epoch = Instant::now();
             let mut session = SessionState::new(session_id);
             let mut ping_sequence = 0u64;
             let mut last_ping_sent_ms: Option<u64> = None;
@@ -2869,7 +2877,37 @@ fn start_android_session(
                                 // 1 s poll tick — so best-transport and
                                 // lowest-latency have something to rank
                                 // on. The default mode ignores them.
+                                //
+                                // Adaptive (4.100): when the resolved
+                                // mode is adaptive, the pin comes from
+                                // the per-flow table instead of the
+                                // engine's stateless order — one call
+                                // covers both, so this pin point and
+                                // the Linux client loop cannot drift.
+                                // The table feeds the flow's cumulative
+                                // bytes (this packet's length joins
+                                // them), the live signals above, and
+                                // the session clock, and applies the
+                                // decision: stay keeps the current leg
+                                // first, a move re-pins, a bulk
+                                // promotion orders the spread legs
+                                // first, and a handover duplicates
+                                // (then `duplicate` is true and the
+                                // fan-out below runs, with the
+                                // redundant flag so the server fans
+                                // the return traffic out the same
+                                // way). A flow pinned by a rule to
+                                // another mode never reaches the
+                                // table — the engine's order stands.
                                 let engine = traffic_mode_engine_snapshot();
+                                let pin = adaptive_flows.pin_for_packet(
+                                    &engine,
+                                    &packet,
+                                    transports.len(),
+                                    active_index,
+                                    &path_signals(&worker_snapshot, transports.len()),
+                                    adaptive_epoch.elapsed().as_millis() as u64,
+                                );
                                 // Redundant (4.54): a flow in this mode
                                 // is NOT pinned — its packet is fanned
                                 // out to every live transport, and the
@@ -2877,18 +2915,13 @@ fn start_android_session(
                                 // server fans the return traffic out
                                 // the same way (the server has no rule
                                 // table; the flag is the signaling).
+                                // An adaptive handover duplicates the
+                                // same way, on its two legs.
                                 // Non-redundant flows keep the
                                 // try-list discipline below.
-                                let mode = engine.mode_for_packet(&packet);
-                                let redundant = mode
-                                    == bonded_core::traffic_mode::TrafficMode::Redundant;
+                                let redundant = pin.duplicate;
                                 let frame_flags = if redundant { FLAG_REDUNDANT } else { 0 };
-                                let ordered = engine.order_for_packet(
-                                    &packet,
-                                    transports.len(),
-                                    active_index,
-                                    &path_signals(&worker_snapshot, transports.len()),
-                                );
+                                let ordered = pin.candidates;
                                 let frame = session
                                     .create_outbound_frame(Bytes::from(packet), frame_flags);
                                 // Paused paths go last in the try-list:

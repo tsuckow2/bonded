@@ -3,9 +3,9 @@
 //! A mode picks how a flow's packets are spread over the session's
 //! transports. The default mode is today's behavior: pin each flow to
 //! one transport by flow hash. `best_transport` and `lowest_latency`
-//! landed in 4.52, `bandwidth_boost` in 4.53, and `redundant` in
-//! 4.54 — all five modes now have behavior, and no mode falls back
-//! to default any more.
+//! landed in 4.52, `bandwidth_boost` in 4.53, `redundant` in 4.54,
+//! and `adaptive` in 4.100 — all six modes now have behavior, and no
+//! mode falls back to default any more.
 //!
 //! Rules resolve a mode per flow from the destination IP only. A rule
 //! matches an exact IP, a subnet (CIDR), or the IPs a domain resolved
@@ -44,6 +44,14 @@ pub enum TrafficMode {
     BandwidthBoost,
     /// Duplicate on all transports, both ways (4.54).
     Redundant,
+    /// Per-flow policy composing the other modes (4.100): a flow
+    /// starts on the best-graded leg, promotes to a bandwidth-boost
+    /// spread if it proves bulk, and duplicates briefly through a
+    /// degradation handover. Stateful — see
+    /// [`crate::adaptive::AdaptiveFlowTable`]; the stateless
+    /// [`TrafficModeEngine::order_candidates`] arm below is only the
+    /// flow's initial placement (the best-transport ranking).
+    Adaptive,
 }
 
 impl TrafficMode {
@@ -55,6 +63,7 @@ impl TrafficMode {
             TrafficMode::LowestLatency => "lowest_latency",
             TrafficMode::BandwidthBoost => "bandwidth_boost",
             TrafficMode::Redundant => "redundant",
+            TrafficMode::Adaptive => "adaptive",
         }
     }
 
@@ -66,11 +75,12 @@ impl TrafficMode {
             "lowest_latency" => TrafficMode::LowestLatency,
             "bandwidth_boost" => TrafficMode::BandwidthBoost,
             "redundant" => TrafficMode::Redundant,
+            "adaptive" => TrafficMode::Adaptive,
             _ => TrafficMode::Default,
         }
     }
 
-    /// All five modes have behavior (4.51–4.54). `is_implemented`
+    /// All six modes have behavior (4.51–4.54, 4.100). `is_implemented`
     /// stays as the UI's source of truth for the fallback note — it
     /// is now true for every mode, so no mode shows the note any
     /// more — and `effective` is the identity for every mode.
@@ -82,6 +92,7 @@ impl TrafficMode {
                 | TrafficMode::LowestLatency
                 | TrafficMode::BandwidthBoost
                 | TrafficMode::Redundant
+                | TrafficMode::Adaptive
         )
     }
 
@@ -225,8 +236,8 @@ impl TrafficModeEngine {
     }
 
     /// The mode governing one flow, from its destination IP: the most
-    /// specific matching rule wins, else the default mode. All five
-    /// modes have behavior since 4.54, so the returned mode is the
+    /// specific matching rule wins, else the default mode. All six
+    /// modes have behavior since 4.100, so the returned mode is the
     /// one that governs the flow — there is no fallback left to
     /// apply in [`TrafficModeEngine::order_candidates`].
     pub fn mode_for(&self, dst: IpAddr) -> TrafficMode {
@@ -284,7 +295,16 @@ impl TrafficModeEngine {
     /// for every packet of the flow; the pin points filter it to
     /// the live (non-paused) transports before sending. With one
     /// transport the fan-out is exactly one copy, i.e. the
-    /// degenerate case is the default behavior.
+    /// degenerate case is the default behavior. `adaptive` (4.100)
+    /// is stateful and this arm is NOT its behavior: it is only the
+    /// flow's initial placement — the best-transport ranking, the
+    /// leg a new adaptive flow starts on. The real decisions
+    /// (stay / move / spread / duplicate) live in
+    /// [`crate::adaptive::AdaptiveFlowTable::pin_for_packet`], which
+    /// the pin points call instead of this function when the
+    /// resolved mode is adaptive; a caller that reaches this arm
+    /// gets a sane order (the best leg first) but no promotion,
+    /// handover, or duplication.
     pub fn order_candidates(
         &self,
         mode: TrafficMode,
@@ -305,6 +325,9 @@ impl TrafficModeEngine {
                 bandwidth_boost_order(flow_hash, count, active_index, signals)
             }
             TrafficMode::Redundant => redundant_order(count, active_index),
+            TrafficMode::Adaptive => {
+                ranked_order(count, active_index, signals, best_transport_cmp)
+            }
         }
     }
 
@@ -668,6 +691,7 @@ mod tests {
             TrafficMode::LowestLatency,
             TrafficMode::BandwidthBoost,
             TrafficMode::Redundant,
+            TrafficMode::Adaptive,
         ] {
             assert_eq!(TrafficMode::from_wire_name(mode.wire_name()), mode);
         }
@@ -676,12 +700,17 @@ mod tests {
     }
 
     #[test]
-    fn all_five_modes_are_implemented() {
+    fn all_six_modes_are_implemented() {
         assert!(TrafficMode::Default.is_implemented());
         assert!(TrafficMode::BestTransport.is_implemented());
         assert!(TrafficMode::LowestLatency.is_implemented());
         assert!(TrafficMode::BandwidthBoost.is_implemented());
         assert!(TrafficMode::Redundant.is_implemented());
+        assert!(TrafficMode::Adaptive.is_implemented());
+        assert_eq!(
+            TrafficMode::Adaptive.effective(),
+            TrafficMode::Adaptive
+        );
         assert_eq!(
             TrafficMode::BestTransport.effective(),
             TrafficMode::BestTransport
@@ -923,6 +952,31 @@ mod tests {
         assert_eq!(
             engine.order_candidates(TrafficMode::Redundant, 7, 0, 3, &[]),
             vec![3]
+        );
+    }
+
+    #[test]
+    fn adaptive_stateless_order_is_the_best_transport_ranking() {
+        // The Adaptive arm of order_candidates is only the flow's
+        // initial placement (4.100): the best-transport ranking —
+        // the leg a new adaptive flow starts on. The promotion /
+        // handover / duplication decisions live in
+        // AdaptiveFlowTable::pin_for_packet, not here.
+        let engine = TrafficModeEngine::default();
+        let signals = [
+            signal(Some(80), Some(20), Some(0.01)),
+            signal(Some(95), Some(200), Some(0.09)),
+            signal(Some(70), Some(10), Some(0.0)),
+        ];
+        assert_eq!(
+            engine.order_candidates(TrafficMode::Adaptive, 7, 3, 0, &signals),
+            vec![1, 0, 2]
+        );
+        // No signals: index order, same as best transport with
+        // nothing measured.
+        assert_eq!(
+            engine.order_candidates(TrafficMode::Adaptive, 7, 3, 0, &[]),
+            vec![0, 1, 2]
         );
     }
 

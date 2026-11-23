@@ -3,9 +3,9 @@
 /// A mode picks how a flow's packets are placed on the session's
 /// transports. `default` has behavior since 4.51; `bestTransport`
 /// and `lowestLatency` since 4.52; `bandwidthBoost` since 4.53;
-/// `redundant` since 4.54. All five modes are implemented — no mode
-/// falls back to default any more, and the fallback note shows for
-/// no mode.
+/// `redundant` since 4.54; `adaptive` since 4.100. All six modes
+/// are implemented — no mode falls back to default any more, and
+/// the fallback note shows for no mode.
 ///
 /// Rules resolve a mode per flow from the destination IP only, in
 /// Rust (`bonded-core` `TrafficModeEngine`). A rule matches an exact
@@ -37,7 +37,12 @@ enum TrafficMode {
   bandwidthBoost,
 
   /// Duplicate on all transports, both ways (4.54).
-  redundant;
+  redundant,
+
+  /// Per-flow policy composing the other modes (4.100): a flow
+  /// starts on the best-graded leg, spreads if it proves bulk, and
+  /// duplicates briefly through a degradation handover.
+  adaptive;
 
   /// Wire name shared with Rust (`default`, `best_transport`, …).
   String get wireName => switch (this) {
@@ -46,6 +51,7 @@ enum TrafficMode {
     TrafficMode.lowestLatency => 'lowest_latency',
     TrafficMode.bandwidthBoost => 'bandwidth_boost',
     TrafficMode.redundant => 'redundant',
+    TrafficMode.adaptive => 'adaptive',
   };
 
   /// Short label for the rules UI.
@@ -55,9 +61,10 @@ enum TrafficMode {
     TrafficMode.lowestLatency => 'Lowest latency',
     TrafficMode.bandwidthBoost => 'Bandwidth boost',
     TrafficMode.redundant => 'Redundant (all transports)',
+    TrafficMode.adaptive => 'Adaptive (per-flow)',
   };
 
-  /// All five modes have behavior (4.51–4.54). `isImplemented`
+  /// All six modes have behavior (4.51–4.54, 4.100). `isImplemented`
   /// stays as the UI's source of truth for the fallback note — it
   /// is now true for every mode, so no mode shows the note.
   bool get isImplemented =>
@@ -65,7 +72,8 @@ enum TrafficMode {
       this == TrafficMode.bestTransport ||
       this == TrafficMode.lowestLatency ||
       this == TrafficMode.bandwidthBoost ||
-      this == TrafficMode.redundant;
+      this == TrafficMode.redundant ||
+      this == TrafficMode.adaptive;
 
   /// The slice that implements this mode, for the UI fallback note.
   String get implementedIn => switch (this) {
@@ -74,6 +82,7 @@ enum TrafficMode {
     TrafficMode.lowestLatency => '4.52',
     TrafficMode.bandwidthBoost => '4.53',
     TrafficMode.redundant => '4.54',
+    TrafficMode.adaptive => '4.100',
   };
 
   static TrafficMode fromWireName(String? name) => switch (name) {
@@ -81,6 +90,7 @@ enum TrafficMode {
     'lowest_latency' => TrafficMode.lowestLatency,
     'bandwidth_boost' => TrafficMode.bandwidthBoost,
     'redundant' => TrafficMode.redundant,
+    'adaptive' => TrafficMode.adaptive,
     _ => TrafficMode.defaultMode,
   };
 }

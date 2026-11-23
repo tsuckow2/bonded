@@ -14,7 +14,6 @@ use bonded_core::session::{
     FLAG_PING, FLAG_PONG, FLAG_REDUNDANT,
 };
 #[cfg(target_os = "linux")]
-use bonded_core::traffic_mode::TrafficMode;
 use bonded_core::transport::{
     NaiveTcpTransport, QuicTransport, Transport, WebSocketTlsTransport, WireGuardTransport,
 };
@@ -2864,6 +2863,18 @@ async fn run_linux_packet_loop(
     // slice, so the loop below runs the default engine — today's
     // flow-hash spreading, unchanged.
     let traffic_engine = bonded_core::traffic_mode::TrafficModeEngine::default();
+    // Adaptive traffic mode (4.100): one AdaptiveFlow per flow, in
+    // the table the pin point below consults for every packet — the
+    // same call the Android worker makes, so the two pin points
+    // cannot drift. The CLI feeds it no signals yet (no grades /
+    // RTT feed in the CLI, so it passes the same empty slice the
+    // engine orders got before): an adaptive flow here starts on
+    // leg 0 and stays there until CLI signal input lands — the same
+    // inert-until-input posture the redundant branch had under the
+    // default engine. The epoch is the loop's monotonic clock for
+    // decide's now_ms.
+    let mut adaptive_flows = bonded_core::adaptive::AdaptiveFlowTable::new();
+    let adaptive_epoch = Instant::now();
     // Skip the immediate first tick; we just completed binding.
     heartbeat.tick().await;
 
@@ -2880,6 +2891,24 @@ async fn run_linux_packet_loop(
                 last_traffic = Instant::now();
 
                 let packet = Bytes::copy_from_slice(&tun_buf[..read]);
+                // Adaptive (4.100): the pin comes from the per-flow
+                // table — one call that resolves the mode and, when
+                // it is adaptive, applies the flow's decision (stay
+                // / move / spread / duplicate), fed with this
+                // packet's length, the (currently empty) signals,
+                // and the loop clock. The same call the Android
+                // worker makes, so the two pin points cannot drift.
+                // A flow pinned by a rule to another mode never
+                // reaches the table; `duplicate` is true exactly
+                // for a redundant flow or an adaptive handover.
+                let pin = adaptive_flows.pin_for_packet(
+                    &traffic_engine,
+                    &packet,
+                    transports.len(),
+                    active_index,
+                    &[],
+                    adaptive_epoch.elapsed().as_millis() as u64,
+                );
                 // Redundant (4.54): a flow in this mode is NOT pinned
                 // — its packet is fanned out to every live transport,
                 // and the frame carries FLAG_REDUNDANT so the server
@@ -2888,16 +2917,12 @@ async fn run_linux_packet_loop(
                 // flow resolves redundant here today — the branch is
                 // the same fan-out the Android worker runs, kept so
                 // the two pin points cannot drift when CLI rule
-                // input lands.
-                let redundant = traffic_engine.mode_for_packet(&packet)
-                    == TrafficMode::Redundant;
+                // input lands. An adaptive handover duplicates the
+                // same way, on its two legs.
+                let redundant = pin.duplicate;
                 let frame_flags = if redundant { FLAG_REDUNDANT } else { 0 };
                 let frame = state.create_outbound_frame(packet.clone(), frame_flags);
-                // Traffic modes (4.51): the engine resolves the mode
-                // for this packet's destination IP and orders the
-                // try-list. The Linux CLI has no rule input in this
-                // slice, so it runs the default engine — today's
-                // flow-hash spreading, unchanged. Candidates are the
+                // Traffic modes (4.51): the candidates are the
                 // mode-ordered transports, then the active transport
                 // as a last resort. A failed candidate is removed and
                 // the next one is tried with the same frame; failing
@@ -2906,12 +2931,7 @@ async fn run_linux_packet_loop(
                 // the fan-out set (every transport, index order) and
                 // each gets a copy instead of the first success
                 // stopping the loop.
-                let candidates: Vec<usize> = traffic_engine.order_for_packet(
-                    &packet,
-                    transports.len(),
-                    active_index,
-                    &[],
-                );
+                let candidates: Vec<usize> = pin.candidates;
                 let mut sent = false;
                 if redundant {
                     // Fan out: targets are ascending (redundant

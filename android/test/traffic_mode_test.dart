@@ -12,16 +12,20 @@ void main() {
       expect(TrafficMode.fromWireName(null), TrafficMode.defaultMode);
     });
 
-    test('all five modes are implemented in 4.54', () {
+    test('all six modes are implemented in 4.100', () {
       expect(TrafficMode.defaultMode.isImplemented, isTrue);
       expect(TrafficMode.bestTransport.isImplemented, isTrue);
       expect(TrafficMode.lowestLatency.isImplemented, isTrue);
       expect(TrafficMode.bandwidthBoost.isImplemented, isTrue);
       expect(TrafficMode.redundant.isImplemented, isTrue);
+      expect(TrafficMode.adaptive.isImplemented, isTrue);
       expect(TrafficMode.bestTransport.implementedIn, '4.52');
       expect(TrafficMode.lowestLatency.implementedIn, '4.52');
       expect(TrafficMode.bandwidthBoost.implementedIn, '4.53');
       expect(TrafficMode.redundant.implementedIn, '4.54');
+      expect(TrafficMode.adaptive.implementedIn, '4.100');
+      expect(TrafficMode.adaptive.wireName, 'adaptive');
+      expect(TrafficMode.adaptive.label, 'Adaptive (per-flow)');
     });
   });
 
