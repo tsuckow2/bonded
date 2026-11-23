@@ -13,6 +13,7 @@ use bonded_core::session::{
     SessionFrame, SessionHeader, SessionState, SessionStateError, FLAG_MULTIPATH_RECV,
     FLAG_PING, FLAG_PONG, FLAG_REDUNDANT,
 };
+#[cfg(target_os = "linux")]
 use bonded_core::traffic_mode::PathSignal;
 use bonded_core::transport::{
     NaiveTcpTransport, QuicTransport, Transport, WebSocketTlsTransport, WireGuardTransport,
@@ -2800,6 +2801,7 @@ fn cli_path_signals(
         .collect()
 }
 
+#[cfg(target_os = "linux")]
 async fn run_linux_packet_loop(
     tun_name: &str,
     transports: Vec<ClientTransport>,
