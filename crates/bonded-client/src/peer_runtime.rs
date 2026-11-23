@@ -350,20 +350,36 @@ fn renewal_delay(expires_at: u64, now_secs: u64) -> Duration {
     Duration::from_secs(renew_at.saturating_sub(now_secs)).max(PEER_RELAY_RENEWAL_MIN_DELAY)
 }
 
-/// Fire a renewal notice for one peer after `delay`. The notice carries
-/// the dial generation it was scheduled for; the browse loop ignores
-/// notices whose generation a newer dial has superseded.
+/// Fire a renewal notice for one peer after `delay`. The notice
+/// carries the dial generation it was scheduled for and the
+/// direction of that leg; the browse loop ignores notices whose
+/// generation a newer dial in the SAME direction has superseded
+/// (4.102, item 7: generations are per-direction, so a reversed
+/// renewal no longer invalidates a forward leg's notice).
 fn spawn_renewal_notice(
-    renewal_tx: &tokio::sync::mpsc::UnboundedSender<(String, u64)>,
+    renewal_tx: &tokio::sync::mpsc::UnboundedSender<(String, u64, bool)>,
     peer_id: String,
     generation: u64,
+    reversed: bool,
     delay: Duration,
 ) {
     let renewal_tx = renewal_tx.clone();
     tokio::spawn(async move {
         sleep(delay).await;
-        let _ = renewal_tx.send((peer_id, generation));
+        let _ = renewal_tx.send((peer_id, generation, reversed));
     });
+}
+
+/// Per-direction renewal state for one peer: the newest dial's
+/// generation and introduction expiry in that direction. Renewal
+/// is tracked per direction (4.102, item 7): a peer holding both
+/// a forward and a reversed leg renews each direction on its own
+/// schedule, instead of the newest leg's direction governing the
+/// one renewal for the peer.
+#[derive(Default, Clone, Copy)]
+struct DirectionRenewal {
+    generation: u64,
+    expires_at: u64,
 }
 
 /// Live relay legs per discovered peer, with the renewal bookkeeping.
@@ -371,17 +387,13 @@ fn spawn_renewal_notice(
 /// A peer can briefly hold two legs (the renewal overlap), so
 /// "connected" is a count, not a flag: discovery is only re-driven
 /// when the LAST leg closes. The generation identifies the newest
-/// dial; renewal notices scheduled by superseded dials are stale.
+/// dial in each direction; renewal notices scheduled by superseded
+/// dials in the same direction are stale.
 #[derive(Default)]
 struct PeerLegTracker {
     legs: HashMap<String, usize>,
-    generations: HashMap<String, u64>,
-    expires_at: HashMap<String, u64>,
-    // Direction of the peer's NEWEST leg: true when it arrived via
-    // a reversed introduction (4.67). Renewal follows the newest
-    // leg's direction, so a reversed leg renews in reverse instead
-    // of re-dialing forward into the hotspot case.
-    reversed: HashMap<String, bool>,
+    forward: HashMap<String, DirectionRenewal>,
+    reversed: HashMap<String, DirectionRenewal>,
 }
 
 impl PeerLegTracker {
@@ -393,20 +405,47 @@ impl PeerLegTracker {
         self.legs.get(peer_id).copied().unwrap_or(0)
     }
 
-    /// Whether the peer's newest leg arrived via a reversed
-    /// introduction. False for forward legs and unknown peers.
-    fn is_reversed(&self, peer_id: &str) -> bool {
-        self.reversed.get(peer_id).copied().unwrap_or(false)
+    /// Whether the peer's newest leg in `reversed` direction is the
+    /// current generation for that direction. False for unknown
+    /// peers and for a direction with no leg.
+    fn is_current_generation(&self, peer_id: &str, generation: u64, reversed: bool) -> bool {
+        self.current_generation(peer_id, reversed) == Some(generation)
     }
 
-    /// Record a freshly dialed leg; returns its renewal generation.
+    fn current_generation(&self, peer_id: &str, reversed: bool) -> Option<u64> {
+        self.direction_state(peer_id, reversed)
+            .map(|state| state.generation)
+            .filter(|generation| *generation > 0)
+    }
+
+    fn current_expires_at(&self, peer_id: &str, reversed: bool) -> Option<u64> {
+        self.direction_state(peer_id, reversed)
+            .map(|state| state.expires_at)
+            .filter(|expires_at| *expires_at > 0)
+    }
+
+    fn direction_state(&self, peer_id: &str, reversed: bool) -> Option<&DirectionRenewal> {
+        if reversed {
+            self.reversed.get(peer_id)
+        } else {
+            self.forward.get(peer_id)
+        }
+    }
+
+    /// Record a freshly dialed leg; returns its renewal generation
+    /// in its own direction. A dial in one direction never touches
+    /// the other direction's generation, so the other direction's
+    /// pending renewal notice stays valid.
     fn note_dial(&mut self, peer_id: &str, expires_at: u64, reversed: bool) -> u64 {
         *self.legs.entry(peer_id.to_owned()).or_default() += 1;
-        self.expires_at.insert(peer_id.to_owned(), expires_at);
-        self.reversed.insert(peer_id.to_owned(), reversed);
-        let generation = self.generations.entry(peer_id.to_owned()).or_default();
-        *generation += 1;
-        *generation
+        let state = if reversed {
+            self.reversed.entry(peer_id.to_owned()).or_default()
+        } else {
+            self.forward.entry(peer_id.to_owned()).or_default()
+        };
+        state.generation += 1;
+        state.expires_at = expires_at;
+        state.generation
     }
 
     /// Record a closed leg. Returns true when the peer has no legs
@@ -425,31 +464,22 @@ impl PeerLegTracker {
             None => true,
         }
     }
-
-    fn is_current_generation(&self, peer_id: &str, generation: u64) -> bool {
-        self.generations.get(peer_id).copied() == Some(generation)
-    }
-
-    fn current_generation(&self, peer_id: &str) -> Option<u64> {
-        self.generations.get(peer_id).copied()
-    }
-
-    fn current_expires_at(&self, peer_id: &str) -> Option<u64> {
-        self.expires_at.get(peer_id).copied()
-    }
 }
 
 /// After a failed renewal dial, schedule one retry notice while the
 /// current leg still has enough life left for the retry to land before
 /// expiry. Otherwise the expiry + redial machinery is the backstop.
+/// The retry re-fires for the same direction (`reversed`), so a
+/// failed reversed renewal does not become a forward retry.
 fn schedule_renewal_retry(
     legs: &PeerLegTracker,
-    renewal_tx: &tokio::sync::mpsc::UnboundedSender<(String, u64)>,
+    renewal_tx: &tokio::sync::mpsc::UnboundedSender<(String, u64, bool)>,
     peer_id: &str,
+    reversed: bool,
 ) {
     let (Some(expires_at), Some(generation)) = (
-        legs.current_expires_at(peer_id),
-        legs.current_generation(peer_id),
+        legs.current_expires_at(peer_id, reversed),
+        legs.current_generation(peer_id, reversed),
     ) else {
         return;
     };
@@ -458,6 +488,7 @@ fn schedule_renewal_retry(
             renewal_tx,
             peer_id.to_owned(),
             generation,
+            reversed,
             PEER_RELAY_RENEWAL_RETRY_DELAY,
         );
     }
@@ -575,6 +606,54 @@ impl Drop for PeerShareRuntime {
     }
 }
 
+/// Bound on continuous upstream failure for one relay leg (4.102,
+/// item 6 — the upstream-dead leg): while the upstream
+/// (provider->server) is down, `run_relay_task` retries with
+/// backoff, but a leg whose upstream never comes back must not be
+/// retried until its 300 s introduction expires. The consumer
+/// counts the leg connected the whole time (its peer QUIC
+/// connection is alive and the FFI worker only retires a leg on
+/// expiry or on a closed connection), so a dead upstream is a
+/// zombie leg: counted, carrying nothing, and blocking no
+/// rediscovery. 60 s covers ~5 re-establishment attempts at the
+/// 1 s -> 30 s backoff (plus dial time) — long enough to ride out
+/// a transient path flap or a server restart, far shorter than
+/// the introduction lifetime. When the bound is hit the relay
+/// task ends, which drops the peer connection; the consumer then
+/// learns the leg is dead through the existing path (its
+/// send/recv fails or the FFI worker's
+/// `peer_relay_connection_closed` retire check fires the close
+/// notifier) and re-drives discovery for the peer instead of
+/// counting the zombie forever.
+const RELAY_UPSTREAM_DEAD_AFTER: Duration = Duration::from_secs(60);
+
+/// Continuous upstream-failure state for one relay task (4.102,
+/// item 6). Pure over injected instants so the bound is
+/// unit-testable without a live upstream: a failure starts (or
+/// continues) the window, a healthy pump resets it, and the leg
+/// is dead once the window reaches `RELAY_UPSTREAM_DEAD_AFTER`.
+#[derive(Default)]
+struct UpstreamFailureTracker {
+    first_failure_at: Option<std::time::Instant>,
+}
+
+impl UpstreamFailureTracker {
+    /// Record an upstream failure at `now`; returns true when the
+    /// leg has now been continuously failing for at least
+    /// `RELAY_UPSTREAM_DEAD_AFTER` and should be abandoned.
+    fn record_failure(&mut self, now: std::time::Instant) -> bool {
+        let first = *self.first_failure_at.get_or_insert(now);
+        now.saturating_duration_since(first) >= RELAY_UPSTREAM_DEAD_AFTER
+    }
+
+    /// Record a healthy upstream (a pump started): the failure
+    /// window resets, so a later transient blip gets a fresh
+    /// budget instead of inheriting an old one.
+    fn record_success(&mut self) {
+        self.first_failure_at = None;
+    }
+}
+
 /// One relay pump task for a provider-side leg (4.57): shared by
 /// the forward accept loop and the dial-back handler, so both
 /// directions get the same upstream re-establishment, expiry
@@ -613,7 +692,12 @@ async fn run_relay_task(
     // Resilience: if the upstream (provider->server) connection fails,
     // re-establish it instead of terminating the relay permanently.
     // The peer (consumer->provider QUIC) connection is kept alive
-    // across upstream reconnects.
+    // across upstream reconnects. Bounded (4.102, item 6): an
+    // upstream that fails continuously for RELAY_UPSTREAM_DEAD_AFTER
+    // ends the task instead of retrying until the introduction
+    // expires, so the consumer learns the leg is dead (its peer
+    // connection drops) and re-discovers the peer.
+    let mut upstream_failures = UpstreamFailureTracker::default();
     let result = async {
         let mut retry_delay = std::time::Duration::from_secs(1);
         const MAX_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
@@ -649,6 +733,11 @@ async fn run_relay_task(
                     Ok(upstream) => upstream,
                     Err(e) => {
                         tracing::warn!(error = %e, "provider: failed to establish relay upstream, retrying");
+                        if upstream_failures.record_failure(std::time::Instant::now()) {
+                            anyhow::bail!(
+                                "peer relay upstream dead for {RELAY_UPSTREAM_DEAD_AFTER:?}; abandoning relay so the consumer can re-discover"
+                            );
+                        }
                         tokio::time::sleep(retry_delay).await;
                         retry_delay =
                             std::cmp::min(retry_delay * 2, MAX_RETRY_DELAY);
@@ -658,11 +747,19 @@ async fn run_relay_task(
             tracing::warn!("provider: sending relay registration");
             if let Err(e) = register_peer_relay_upstream(&mut upstream, introduction.clone()).await {
                 tracing::warn!(error = %e, "provider: relay registration failed, retrying");
+                if upstream_failures.record_failure(std::time::Instant::now()) {
+                    anyhow::bail!(
+                        "peer relay upstream dead for {RELAY_UPSTREAM_DEAD_AFTER:?}; abandoning relay so the consumer can re-discover"
+                    );
+                }
                 tokio::time::sleep(retry_delay).await;
                 retry_delay = std::cmp::min(retry_delay * 2, MAX_RETRY_DELAY);
                 continue;
             }
             tracing::warn!("provider: relay registration sent");
+            // The upstream is healthy again: a later failure gets a
+            // fresh 60 s budget instead of inheriting this window.
+            upstream_failures.record_success();
             let mut limiter = PeerRelayRateLimiter::new(bandwidth_kbps);
             match relay_peer_frames_rate_limited(
                 &mut peer,
@@ -689,6 +786,11 @@ async fn run_relay_task(
                         return Ok(());
                     }
                     tracing::warn!(error = %e, "provider: relay upstream failed, re-establishing");
+                    if upstream_failures.record_failure(std::time::Instant::now()) {
+                        anyhow::bail!(
+                            "peer relay upstream dead for {RELAY_UPSTREAM_DEAD_AFTER:?}; abandoning relay so the consumer can re-discover"
+                        );
+                    }
                     tokio::time::sleep(retry_delay).await;
                     retry_delay = std::cmp::min(retry_delay * 2, MAX_RETRY_DELAY);
                     // Continue loop to re-establish upstream
@@ -1668,7 +1770,7 @@ pub async fn start_peer_share_runtime(
         };
         let (closed_peer_tx, mut closed_peer_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let (renewal_tx, mut renewal_rx) =
-            tokio::sync::mpsc::unbounded_channel::<(String, u64)>();
+            tokio::sync::mpsc::unbounded_channel::<(String, u64, bool)>();
         let mut browser = browser.expect("consumer mode requires browser");
         // UTC minute of the last discovery-window re-query. The 1s
         // recv timeout below notices a new minute within a second, so
@@ -1776,15 +1878,24 @@ pub async fn start_peer_share_runtime(
                             &renewal_tx,
                             peer_id.clone(),
                             generation,
+                            true,
                             renewal_delay(leg.expires_at, now_unix_secs()),
                         );
                         continue;
                     }
-                    Some((peer_id, generation)) = renewal_rx.recv() => {
+                    Some((peer_id, generation, reversed)) = renewal_rx.recv() => {
                         // Make-before-break renewal: dial the replacement
                         // leg while the current one is still bound.
+                        // The notice renews its OWN direction (4.102,
+                        // item 7): a peer holding both a forward and
+                        // a reversed leg gets a renewal notice per
+                        // direction, so both directions stay alive
+                        // instead of only the newest leg's direction
+                        // renewing. A notice is stale only when a
+                        // newer dial in the SAME direction superseded
+                        // it.
                         if !legs.is_connected(&peer_id)
-                            || !legs.is_current_generation(&peer_id, generation)
+                            || !legs.is_current_generation(&peer_id, generation, reversed)
                         {
                             continue;
                         }
@@ -1795,14 +1906,14 @@ pub async fn start_peer_share_runtime(
                                     browse_logger.as_ref(),
                                     format!("relay renewal due for peer={peer_id}"),
                                 );
-                                if legs.is_reversed(&peer_id) && browse_dial_back.is_some() {
+                                if reversed && browse_dial_back.is_some() {
                                     // Reverse-aware renewal (4.67): the
-                                    // live leg arrived via a reversed
-                                    // introduction, so the forward dial
-                                    // below would fail in the hotspot
-                                    // case — the provider's forward
-                                    // addresses are unreachable from
-                                    // here. Request a fresh
+                                    // leg this notice is for arrived via
+                                    // a reversed introduction, so the
+                                    // forward dial below would fail in
+                                    // the hotspot case — the provider's
+                                    // forward addresses are unreachable
+                                    // from here. Request a fresh
                                     // introduction with dial-back
                                     // instead; the server mints a
                                     // reversed introduction and pushes
@@ -1844,7 +1955,7 @@ pub async fn start_peer_share_runtime(
                                             );
                                         }
                                     }
-                                    schedule_renewal_retry(&legs, &renewal_tx, &peer_id);
+                                    schedule_renewal_retry(&legs, &renewal_tx, &peer_id, true);
                                     continue;
                                 }
                                 (advertisement.clone(), false, true)
@@ -1892,6 +2003,32 @@ pub async fn start_peer_share_runtime(
 
             let peer_id = peer_share_peer_id(&advertisement);
             if !is_renewal && legs.is_connected(&peer_id) {
+                // 4.102 (b): a second discovery for an
+                // already-connected peer is no longer dropped
+                // outright. When it carries a changed endpoint list
+                // the cached advertisement is updated, so the next
+                // renewal or redial dials the new addresses; an
+                // identical discovery is still deduped. A peer with
+                // no cached advertisement (its leg arrived via a
+                // reversed introduction, never seen over mDNS) gets
+                // this first one cached.
+                match last_seen.get(&peer_id) {
+                    Some(cached) => {
+                        if let Some(merged) =
+                            merge_connected_peer_discovery(cached, &advertisement)
+                        {
+                            info!(
+                                peer = %peer_id,
+                                endpoints = %advertisement.endpoints.join(","),
+                                "peer-share discovery for connected peer carries new endpoints; cache updated"
+                            );
+                            last_seen.insert(peer_id.clone(), merged);
+                        }
+                    }
+                    None => {
+                        last_seen.insert(peer_id.clone(), advertisement.clone());
+                    }
+                }
                 continue;
             }
             last_seen.insert(peer_id.clone(), advertisement.clone());
@@ -1927,7 +2064,7 @@ pub async fn start_peer_share_runtime(
                         redials.requeue_failed(&advertisement);
                     }
                     if is_renewal {
-                        schedule_renewal_retry(&legs, &renewal_tx, &peer_id);
+                        schedule_renewal_retry(&legs, &renewal_tx, &peer_id, false);
                     }
                     sleep(PEER_RUNTIME_RETRY_DELAY).await;
                     continue;
@@ -1999,7 +2136,7 @@ pub async fn start_peer_share_runtime(
                                 redials.requeue_failed(&advertisement);
                             }
                             if is_renewal {
-                                schedule_renewal_retry(&legs, &renewal_tx, &peer_id);
+                                schedule_renewal_retry(&legs, &renewal_tx, &peer_id, false);
                             }
                             sleep(PEER_RUNTIME_RETRY_DELAY).await;
                             dial_failed = true;
@@ -2038,7 +2175,7 @@ pub async fn start_peer_share_runtime(
                         redials.requeue_failed(&advertisement);
                     }
                     if is_renewal {
-                        schedule_renewal_retry(&legs, &renewal_tx, &peer_id);
+                        schedule_renewal_retry(&legs, &renewal_tx, &peer_id, false);
                     }
                     sleep(PEER_RUNTIME_RETRY_DELAY).await;
                 }
@@ -2049,6 +2186,7 @@ pub async fn start_peer_share_runtime(
                 &renewal_tx,
                 peer_id.clone(),
                 generation,
+                false,
                 renewal_delay(relay_expires_at, now_unix_secs()),
             );
             if is_renewal {
@@ -2810,6 +2948,32 @@ fn should_accept_discovered_peer(
         && advertisement.device_public_key != self_public_key
 }
 
+/// Compare a fresh discovery against the cached advertisement for
+/// an already-connected peer (4.102, item 8 — follow-up (b) of
+/// 4.85). Returns the advertisement to cache when the discovery
+/// carries new information, or None when it is a pure duplicate
+/// to drop.
+///
+/// The endpoint list is compared in order: a changed set (a new
+/// interface came up, an old one went away) or a changed order
+/// (the provider re-prioritised its primary) both update the
+/// cache. The fresh advertisement is the provider's current
+/// authoritative list — its advertise watcher re-registers the
+/// full list on every change — so replacing the cached entry IS
+/// the merge: the next renewal or redial dials the new addresses
+/// instead of the stale ones. An identical discovery is still
+/// deduped, so a connected peer's re-announce costs no dial.
+fn merge_connected_peer_discovery(
+    cached: &PeerShareAdvertisement,
+    fresh: &PeerShareAdvertisement,
+) -> Option<PeerShareAdvertisement> {
+    if cached.endpoints == fresh.endpoints {
+        None
+    } else {
+        Some(fresh.clone())
+    }
+}
+
 /// The client's own tunnel addresses: the VPN builder assigns
 /// 10.8.0.2 (and fd00:10:8::2) to the client; the server is .1. The
 /// address is identical on every client, so a peer dialing it would
@@ -3127,13 +3291,14 @@ mod tests {
     use super::{
         advertisable_ips_from_pairs, build_peer_introduction_request, forward_dial_back_frame,
         introduction_expired, is_tunnel_interface, load_or_create_peer_listener_cert,
-        note_reversed_leg, peer_listener_bind_retry_delay, peer_share_peer_id,
-        pick_listed_protocol, plan_dial_back, prefer_path_subnet_candidate,
+        merge_connected_peer_discovery, note_reversed_leg, peer_listener_bind_retry_delay,
+        peer_share_peer_id, pick_listed_protocol, plan_dial_back, prefer_path_subnet_candidate,
         prepare_listener_identity, renewal_delay, resolve_advertise_ips, retry_bind_on_addr_in_use,
         select_advertise_ip, select_advertise_ip_for_binds, should_accept_discovered_peer,
         sticky_entry_fresh, ConnectedPeers, DialBackParams, PeerLegTracker, RedialQueue,
-        RelayPathClaims, RelayUpstreamSticky, PEER_LISTENER_BIND_MAX_ATTEMPTS,
-        PEER_REDISCOVERY_MAX_ATTEMPTS, PEER_RELAY_RENEWAL_LEAD_SECS, PEER_RELAY_RENEWAL_MIN_DELAY,
+        RelayPathClaims, RelayUpstreamSticky, UpstreamFailureTracker,
+        PEER_LISTENER_BIND_MAX_ATTEMPTS, PEER_REDISCOVERY_MAX_ATTEMPTS,
+        PEER_RELAY_RENEWAL_LEAD_SECS, PEER_RELAY_RENEWAL_MIN_DELAY, RELAY_UPSTREAM_DEAD_AFTER,
         RELAY_UPSTREAM_STICKY_REPROBE_AFTER,
     };
     use bonded_core::auth::DeviceKeypair;
@@ -3331,19 +3496,38 @@ mod tests {
     }
 
     #[test]
-    fn leg_tracker_generations_invalidate_stale_renewal_notices() {
+    fn leg_tracker_generations_invalidate_stale_renewal_notices_per_direction() {
+        // Generations are per-direction (4.102, item 7): a renewal
+        // dial in one direction supersedes only that direction's
+        // notices, and a dial in the other direction leaves them
+        // alone — the old single-generation behaviour (a reversed
+        // leg invalidating the forward leg's renewal) is gone.
         let mut tracker = PeerLegTracker::default();
-        let first = tracker.note_dial("peer-a", 1_000, false);
-        assert!(tracker.is_current_generation("peer-a", first));
-        assert_eq!(tracker.current_expires_at("peer-a"), Some(1_000));
+        let first_forward = tracker.note_dial("peer-a", 1_000, false);
+        assert!(tracker.is_current_generation("peer-a", first_forward, false));
+        assert_eq!(tracker.current_expires_at("peer-a", false), Some(1_000));
+        assert_eq!(tracker.current_generation("peer-a", true), None);
 
-        // A renewal dial supersedes the first dial's schedule.
-        let second = tracker.note_dial("peer-a", 1_240, false);
-        assert_ne!(first, second);
-        assert!(!tracker.is_current_generation("peer-a", first));
-        assert!(tracker.is_current_generation("peer-a", second));
-        assert_eq!(tracker.current_generation("peer-a"), Some(second));
-        assert_eq!(tracker.current_expires_at("peer-a"), Some(1_240));
+        // A reversed leg for the same peer does not touch the
+        // forward generation: the forward notice stays current.
+        let first_reversed = tracker.note_dial("peer-a", 1_240, true);
+        assert!(tracker.is_current_generation("peer-a", first_forward, false));
+        assert!(tracker.is_current_generation("peer-a", first_reversed, true));
+        assert_eq!(tracker.current_expires_at("peer-a", true), Some(1_240));
+
+        // A renewal dial supersedes the first dial's schedule in
+        // its own direction only.
+        let second_forward = tracker.note_dial("peer-a", 1_480, false);
+        assert_ne!(first_forward, second_forward);
+        assert!(!tracker.is_current_generation("peer-a", first_forward, false));
+        assert!(tracker.is_current_generation("peer-a", second_forward, false));
+        assert_eq!(
+            tracker.current_generation("peer-a", false),
+            Some(second_forward)
+        );
+        assert_eq!(tracker.current_expires_at("peer-a", false), Some(1_480));
+        // The reversed direction is untouched by the forward renewal.
+        assert!(tracker.is_current_generation("peer-a", first_reversed, true));
     }
 
     #[test]
@@ -4160,10 +4344,15 @@ mod tests {
         let connected = ConnectedPeers::default();
         legs.note_dial("peer-a:nonce-1", 1_000, false);
         connected.mark_connected("peer-a:nonce-1");
+        // Generations are per-direction (4.102, item 7): this is the
+        // FIRST reversed dial for the peer, so its reversed
+        // generation is 1 even though a forward leg already holds
+        // forward generation 1.
         let generation = note_reversed_leg(&mut legs, &connected, "peer-a:nonce-1", 1_000);
-        assert_eq!(generation, 2);
+        assert_eq!(generation, 1);
         assert_eq!(legs.leg_count("peer-a:nonce-1"), 2);
-        assert!(legs.is_reversed("peer-a:nonce-1"));
+        assert!(legs.is_current_generation("peer-a:nonce-1", 1, false));
+        assert!(legs.is_current_generation("peer-a:nonce-1", 1, true));
     }
 
     #[test]
@@ -4180,24 +4369,132 @@ mod tests {
     }
 
     #[test]
-    fn leg_tracker_records_direction_of_newest_leg() {
-        // Renewal direction selection (4.67): the tracker remembers
-        // how the peer's NEWEST leg was established, so a reversed
-        // leg renews in reverse and a forward leg renews forward.
+    fn leg_tracker_renews_both_directions_independently() {
+        // Renewal both directions (4.102, item 7 — follow-up (a) of
+        // 4.85): a peer holding a forward leg and a reversed leg
+        // keeps a current renewal generation per direction, so each
+        // direction's renewal notice fires for its own direction.
+        // The old behaviour — one generation for the peer, governed
+        // by the NEWEST leg, so a reversed-newest renewal left the
+        // forward legs to expire — is gone: the reversed dial below
+        // does not invalidate the forward generation, and a later
+        // forward dial does not invalidate the reversed one.
         let mut tracker = PeerLegTracker::default();
-        assert!(!tracker.is_reversed("peer-a"));
 
-        tracker.note_dial("peer-a", 1_000, false);
-        assert!(!tracker.is_reversed("peer-a"));
+        let forward = tracker.note_dial("peer-a", 1_000, false);
+        assert!(tracker.is_current_generation("peer-a", forward, false));
 
-        // A reversed leg supersedes the forward one (renewal
-        // overlap): the newest leg governs the next renewal.
-        tracker.note_dial("peer-a", 1_240, true);
-        assert!(tracker.is_reversed("peer-a"));
+        let reversed = tracker.note_dial("peer-a", 1_240, true);
+        assert!(tracker.is_current_generation("peer-a", reversed, true));
+        // The forward notice is still current after the reversed dial.
+        assert!(tracker.is_current_generation("peer-a", forward, false));
 
-        // And a later forward leg flips it back.
-        tracker.note_dial("peer-a", 1_480, false);
-        assert!(!tracker.is_reversed("peer-a"));
+        // A later forward renewal supersedes only the forward notice.
+        let forward_renewed = tracker.note_dial("peer-a", 1_480, false);
+        assert!(!tracker.is_current_generation("peer-a", forward, false));
+        assert!(tracker.is_current_generation("peer-a", forward_renewed, false));
+        assert!(tracker.is_current_generation("peer-a", reversed, true));
+
+        // And a reversed renewal supersedes only the reversed notice.
+        let reversed_renewed = tracker.note_dial("peer-a", 1_720, true);
+        assert!(!tracker.is_current_generation("peer-a", reversed, true));
+        assert!(tracker.is_current_generation("peer-a", reversed_renewed, true));
+        assert!(tracker.is_current_generation("peer-a", forward_renewed, false));
+    }
+
+    #[test]
+    fn upstream_failure_tracker_abandons_leg_after_bounded_continuous_failure() {
+        // Item 6: an upstream that always fails marks the leg dead
+        // within the bound — the first failure starts the window, a
+        // failure before the bound is not yet dead, and a failure at
+        // (or past) the bound is.
+        let mut tracker = UpstreamFailureTracker::default();
+        let start = Instant::now();
+        assert!(!tracker.record_failure(start));
+        assert!(!tracker.record_failure(start + RELAY_UPSTREAM_DEAD_AFTER - Duration::from_secs(1)));
+        assert!(tracker.record_failure(start + RELAY_UPSTREAM_DEAD_AFTER));
+        assert!(tracker.record_failure(start + RELAY_UPSTREAM_DEAD_AFTER + Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn upstream_failure_tracker_recovers_when_upstream_recovers() {
+        // Item 6: an upstream that recovers keeps the leg up — a
+        // healthy pump resets the window, so a later failure starts
+        // a fresh window instead of inheriting the old one.
+        let mut tracker = UpstreamFailureTracker::default();
+        let start = Instant::now();
+        assert!(!tracker.record_failure(start));
+        assert!(!tracker.record_failure(start + Duration::from_secs(50)));
+        tracker.record_success();
+        // A fresh failure after the recovery is a new window: 50 s
+        // into it is not dead, even though 100 s have passed since
+        // the very first failure.
+        let recovered_at = start + Duration::from_secs(55);
+        assert!(!tracker.record_failure(recovered_at));
+        assert!(!tracker.record_failure(recovered_at + Duration::from_secs(50)));
+        assert!(tracker.record_failure(recovered_at + RELAY_UPSTREAM_DEAD_AFTER));
+    }
+
+    fn sample_connected_peer_advertisement(endpoints: &[&str]) -> PeerShareAdvertisement {
+        PeerShareAdvertisement {
+            version: 1,
+            device_public_key: "provider".to_owned(),
+            server_public_key: "server".to_owned(),
+            instance_nonce: "nonce-1".to_owned(),
+            endpoint: endpoints.first().copied().unwrap_or("").to_owned(),
+            endpoints: endpoints.iter().map(|endpoint| endpoint.to_string()).collect(),
+            listener_cert_fingerprint: "sha256:abcd".to_owned(),
+            capabilities: vec!["relay".to_owned(), "quic".to_owned()],
+        }
+    }
+
+    #[test]
+    fn connected_peer_discovery_with_new_endpoint_updates_cache() {
+        // Item 8: a second discovery for an already-connected peer
+        // that carries a new endpoint is not dropped — the cached
+        // advertisement is updated, so the next renewal or redial
+        // dials the new address.
+        let cached = sample_connected_peer_advertisement(&["192.168.1.20:54443"]);
+        let fresh = sample_connected_peer_advertisement(&["192.168.1.20:54443", "10.0.0.5:54443"]);
+        let merged = merge_connected_peer_discovery(&cached, &fresh)
+            .expect("a new endpoint is new information");
+        assert_eq!(merged.endpoints, fresh.endpoints);
+        assert_eq!(merged.endpoint, "192.168.1.20:54443");
+    }
+
+    #[test]
+    fn connected_peer_discovery_with_identical_endpoints_is_deduped() {
+        // Item 8: a second discovery with identical endpoints is
+        // still deduped — a connected peer's re-announce costs no
+        // dial and no cache churn.
+        let cached = sample_connected_peer_advertisement(&["192.168.1.20:54443", "10.0.0.5:54443"]);
+        let fresh = sample_connected_peer_advertisement(&["192.168.1.20:54443", "10.0.0.5:54443"]);
+        assert!(merge_connected_peer_discovery(&cached, &fresh).is_none());
+    }
+
+    #[test]
+    fn connected_peer_discovery_with_dropped_endpoint_updates_cache() {
+        // Item 8: the provider lost an interface, so the fresh list
+        // is shorter — the cache follows the authoritative list
+        // instead of keeping a dead address for the next renewal.
+        let cached = sample_connected_peer_advertisement(&["192.168.1.20:54443", "10.0.0.5:54443"]);
+        let fresh = sample_connected_peer_advertisement(&["192.168.1.20:54443"]);
+        let merged = merge_connected_peer_discovery(&cached, &fresh)
+            .expect("a dropped endpoint is new information");
+        assert_eq!(merged.endpoints, vec!["192.168.1.20:54443".to_owned()]);
+    }
+
+    #[test]
+    fn connected_peer_discovery_with_reordered_endpoints_updates_cache() {
+        // Item 8: same endpoint set, new order — the provider
+        // re-prioritised its primary, so the dial order changes and
+        // the cache follows.
+        let cached = sample_connected_peer_advertisement(&["192.168.1.20:54443", "10.0.0.5:54443"]);
+        let fresh = sample_connected_peer_advertisement(&["10.0.0.5:54443", "192.168.1.20:54443"]);
+        let merged = merge_connected_peer_discovery(&cached, &fresh)
+            .expect("a reordered endpoint list is new information");
+        assert_eq!(merged.endpoints, fresh.endpoints);
+        assert_eq!(merged.endpoint, "10.0.0.5:54443");
     }
 
     #[test]
@@ -4213,13 +4510,13 @@ mod tests {
         let connected = ConnectedPeers::default();
         legs.note_dial("peer-a:nonce-1", 1_000, true);
         connected.mark_connected("peer-a:nonce-1");
-        assert!(legs.is_reversed("peer-a:nonce-1"));
+        assert!(legs.is_current_generation("peer-a:nonce-1", 1, true));
 
         connected.mark_reversed_renewal_pending("peer-a:nonce-1");
         let generation = note_reversed_leg(&mut legs, &connected, "peer-a:nonce-1", 1_300);
         assert_eq!(generation, 2);
         assert_eq!(legs.leg_count("peer-a:nonce-1"), 2);
-        assert!(legs.is_reversed("peer-a:nonce-1"));
+        assert!(legs.is_current_generation("peer-a:nonce-1", 2, true));
         assert!(!connected.is_reversed_renewal_pending("peer-a:nonce-1"));
 
         // The old leg closing leaves the replacement standing.
