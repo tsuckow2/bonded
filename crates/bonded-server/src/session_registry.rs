@@ -31,6 +31,17 @@ struct SessionRegistryInner {
     /// every transport bind, cleared with the session on
     /// unregister.
     source_ip_by_client: HashMap<String, std::net::IpAddr>,
+    /// When each client key last bound a transport (4.112): the
+    /// wall-clock-independent instant of the most recent
+    /// `note_source_ip` call for that key. A session restart
+    /// re-binds every transport, so the instant advances past any
+    /// dial-back push made before the restart — the dial-back
+    /// limiter reads it to tell a genuine post-restart push
+    /// (target re-bound after the pair's last push) from a flap
+    /// (target stable, consumer re-requesting). Updated on every
+    /// transport bind alongside the source IP, cleared with the
+    /// session on unregister.
+    last_bind_at_by_client: HashMap<String, std::time::Instant>,
 }
 
 impl SessionRegistry {
@@ -58,6 +69,7 @@ impl SessionRegistry {
             .expect("session registry write lock should not be poisoned");
         guard.sessions_by_client.remove(client_key);
         guard.source_ip_by_client.remove(client_key);
+        guard.last_bind_at_by_client.remove(client_key);
     }
 
     /// Record the transport source address a client key was most
@@ -74,6 +86,26 @@ impl SessionRegistry {
         guard
             .source_ip_by_client
             .insert(client_key.to_owned(), peer.ip());
+        // (4.112) The bind instant advances with every transport
+        // bind, so a session restart — which re-binds every
+        // transport — moves it past any dial-back push made before
+        // the restart.
+        guard
+            .last_bind_at_by_client
+            .insert(client_key.to_owned(), std::time::Instant::now());
+    }
+
+    /// When this client key last bound a transport, if any (4.112).
+    /// `None` means no transport has been noted yet (or the session
+    /// was unregistered) — the dial-back limiter then falls back
+    /// to the plain per-pair window.
+    pub fn last_bind_at_for(&self, client_key: &str) -> Option<std::time::Instant> {
+        self.inner
+            .read()
+            .expect("session registry read lock should not be poisoned")
+            .last_bind_at_by_client
+            .get(client_key)
+            .copied()
     }
 
     /// The last-seen source IP for a live session registered under
@@ -189,6 +221,29 @@ mod tests {
         );
         registry.unregister_client("pub-a");
         assert_eq!(registry.source_ip_for("pub-a"), None);
+    }
+
+    #[test]
+    fn last_bind_at_advances_on_bind_and_clears_on_unregister() {
+        // 4.112: the registry remembers when each client last
+        // bound a transport; a re-bind advances it and unregister
+        // clears it, so the dial-back limiter can tell a
+        // post-restart push from a flap.
+        let registry = SessionRegistry::default();
+        assert_eq!(registry.last_bind_at_for("pub-a"), None);
+        let _ = registry.register_client("pub-a".to_owned());
+        assert_eq!(registry.last_bind_at_for("pub-a"), None);
+        registry.note_source_ip("pub-a", "75.164.76.151:54321".parse().unwrap());
+        let first = registry
+            .last_bind_at_for("pub-a")
+            .expect("bind should record an instant");
+        registry.note_source_ip("pub-a", "1.1.1.1:443".parse().unwrap());
+        let second = registry
+            .last_bind_at_for("pub-a")
+            .expect("re-bind should record an instant");
+        assert!(second >= first, "a re-bind must not move the instant back");
+        registry.unregister_client("pub-a");
+        assert_eq!(registry.last_bind_at_for("pub-a"), None);
     }
 
     #[test]

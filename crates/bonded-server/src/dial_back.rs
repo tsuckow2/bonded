@@ -93,22 +93,44 @@ pub enum DialBackPushOutcome {
 /// Stale entries (older than the window) are pruned on every call,
 /// so the map holds at most one entry per pair active inside the
 /// window — a flapping pair cannot grow it.
+///
+/// Re-bind exemption (4.112): a push is also allowed when the push
+/// TARGET re-bound a transport after the pair's last push. A
+/// session restart re-binds every transport, so the legs the last
+/// push created are gone with the old session incarnation — the
+/// next push is a fresh need, not a flap. The 2026-11-11
+/// churn-loop case is unaffected: there the target (6a) was stable
+/// and never re-bound, so its pushes still collapse to one per
+/// window; only a target that itself restarted gets a fresh push.
+/// `target_last_bind` is `None` when the target has no recorded
+/// bind (no live session yet) — the plain per-pair window applies.
 #[derive(Default)]
 struct DialBackPushLimiter {
     last_push: HashMap<(String, String), Instant>,
 }
 
 impl DialBackPushLimiter {
-    fn allow(&mut self, consumer: &str, provider: &str, now: Instant) -> bool {
+    fn allow(
+        &mut self,
+        consumer: &str,
+        provider: &str,
+        target_last_bind: Option<Instant>,
+        now: Instant,
+    ) -> bool {
         self.last_push
             .retain(|_, at| now.duration_since(*at) < DIAL_BACK_PUSH_MIN_INTERVAL);
         let key = (consumer.to_owned(), provider.to_owned());
-        if self
-            .last_push
-            .get(&key)
-            .is_some_and(|at| now.duration_since(*at) < DIAL_BACK_PUSH_MIN_INTERVAL)
-        {
-            return false;
+        if let Some(at) = self.last_push.get(&key) {
+            // Inside the window: still allow when the target
+            // re-bound after the last push — the legs that push
+            // created died with the target's old session
+            // incarnation, so this is a re-establishment, not a
+            // flap. A stable target keeps the plain window.
+            if now.duration_since(*at) < DIAL_BACK_PUSH_MIN_INTERVAL
+                && !target_last_bind.is_some_and(|bind| bind > *at)
+            {
+                return false;
+            }
         }
         self.last_push.insert(key, now);
         true
@@ -163,6 +185,13 @@ impl DialBackPush {
         else {
             return DialBackPushOutcome::NoLiveSession;
         };
+        // (4.112) The target's last transport bind: a target that
+        // re-bound after the pair's last push restarted its session
+        // since then, so the push is a re-establishment, not a flap
+        // — the limiter allows it inside the window. A stable
+        // target keeps the plain per-pair window (the 2026-11-11
+        // churn-loop case).
+        let target_last_bind = self.sessions.last_bind_at_for(provider_device_public_key);
         let allowed = self
             .limiter
             .lock()
@@ -170,6 +199,7 @@ impl DialBackPush {
             .allow(
                 &notification.consumer_device_public_key,
                 provider_device_public_key,
+                target_last_bind,
                 Instant::now(),
             );
         if !allowed {
@@ -343,12 +373,17 @@ mod tests {
 
         let mut limiter = DialBackPushLimiter::default();
         let start = Instant::now();
-        assert!(limiter.allow("consumer", "provider", start));
+        assert!(limiter.allow("consumer", "provider", None, start));
         // A flapping re-auth burst: 10 requests in the same window
         // produce no further pushes.
         for offset_ms in [1, 10, 100, 1000, 5000, 29_000] {
             assert!(
-                !limiter.allow("consumer", "provider", start + Duration::from_millis(offset_ms)),
+                !limiter.allow(
+                    "consumer",
+                    "provider",
+                    None,
+                    start + Duration::from_millis(offset_ms)
+                ),
                 "push at +{offset_ms}ms should be rate-limited"
             );
         }
@@ -356,13 +391,62 @@ mod tests {
         assert!(limiter.allow(
             "consumer",
             "provider",
+            None,
             start + DIAL_BACK_PUSH_MIN_INTERVAL
         ));
         // ...and is immediately limited again.
         assert!(!limiter.allow(
             "consumer",
             "provider",
+            None,
             start + DIAL_BACK_PUSH_MIN_INTERVAL + Duration::from_millis(1)
+        ));
+    }
+
+    /// Re-bind exemption (4.112): a push inside the window is
+    /// allowed when the push TARGET re-bound a transport after the
+    /// pair's last push — the target restarted, so the legs the
+    /// last push created are gone and this is a re-establishment,
+    /// not a flap. A bind at or before the last push does not
+    /// exempt: a stable target keeps the plain window.
+    #[test]
+    fn dial_back_push_limiter_allows_repush_after_target_rebinds() {
+        use std::time::{Duration, Instant};
+
+        let mut limiter = DialBackPushLimiter::default();
+        let start = Instant::now();
+        assert!(limiter.allow("consumer", "provider", None, start));
+        // 8 s later, target stable: still limited (the 2026-11-24
+        // 7a case before the fix — the re-push at +8 s was
+        // dropped and the mutual leg stayed down ~4 min).
+        assert!(!limiter.allow(
+            "consumer",
+            "provider",
+            None,
+            start + Duration::from_secs(8)
+        ));
+        // The target re-binds (session restart) at +8 s: the same
+        // instant's push is now a re-establishment.
+        assert!(limiter.allow(
+            "consumer",
+            "provider",
+            Some(start + Duration::from_secs(8)),
+            start + Duration::from_secs(8)
+        ));
+        // ...and is immediately limited again for the same bind.
+        assert!(!limiter.allow(
+            "consumer",
+            "provider",
+            Some(start + Duration::from_secs(8)),
+            start + Duration::from_secs(8) + Duration::from_millis(1)
+        ));
+        // A bind at or before the last push does not exempt: the
+        // target has not re-bound since.
+        assert!(!limiter.allow(
+            "consumer",
+            "provider",
+            Some(start + Duration::from_secs(8)),
+            start + Duration::from_secs(9)
         ));
     }
 
@@ -375,14 +459,14 @@ mod tests {
 
         let mut limiter = DialBackPushLimiter::default();
         let start = Instant::now();
-        assert!(limiter.allow("consumer-a", "provider", start));
-        assert!(limiter.allow("consumer-b", "provider", start));
-        assert!(limiter.allow("consumer-a", "other-provider", start));
+        assert!(limiter.allow("consumer-a", "provider", None, start));
+        assert!(limiter.allow("consumer-b", "provider", None, start));
+        assert!(limiter.allow("consumer-a", "other-provider", None, start));
         assert_eq!(limiter.last_push.len(), 3);
         // After the window, the next allow for any pair prunes the
         // stale entries: only the fresh one remains.
         let later = start + DIAL_BACK_PUSH_MIN_INTERVAL + Duration::from_secs(1);
-        assert!(limiter.allow("consumer-a", "provider", later));
+        assert!(limiter.allow("consumer-a", "provider", None, later));
         assert_eq!(limiter.last_push.len(), 1);
     }
 
@@ -421,6 +505,54 @@ mod tests {
                 .await
                 .is_err(),
             "no second frame should arrive for the rate-limited pushes"
+        );
+    }
+
+    /// Re-bind exemption end to end (4.112): a second push inside
+    /// the window is rate-limited while the provider is stable,
+    /// but goes through once the provider re-binds (session
+    /// restart) — the legs the first push created died with the
+    /// provider's old session incarnation. The 2026-11-11 flap
+    /// stays collapsed: a stable target never re-binds, so its
+    /// pushes still collapse to one per window.
+    #[tokio::test]
+    async fn push_allows_repush_after_provider_rebinds() {
+        let sessions = SessionRegistry::default();
+        let handle = sessions.register_client("provider".to_owned());
+        let (session_ctx, mut transport_rx) = live_session_context();
+        let forwarders: Arc<RwLock<HashMap<u64, Arc<SessionContext>>>> =
+            Arc::new(RwLock::new(HashMap::from([(
+                handle.session_id,
+                session_ctx,
+            )])));
+        let push = DialBackPush::new(sessions.clone(), forwarders);
+
+        assert_eq!(push.push("provider", &notification()), DialBackPushOutcome::Pushed);
+        // Stable provider: the immediate re-push is limited.
+        assert_eq!(
+            push.push("provider", &notification()),
+            DialBackPushOutcome::RateLimited
+        );
+        // The provider restarts and re-binds a transport: the next
+        // push is a re-establishment, not a flap.
+        sessions.note_source_ip("provider", "192.168.1.20:54443".parse().unwrap());
+        assert_eq!(push.push("provider", &notification()), DialBackPushOutcome::Pushed);
+
+        // Exactly two frames arrive: the first push and the
+        // post-rebind re-push; the rate-limited one delivered
+        // nothing.
+        for _ in 0..2 {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(2), transport_rx.recv())
+                .await
+                .expect("pushed frame should deliver promptly")
+                .expect("transport should receive the frame");
+            assert_ne!(frame.header.flags & FLAG_PEER_DIAL_BACK, 0);
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), transport_rx.recv())
+                .await
+                .is_err(),
+            "no third frame should arrive for the rate-limited push"
         );
     }
 
