@@ -79,6 +79,18 @@ pub const FLAG_REDUNDANT: u32 = 0x0040;
 /// payloads, but a PONG-flagged frame would also write a bogus
 /// `last_rtt_ms` into path stats and corrupt transport grading.
 pub const FLAG_PEER_DIAL_BACK: u32 = 0x0080;
+/// Frame flag: set on a client PING (heartbeat / binding) to tell
+/// the server this client understands the EXTENDED PONG format
+/// (4.107, [`encode_observed_network`] /
+/// [`decode_observed_network`]). The server replies with the
+/// extended payload — observed address plus the network name it
+/// resolved for that address (ASN org + PTR hostname) — only to
+/// PINGs carrying this flag; PINGs without it get the plain
+/// address-only PONG exactly as before, so old clients (which
+/// never set the flag) see zero change. Old servers ignore unknown
+/// flag bits, so a new client degrades to the plain format against
+/// them.
+pub const FLAG_NETWORK_NAME: u32 = 0x0100;
 
 /// Parse a session-epoch binding PING's epoch, if present: the flag
 /// must be set and the payload must be exactly 8 bytes.
@@ -252,9 +264,69 @@ pub fn encode_observed_address(observed: std::net::SocketAddr) -> Bytes {
 
 /// Decode a PONG payload stamped by [`encode_observed_address`]. Returns
 /// `None` for empty payloads (older servers) and anything that is not a
-/// socket-address string.
+/// socket-address string. An EXTENDED payload (see
+/// [`decode_observed_network`]) also decodes as `None` here: the
+/// whole payload is not a bare address. Callers that understand the
+/// extended format use `decode_observed_network` instead.
 pub fn decode_observed_address(payload: &[u8]) -> Option<std::net::SocketAddr> {
     std::str::from_utf8(payload).ok()?.trim().parse().ok()
+}
+
+/// Encode the observed address plus the network name the server
+/// resolved for it (4.107) into an extended PONG payload, sent only
+/// to PINGs that carried [`FLAG_NETWORK_NAME`].
+///
+/// Newline-separated, three lines: line 1 is the socket-address
+/// string (exactly as [`encode_observed_address`] produces), line 2
+/// is the ASN org name or empty, line 3 is the PTR hostname or
+/// empty. All three lines are always emitted (empty when unknown),
+/// so the format is fixed-width in lines; the decoder also accepts
+/// payloads with absent trailing lines (treated as empty).
+pub fn encode_observed_network(
+    observed: std::net::SocketAddr,
+    asn_org: Option<&str>,
+    ptr_hostname: Option<&str>,
+) -> Bytes {
+    let payload = format!(
+        "{}\n{}\n{}",
+        observed,
+        asn_org.unwrap_or(""),
+        ptr_hostname.unwrap_or("")
+    );
+    Bytes::copy_from_slice(payload.as_bytes())
+}
+
+/// Decode a PONG payload stamped by [`encode_observed_network`]
+/// (4.107). Returns `(address, asn_org, ptr_hostname)`; each
+/// element is `None` when absent or unparseable. A plain
+/// address-only payload (see [`encode_observed_address`]) decodes
+/// as `(Some(addr), None, None)` — the extended decoder accepts
+/// both formats. Returns `(None, None, None)` for an empty or
+/// garbage payload.
+pub fn decode_observed_network(
+    payload: &[u8],
+) -> (
+    Option<std::net::SocketAddr>,
+    Option<String>,
+    Option<String>,
+) {
+    let text = match std::str::from_utf8(payload) {
+        Ok(text) => text,
+        Err(_) => return (None, None, None),
+    };
+    let mut lines = text.split('\n');
+    let address = lines.next().and_then(|line| line.trim().parse().ok());
+    let asn_org = lines
+        .next()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned);
+    let ptr_hostname = lines
+        .next()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned);
+    (address, asn_org, ptr_hostname)
 }
 
 #[cfg(test)]
@@ -296,6 +368,76 @@ mod tests {
         // Older servers echo the ping's empty payload: not reported.
         assert_eq!(decode_observed_address(&[]), None);
         assert_eq!(decode_observed_address(b"not an address"), None);
+    }
+
+    #[test]
+    fn observed_network_roundtrip_and_legacy_payloads() {
+        use super::{
+            decode_observed_address, decode_observed_network, encode_observed_address,
+            encode_observed_network,
+        };
+        let v4: std::net::SocketAddr = "75.164.76.151:54321".parse().expect("v4 addr");
+        // Full extended payload: address + ASN org + PTR hostname.
+        let full = encode_observed_network(
+            v4,
+            Some("GOOGLE - Google LLC"),
+            Some("dns.google"),
+        );
+        assert_eq!(
+            decode_observed_network(&full),
+            (
+                Some(v4),
+                Some("GOOGLE - Google LLC".to_owned()),
+                Some("dns.google".to_owned())
+            )
+        );
+        // Address + ASN only: PTR absent.
+        let asn_only = encode_observed_network(v4, Some("CLOUDFLARENET - Cloudflare, Inc."), None);
+        assert_eq!(
+            decode_observed_network(&asn_only),
+            (
+                Some(v4),
+                Some("CLOUDFLARENET - Cloudflare, Inc.".to_owned()),
+                None
+            )
+        );
+        // Address only: both names absent.
+        let addr_only = encode_observed_network(v4, None, None);
+        assert_eq!(
+            decode_observed_network(&addr_only),
+            (Some(v4), None, None)
+        );
+        // A plain address-only payload also decodes through the
+        // extended decoder, with both names absent.
+        let plain = encode_observed_address(v4);
+        assert_eq!(
+            decode_observed_network(&plain),
+            (Some(v4), None, None)
+        );
+        // The old decoder still works on the plain format, and
+        // reports nothing for the extended format (the whole payload
+        // is not a bare address).
+        assert_eq!(decode_observed_address(&plain), Some(v4));
+        assert_eq!(decode_observed_address(&full), None);
+        // Empty / garbage payloads decode as all-absent.
+        assert_eq!(decode_observed_network(&[]), (None, None, None));
+        assert_eq!(
+            decode_observed_network(b"not an address"),
+            (None, None, None)
+        );
+        assert_eq!(
+            decode_observed_network(b"\n\n\n"),
+            (None, None, None)
+        );
+        // Absent trailing lines read as empty, not garbage.
+        assert_eq!(
+            decode_observed_network(b"75.164.76.151:54321\nGOOGLE - Google LLC"),
+            (
+                Some(v4),
+                Some("GOOGLE - Google LLC".to_owned()),
+                None
+            )
+        );
     }
 
     #[test]

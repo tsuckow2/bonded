@@ -11,6 +11,14 @@ pub const DEFAULT_SERVER_IDENTITY_KEY_PATH: &str = "/var/lib/bonded/server-ident
 pub const DEFAULT_WIREGUARD_PEERS_PATH: &str = "/var/lib/bonded/wireguard_peers.toml";
 pub const DEFAULT_WIREGUARD_PEER_LEASE_SECS: u64 = 30 * 24 * 60 * 60;
 
+/// Canonical ASN database feed (4.107): iptoasn.com's combined
+/// IPv4+IPv6 TSV, gzip-compressed. Used when `server.asn_db_url` is
+/// unset.
+pub const DEFAULT_ASN_DB_URL: &str = "https://iptoasn.com/data/ip2asn-combined.tsv.gz";
+
+/// Default ASN database refresh interval: daily.
+pub const DEFAULT_ASN_DB_REFRESH_INTERVAL_SECS: u64 = 86_400;
+
 pub const DEFAULT_CLIENT_CONFIG_PATH: &str = "~/.config/bonded/client.toml";
 pub const DEFAULT_CLIENT_PRIVATE_KEY_PATH: &str = "~/.local/share/bonded/device-key.pem";
 pub const DEFAULT_CLIENT_PUBLIC_KEY_PATH: &str = "~/.local/share/bonded/device-key.pub";
@@ -157,6 +165,32 @@ pub struct ServerSection {
     /// codes are issued.
     pub identity_key_file: String,
 
+    // ── Network names (4.107) ───────────────────────────────────────────────
+    /// Path to the ASN database file (iptoasn.com combined TSV, plain
+    /// or gzip-compressed) used to map a leg's public source IP to
+    /// its ASN org name. Unset = ASN lookup disabled (PTR only).
+    #[serde(default)]
+    pub asn_db_path: Option<String>,
+    /// When true, the server downloads the ASN database from
+    /// `asn_db_url` on a timer and swaps it in without a restart.
+    /// Opt-in: off by default.
+    #[serde(default)]
+    pub asn_db_auto_refresh: bool,
+    /// Seconds between ASN database refresh downloads. Default:
+    /// daily.
+    #[serde(default = "default_asn_db_refresh_interval_secs")]
+    pub asn_db_refresh_interval_secs: u64,
+    /// URL the ASN database is downloaded from on refresh. `None`
+    /// (the default) means the iptoasn.com canonical feed
+    /// (`DEFAULT_ASN_DB_URL`).
+    #[serde(default)]
+    pub asn_db_url: Option<String>,
+    /// Whether reverse-DNS (PTR) lookups run for a leg's public
+    /// source IP. Default true. A PTR miss/timeout simply means no
+    /// PTR name — never an error, never a blocked pong.
+    #[serde(default = "default_true")]
+    pub ptr_lookup: bool,
+
     // ── ACME ─────────────────────────────────────────────────────────────────
     /// Domain for ACME TLS-ALPN-01 certificate automation (e.g.
     /// `"vpn.example.com"`).  When set, the server manages TLS certs via
@@ -225,6 +259,23 @@ impl ServerSection {
             )),
         }
     }
+
+    /// The ASN database download URL: the configured
+    /// `asn_db_url`, or the iptoasn.com canonical feed when unset.
+    pub fn asn_db_url_or_default(&self) -> &str {
+        self.asn_db_url
+            .as_deref()
+            .filter(|url| !url.trim().is_empty())
+            .unwrap_or(DEFAULT_ASN_DB_URL)
+    }
+}
+
+fn default_asn_db_refresh_interval_secs() -> u64 {
+    DEFAULT_ASN_DB_REFRESH_INTERVAL_SECS
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for ServerSection {
@@ -243,6 +294,11 @@ impl Default for ServerSection {
             tcp_bind: None,
             tcp_public: None,
             dns_server: None,
+            asn_db_path: None,
+            asn_db_auto_refresh: false,
+            asn_db_refresh_interval_secs: DEFAULT_ASN_DB_REFRESH_INTERVAL_SECS,
+            asn_db_url: None,
+            ptr_lookup: true,
             status_bind: "0.0.0.0:8082".to_owned(),
             health_bind: "0.0.0.0:8081".to_owned(),
             log_level: "info".to_owned(),
@@ -519,6 +575,49 @@ https_bind = "127.0.0.1:9000"
             cfg.server.wireguard_public_addr(),
             Some("vpn.example.com:51820".to_owned())
         );
+    }
+
+    #[test]
+    fn network_names_config_defaults_are_ptr_only_with_daily_refresh() {
+        // 4.107: a config without the new keys keeps working and
+        // defaults to ASN disabled (no path), auto-refresh off,
+        // daily interval, the iptoasn.com feed URL, PTR on.
+        let cfg: ServerConfig = toml::from_str("").expect("empty config should parse");
+        assert_eq!(cfg.server.asn_db_path, None);
+        assert!(!cfg.server.asn_db_auto_refresh);
+        assert_eq!(
+            cfg.server.asn_db_refresh_interval_secs,
+            super::DEFAULT_ASN_DB_REFRESH_INTERVAL_SECS
+        );
+        assert_eq!(cfg.server.asn_db_url, None);
+        assert_eq!(
+            cfg.server.asn_db_url_or_default(),
+            super::DEFAULT_ASN_DB_URL
+        );
+        assert!(cfg.server.ptr_lookup);
+
+        let cfg: ServerConfig = toml::from_str(
+            r#"
+[server]
+asn_db_path = "/var/lib/bonded/ip2asn.tsv.gz"
+asn_db_auto_refresh = true
+asn_db_refresh_interval_secs = 3600
+asn_db_url = "https://example.invalid/ip2asn.tsv.gz"
+ptr_lookup = false
+"#,
+        )
+        .expect("network-names config should parse");
+        assert_eq!(
+            cfg.server.asn_db_path.as_deref(),
+            Some("/var/lib/bonded/ip2asn.tsv.gz")
+        );
+        assert!(cfg.server.asn_db_auto_refresh);
+        assert_eq!(cfg.server.asn_db_refresh_interval_secs, 3600);
+        assert_eq!(
+            cfg.server.asn_db_url_or_default(),
+            "https://example.invalid/ip2asn.tsv.gz"
+        );
+        assert!(!cfg.server.ptr_lookup);
     }
 
     #[test]

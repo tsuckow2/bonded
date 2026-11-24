@@ -26,7 +26,7 @@ use std::sync::{Arc, RwLock};
 use anyhow::Context as _;
 use bonded_core::heartbeat::QUIC_MAX_IDLE_TIMEOUT;
 use bonded_core::session::{
-    decode_observed_address, encode_observed_address, is_answerable_ping, parse_session_epoch,
+    decode_observed_address, is_answerable_ping, parse_session_epoch, FLAG_NETWORK_NAME,
     SessionFrame, SessionHeader, FLAG_PATH_RETIRE, FLAG_PONG,
 };
 use bonded_core::transport::{QuicTransport, Transport as _};
@@ -296,6 +296,17 @@ async fn handle_quic_connection(
     };
 
     let handle = sessions.register_client(binding.client_public_key.clone());
+    // Last-seen source IP (4.107): under the authenticated key
+    // on a relayed bind (the transport peer is the provider),
+    // else under the session key — see bootstrap.rs.
+    sessions.note_source_ip(
+        if binding.relayed_via_provider {
+            &public_key
+        } else {
+            &binding.client_public_key
+        },
+        peer,
+    );
     info!(
         peer = %peer,
         public_key = %binding.client_public_key,
@@ -364,8 +375,14 @@ async fn handle_quic_connection(
                     },
                     // Observed-address stamp: the client shows this as
                     // the path's public (egress) address. Older clients
-                    // ignore PONG payloads: backward compatible.
-                    payload: encode_observed_address(peer),
+                    // ignore PONG payloads: backward compatible. A PING
+                    // carrying FLAG_NETWORK_NAME (4.107) gets the
+                    // extended payload with the network name.
+                    payload: crate::network_names::observed_pong_payload(
+                        bootstrap_ctx.network_names.as_ref(),
+                        peer,
+                        frame.header.flags & FLAG_NETWORK_NAME != 0,
+                    ),
                 };
                 if let Err(err) = transport.send(pong).await {
                     warn!(peer = %peer, session_id = handle.session_id,
@@ -434,8 +451,14 @@ async fn handle_quic_connection(
                                     sequence: frame.header.sequence,
                                     flags: FLAG_PONG,
                                 },
-                                // Observed-address stamp: see above.
-                                payload: encode_observed_address(peer),
+                                // Observed-address stamp: see above
+                                // (4.107: extended format when the PING
+                                // asked for a network name).
+                                payload: crate::network_names::observed_pong_payload(
+                                    bootstrap_ctx.network_names.as_ref(),
+                                    peer,
+                                    frame.header.flags & FLAG_NETWORK_NAME != 0,
+                                ),
                             };
                             if let Err(err) = transport.send(pong).await {
                                 warn!(peer = %peer, session_id = handle.session_id,

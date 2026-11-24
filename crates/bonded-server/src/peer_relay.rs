@@ -158,6 +158,10 @@ mod tests {
             expires_at: now_plus(300),
             direction: "forward".to_owned(),
             consumer_endpoints: Vec::new(),
+            provider_network_asn_org: None,
+            provider_network_ptr: None,
+            consumer_network_asn_org: None,
+            consumer_network_ptr: None,
         };
         let registration = PeerRelayRegistration {
             introduction: SignedPeerShareIntroduction {
@@ -203,6 +207,10 @@ mod tests {
             expires_at: now_plus(300),
             direction: "reverse".to_owned(),
             consumer_endpoints: vec!["192.168.43.10:54443".to_owned()],
+            provider_network_asn_org: None,
+            provider_network_ptr: None,
+            consumer_network_asn_org: None,
+            consumer_network_ptr: None,
         };
         let registration = PeerRelayRegistration {
             introduction: SignedPeerShareIntroduction {
@@ -241,6 +249,10 @@ mod tests {
             expires_at: now_plus(300),
             direction: "sideways".to_owned(),
             consumer_endpoints: Vec::new(),
+            provider_network_asn_org: None,
+            provider_network_ptr: None,
+            consumer_network_asn_org: None,
+            consumer_network_ptr: None,
         };
         let registration = PeerRelayRegistration {
             introduction: SignedPeerShareIntroduction {

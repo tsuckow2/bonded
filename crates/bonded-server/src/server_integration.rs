@@ -333,6 +333,7 @@ async fn localhost_server_and_rust_client_can_probe_public_dns_udp() {
             None,
             None,
             std::net::SocketAddr::from(([192, 0, 2, 53], 53)),
+            None,
         )
         .await
     });
@@ -534,6 +535,7 @@ async fn localhost_server_and_rust_client_can_fetch_example_com_http_over_tcp_pa
             None,
             None,
             std::net::SocketAddr::from(([192, 0, 2, 53], 53)),
+            None,
         )
         .await
     });
@@ -759,6 +761,7 @@ async fn localhost_server_and_rust_client_can_run_smtp_commands_over_tcp_packets
             None,
             None,
             std::net::SocketAddr::from(([192, 0, 2, 53], 53)),
+            None,
         )
         .await
     });
@@ -1246,6 +1249,7 @@ async fn localhost_server_and_rust_client_can_relay_udp_echo() {
             None,
             None,
             std::net::SocketAddr::from(([192, 0, 2, 53], 53)),
+            None,
         )
         .await
     });
@@ -1357,6 +1361,7 @@ async fn localhost_server_and_rust_client_can_relay_icmp_echo_to_localhost() {
             None,
             None,
             std::net::SocketAddr::from(([192, 0, 2, 53], 53)),
+            None,
         )
         .await
     });
@@ -1656,6 +1661,7 @@ async fn localhost_server_and_rust_client_can_relay_tcp_as_ipv4_packets() {
             None,
             None,
             std::net::SocketAddr::from(([192, 0, 2, 53], 53)),
+            None,
         )
         .await
     });
@@ -1921,6 +1927,7 @@ async fn tunnel_gateway_echo_returns_fixed_payload() {
             None,
             None,
             std::net::SocketAddr::from(([192, 0, 2, 53], 53)),
+            None,
         )
         .await
     });
@@ -2347,6 +2354,7 @@ async fn tunnel_gateway_non_echo_port_is_not_echoed() {
             None,
             None,
             std::net::SocketAddr::from(([192, 0, 2, 53], 53)),
+            None,
         )
         .await
     });

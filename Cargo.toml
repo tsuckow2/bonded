@@ -45,3 +45,6 @@ h3 = "0.0.8"
 h3-quinn = "0.0.10"
 boringtun = "0.7"
 mdns-sd = "0.20"
+flate2 = "1"
+hickory-resolver = { version = "0.25", default-features = false, features = ["tokio", "system-config"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }

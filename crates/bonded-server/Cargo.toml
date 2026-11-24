@@ -31,6 +31,9 @@ tracing-subscriber.workspace = true
 socket2 = "0.5"
 sha2.workspace = true
 quinn.workspace = true
+flate2.workspace = true
+hickory-resolver.workspace = true
+reqwest.workspace = true
 smoltcp = { version = "0.11", default-features = false, features = [
     "async",
     "std",

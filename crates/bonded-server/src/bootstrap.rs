@@ -30,7 +30,7 @@ use bonded_core::peer_share::{
     SignedPeerShareIntroduction,
 };
 use bonded_core::session::{
-    decode_observed_address, encode_observed_address, is_answerable_ping, parse_session_epoch,
+    decode_observed_address, is_answerable_ping, parse_session_epoch, FLAG_NETWORK_NAME,
     SessionFrame, SessionHeader, FLAG_PATH_RETIRE, FLAG_PONG,
 };
 use bonded_core::transport::{PrependedStream, Transport, WebSocketTlsTransport};
@@ -110,6 +110,13 @@ pub struct BootstrapContext {
     /// the push is simply skipped (same as a provider with no live
     /// session: dropped, not queued).
     pub dial_back_push: Option<Arc<DialBackPush>>,
+
+    /// Network-name resolver (4.107): ASN tables + PTR cache used
+    /// to stamp extended PONGs and to fill peer-share introduction
+    /// claims at mint time. `None` in tests and in deployments
+    /// without one — PONGs stay plain-address and introductions
+    /// carry no network names.
+    pub network_names: Option<Arc<crate::network_names::NetworkNameResolver>>,
 
     /// Root directory for uploaded client diagnostics, one subdirectory
     /// per device key. Created on first upload.
@@ -945,6 +952,19 @@ fn peer_share_introduction_response(ctx: &BootstrapContext, body: &str) -> (Stat
     }
 
     let expires_at = unix_timestamp_after(Duration::from_secs(300)).unwrap_or(0);
+    // Network names (4.107): resolved from each side's live
+    // session source IP (last-seen transport address, via the
+    // dial-back push handle's session registry). Either side may
+    // be (None, None) — no resolver, no live session, or no name
+    // for the address — and the claims then carry an explicit
+    // absent value; a name is never invented. The same pair of
+    // names rides all three introductions below: the forward one,
+    // the reversed one, and the mutual one (where the roles swap,
+    // so the names swap with them).
+    let (provider_network_asn_org, provider_network_ptr) =
+        peer_network_name(ctx, &request.provider_device_public_key);
+    let (consumer_network_asn_org, consumer_network_ptr) =
+        peer_network_name(ctx, &request.consumer_device_public_key);
     let claims = PeerShareIntroductionClaims {
         consumer_device_public_key: request.consumer_device_public_key.clone(),
         provider_device_public_key: request.provider_device_public_key.clone(),
@@ -955,6 +975,10 @@ fn peer_share_introduction_response(ctx: &BootstrapContext, body: &str) -> (Stat
         expires_at,
         direction: "forward".to_owned(),
         consumer_endpoints: Vec::new(),
+        provider_network_asn_org: provider_network_asn_org.clone(),
+        provider_network_ptr: provider_network_ptr.clone(),
+        consumer_network_asn_org: consumer_network_asn_org.clone(),
+        consumer_network_ptr: consumer_network_ptr.clone(),
     };
     let response = match sign_introduction_claims(ctx, claims) {
         Ok(response) => response,
@@ -987,6 +1011,10 @@ fn peer_share_introduction_response(ctx: &BootstrapContext, body: &str) -> (Stat
             expires_at,
             direction: "reverse".to_owned(),
             consumer_endpoints: request.consumer_endpoints.clone(),
+            provider_network_asn_org: provider_network_asn_org.clone(),
+            provider_network_ptr: provider_network_ptr.clone(),
+            consumer_network_asn_org: consumer_network_asn_org.clone(),
+            consumer_network_ptr: consumer_network_ptr.clone(),
         };
         match sign_introduction_claims(ctx, reversed_claims) {
             Ok(reversed) => {
@@ -1073,6 +1101,14 @@ fn peer_share_introduction_response(ctx: &BootstrapContext, body: &str) -> (Stat
                 expires_at,
                 direction: "reverse".to_owned(),
                 consumer_endpoints: vec![request.provider_endpoint.clone()],
+                // Roles swap on the mutual leg (4.93): the original
+                // provider is now the consumer and the original
+                // consumer is now the provider, so their network
+                // names swap with them.
+                provider_network_asn_org: consumer_network_asn_org.clone(),
+                provider_network_ptr: consumer_network_ptr.clone(),
+                consumer_network_asn_org: provider_network_asn_org.clone(),
+                consumer_network_ptr: provider_network_ptr.clone(),
             };
             match sign_introduction_claims(ctx, mutual_claims) {
                 Ok(mutual) => {
@@ -1136,6 +1172,32 @@ fn peer_share_introduction_response(ctx: &BootstrapContext, body: &str) -> (Stat
             )
         }
     }
+}
+
+/// Resolve one device's network name (4.107) from its live
+/// session source IP: the ASN org + PTR hostname from the
+/// resolver's cache/table. This is a cache/table read only —
+/// minting never waits on DNS (a PTR cache miss spawns a
+/// background resolution that fills the cache for a later mint).
+/// Returns `(None, None)` when there is no resolver, no live
+/// session for the device (the dial-back push handle holds the
+/// session registry), or no name for the address.
+fn peer_network_name(
+    ctx: &BootstrapContext,
+    device_public_key: &str,
+) -> (Option<String>, Option<String>) {
+    let Some(resolver) = ctx.network_names.as_ref() else {
+        return (None, None);
+    };
+    let Some(ip) = ctx
+        .dial_back_push
+        .as_ref()
+        .and_then(|push| push.session_source_ip(device_public_key))
+    else {
+        return (None, None);
+    };
+    let name = resolver.resolve(ip);
+    (name.asn_org, name.ptr_hostname)
 }
 
 /// Sign introduction claims with the server identity key. Shared by
@@ -1234,6 +1296,21 @@ async fn handle_transport_session<T: Transport>(
     };
 
     let handle = sessions.register_client(binding.client_public_key.clone());
+    // Last-seen source IP (4.107): introduction minting resolves
+    // the peer's network name from it. For a relayed session the
+    // transport peer is the PROVIDER, so the address is noted
+    // under the AUTHENTICATED (provider) key — noting it under
+    // the consumer key would misattribute the provider's egress
+    // to the consumer. The consumer's own direct transports are
+    // noted separately under its own key when they bind.
+    sessions.note_source_ip(
+        if binding.relayed_via_provider {
+            &public_key
+        } else {
+            &binding.client_public_key
+        },
+        peer,
+    );
     info!(
         peer = %peer,
         public_key = %binding.client_public_key,
@@ -1326,8 +1403,16 @@ async fn handle_transport_session<T: Transport>(
                     // Stamp the address this transport's peer presents
                     // from, so the client can show its per-path public
                     // (egress) address. Older clients ignore PONG
-                    // payloads, so this is backward compatible.
-                    payload: encode_observed_address(peer),
+                    // payloads, so this is backward compatible. A PING
+                    // carrying FLAG_NETWORK_NAME (4.107) gets the
+                    // extended payload with the network name resolved
+                    // for that address; anything else gets the plain
+                    // address-only payload.
+                    payload: crate::network_names::observed_pong_payload(
+                        ctx.network_names.as_ref(),
+                        peer,
+                        frame.header.flags & FLAG_NETWORK_NAME != 0,
+                    ),
                 };
                 if let Err(err) = transport.send(pong).await {
                     warn!(peer = %peer, session_id = handle.session_id, error = %err,
@@ -1411,8 +1496,14 @@ async fn handle_transport_session<T: Transport>(
                                     flags: FLAG_PONG,
                                 },
                                 // Observed-address stamp: see the
-                                // initial-frame pong above.
-                                payload: encode_observed_address(peer),
+                                // initial-frame pong above (4.107: the
+                                // extended format when the PING asked
+                                // for a network name).
+                                payload: crate::network_names::observed_pong_payload(
+                                    ctx.network_names.as_ref(),
+                                    peer,
+                                    frame.header.flags & FLAG_NETWORK_NAME != 0,
+                                ),
                             };
                             if let Err(err) = transport.send(pong).await {
                                 warn!(peer = %peer, session_id = handle.session_id, error = %err,
@@ -1503,6 +1594,7 @@ mod tests {
             dns_server: std::net::SocketAddr::from(([192, 0, 2, 53], 53)),
             authorized_keys: AuthorizedKeysStore::default(),
             dial_back_push: None,
+            network_names: None,
             diagnostics_dir: std::env::temp_dir().join("bonded-diagnostics-test"),
             invite_tokens_file: std::env::temp_dir().join("bonded-invites-test.toml"),
         })
@@ -1645,6 +1737,7 @@ mod tests {
             dns_server: std::net::SocketAddr::from(([192, 0, 2, 53], 53)),
             authorized_keys: AuthorizedKeysStore::default(),
             dial_back_push: None,
+            network_names: None,
             diagnostics_dir: std::env::temp_dir().join("bonded-diagnostics-test"),
             invite_tokens_file: std::env::temp_dir().join("bonded-invites-test.toml"),
         });
@@ -1761,6 +1854,7 @@ mod tests {
             dns_server: std::net::SocketAddr::from(([192, 0, 2, 53], 53)),
             authorized_keys,
             dial_back_push: None,
+            network_names: None,
             diagnostics_dir: diagnostics_dir.clone(),
             invite_tokens_file: std::env::temp_dir().join(format!("bonded-invites-{name}-{stamp}.toml")),
         });
@@ -2006,6 +2100,7 @@ mod tests {
             dns_server: std::net::SocketAddr::from(([192, 0, 2, 53], 53)),
             authorized_keys,
             dial_back_push: None,
+            network_names: None,
             diagnostics_dir: std::env::temp_dir().join("bonded-diagnostics-test"),
             invite_tokens_file: std::env::temp_dir().join("bonded-invites-test.toml"),
         });
@@ -2130,6 +2225,15 @@ mod tests {
         provider: &DeviceKeypair,
         dial_back_push: Option<Arc<crate::dial_back::DialBackPush>>,
     ) -> Arc<BootstrapContext> {
+        dial_back_test_ctx_with_names(consumer, provider, dial_back_push, None)
+    }
+
+    fn dial_back_test_ctx_with_names(
+        consumer: &DeviceKeypair,
+        provider: &DeviceKeypair,
+        dial_back_push: Option<Arc<crate::dial_back::DialBackPush>>,
+        network_names: Option<Arc<crate::network_names::NetworkNameResolver>>,
+    ) -> Arc<BootstrapContext> {
         let auth_path = temp_auth_file("peer-dial-back");
         authorize_device_key(&auth_path, &consumer.public_key_b64)
             .expect("consumer key should authorize");
@@ -2149,6 +2253,7 @@ mod tests {
             dns_server: std::net::SocketAddr::from(([192, 0, 2, 53], 53)),
             authorized_keys,
             dial_back_push,
+            network_names,
             diagnostics_dir: std::env::temp_dir().join("bonded-diagnostics-test"),
             invite_tokens_file: std::env::temp_dir().join("bonded-invites-test.toml"),
         })
@@ -2400,6 +2505,176 @@ mod tests {
             &mutual.introduction.server_signature,
         )
         .expect("mutual introduction signature should verify");
+    }
+
+    /// Network names in introductions (4.107): when both devices
+    /// have live sessions with noted source IPs, the minted
+    /// introduction carries each side's ASN org from the
+    /// resolver's table; the mutual introduction swaps the names
+    /// with the roles. When a side has no live session, its names
+    /// are explicitly absent — never invented.
+    #[tokio::test]
+    async fn peer_share_introduction_carries_peer_network_names() {
+        use bonded_core::peer_share::PeerShareDialBackNotification;
+        use crate::network_names::{AsnTables, NetworkNameResolver};
+        use std::io::Cursor;
+
+        let consumer = DeviceKeypair::generate();
+        let provider = DeviceKeypair::generate();
+
+        // Synthetic ASN table: the consumer's egress 8.8.8.8 is
+        // GOOGLE, the provider's egress 1.0.0.1 is CLOUDFLARENET.
+        let tables = AsnTables::parse_reader(Cursor::new(
+            "1.0.0.0\t1.0.0.255\t13335\tUS\tCLOUDFLARENET - Cloudflare, Inc.\n\
+             8.8.8.0\t8.8.8.255\t15169\tUS\tGOOGLE - Google LLC\n",
+        ))
+        .expect("synthetic feed should parse");
+        let resolver = NetworkNameResolver::with_tables(tables, true, None);
+
+        // Both devices have live sessions with noted source IPs,
+        // and forwarding contexts so the mutual push can deliver.
+        let sessions = SessionRegistry::default();
+        let provider_handle = sessions.register_client(provider.public_key_b64.clone());
+        sessions.note_source_ip(&provider.public_key_b64, "1.0.0.1:443".parse().unwrap());
+        let (provider_router, provider_fwd_tx) = SessionOutboundRouter::new();
+        let (provider_transport_tx, mut provider_rx) =
+            mpsc::unbounded_channel::<SessionFrame>();
+        provider_router.add_transport(1, provider_transport_tx);
+        let provider_forwarder = Arc::new(SmoltcpForwarder::new(
+            provider_handle.session_id,
+            provider_fwd_tx,
+            Arc::new(AtomicU64::new(0)),
+            std::net::SocketAddr::from(([192, 0, 2, 53], 53)),
+        ));
+        let consumer_handle = sessions.register_client(consumer.public_key_b64.clone());
+        sessions.note_source_ip(&consumer.public_key_b64, "8.8.8.8:54321".parse().unwrap());
+        let (consumer_router, consumer_fwd_tx) = SessionOutboundRouter::new();
+        let (consumer_transport_tx, mut consumer_rx) =
+            mpsc::unbounded_channel::<SessionFrame>();
+        consumer_router.add_transport(1, consumer_transport_tx);
+        let consumer_forwarder = Arc::new(SmoltcpForwarder::new(
+            consumer_handle.session_id,
+            consumer_fwd_tx,
+            Arc::new(AtomicU64::new(0)),
+            std::net::SocketAddr::from(([192, 0, 2, 53], 53)),
+        ));
+        let forwarders: Arc<RwLock<HashMap<u64, Arc<SessionContext>>>> =
+            Arc::new(RwLock::new(HashMap::from([
+                (
+                    provider_handle.session_id,
+                    Arc::new(SessionContext {
+                        forwarder: provider_forwarder,
+                        router: provider_router,
+                    }),
+                ),
+                (
+                    consumer_handle.session_id,
+                    Arc::new(SessionContext {
+                        forwarder: consumer_forwarder,
+                        router: consumer_router,
+                    }),
+                ),
+            ])));
+        let push = Arc::new(crate::dial_back::DialBackPush::new(
+            sessions, forwarders,
+        ));
+        let ctx = dial_back_test_ctx_with_names(
+            &consumer,
+            &provider,
+            Some(push),
+            Some(resolver.clone()),
+        );
+
+        // Forward mint: each side's ASN org rides its own field.
+        // The PTR half is a cold cache at mint time, so it is
+        // absent here — the pong path fills it later.
+        let request =
+            signed_introduction_request(&consumer, &provider.public_key_b64, false);
+        let (status, body) = route_bootstrap_request(
+            "POST",
+            "/v1/bootstrap/peer-share/introduction",
+            &serde_json::to_string(&request).expect("request should serialize"),
+            ctx.as_ref(),
+            None,
+        );
+        assert_eq!(status, StatusCode::OK);
+        let response: SignedPeerShareIntroduction =
+            serde_json::from_str(&body).expect("response should parse");
+        assert_eq!(
+            response.introduction.provider_network_asn_org.as_deref(),
+            Some("CLOUDFLARENET - Cloudflare, Inc.")
+        );
+        assert_eq!(response.introduction.provider_network_ptr, None);
+        assert_eq!(
+            response.introduction.consumer_network_asn_org.as_deref(),
+            Some("GOOGLE - Google LLC")
+        );
+        assert_eq!(response.introduction.consumer_network_ptr, None);
+
+        // Mutual mint: the names swap with the roles on the mutual
+        // introduction pushed to the consumer's live session.
+        let mut request =
+            signed_introduction_request(&consumer, &provider.public_key_b64, true);
+        request.consumer_instance_nonce = "consumer-nonce-1".to_owned();
+        let (status, _body) = route_bootstrap_request(
+            "POST",
+            "/v1/bootstrap/peer-share/introduction",
+            &serde_json::to_string(&request).expect("request should serialize"),
+            ctx.as_ref(),
+            None,
+        );
+        assert_eq!(status, StatusCode::OK);
+        // Drain the original dial-back push to the provider first.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            provider_rx.recv(),
+        )
+        .await
+        .expect("original push should deliver promptly");
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(2), consumer_rx.recv())
+            .await
+            .expect("mutual push should deliver promptly")
+            .expect("consumer transport should receive the notification");
+        let mutual = PeerShareDialBackNotification::from_control_frame(&frame)
+            .expect("pushed frame should parse as a dial-back notification");
+        let claims = &mutual.introduction.introduction;
+        assert_eq!(
+            claims.provider_network_asn_org.as_deref(),
+            Some("GOOGLE - Google LLC")
+        );
+        assert_eq!(
+            claims.consumer_network_asn_org.as_deref(),
+            Some("CLOUDFLARENET - Cloudflare, Inc.")
+        );
+
+        // No live sessions: the same mint carries no names at all.
+        let empty_sessions = SessionRegistry::default();
+        let empty_push = Arc::new(crate::dial_back::DialBackPush::new(
+            empty_sessions,
+            Arc::new(RwLock::new(HashMap::new())),
+        ));
+        let empty_ctx = dial_back_test_ctx_with_names(
+            &consumer,
+            &provider,
+            Some(empty_push),
+            Some(resolver),
+        );
+        let request =
+            signed_introduction_request(&consumer, &provider.public_key_b64, false);
+        let (status, body) = route_bootstrap_request(
+            "POST",
+            "/v1/bootstrap/peer-share/introduction",
+            &serde_json::to_string(&request).expect("request should serialize"),
+            empty_ctx.as_ref(),
+            None,
+        );
+        assert_eq!(status, StatusCode::OK);
+        let response: SignedPeerShareIntroduction =
+            serde_json::from_str(&body).expect("response should parse");
+        assert_eq!(response.introduction.provider_network_asn_org, None);
+        assert_eq!(response.introduction.provider_network_ptr, None);
+        assert_eq!(response.introduction.consumer_network_asn_org, None);
+        assert_eq!(response.introduction.consumer_network_ptr, None);
     }
 
     #[test]

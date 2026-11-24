@@ -119,6 +119,33 @@ pub struct PeerShareIntroductionClaims {
     /// `provider_endpoint` there).
     #[serde(default)]
     pub consumer_endpoints: Vec<String>,
+    /// ASN org name of the provider's live session source IP
+    /// (4.107), e.g. `"GOOGLE - Google LLC"`, resolved by the
+    /// server at mint time from the provider's last-seen transport
+    /// address. `None` when the provider has no live session or
+    /// its address has no ASN name — an explicit absent value,
+    /// never an invented one — so the client falls back to showing
+    /// no network name. Old servers mint no such field and parse
+    /// as `None`.
+    #[serde(default)]
+    pub provider_network_asn_org: Option<String>,
+    /// PTR hostname of the provider's live session source IP
+    /// (4.107), same source and same absent-means-unknown rule as
+    /// `provider_network_asn_org`.
+    #[serde(default)]
+    pub provider_network_ptr: Option<String>,
+    /// ASN org name of the consumer's live session source IP
+    /// (4.107), same source and same absent-means-unknown rule as
+    /// `provider_network_asn_org`. The provider side (Relayed card)
+    /// reads this one; the consumer side (Paths card) reads the
+    /// provider's.
+    #[serde(default)]
+    pub consumer_network_asn_org: Option<String>,
+    /// PTR hostname of the consumer's live session source IP
+    /// (4.107), same source and same absent-means-unknown rule as
+    /// `consumer_network_asn_org`.
+    #[serde(default)]
+    pub consumer_network_ptr: Option<String>,
 }
 
 impl PeerShareIntroductionClaims {
@@ -469,12 +496,62 @@ mod tests {
             expires_at: 12345,
             direction: "forward".to_owned(),
             consumer_endpoints: Vec::new(),
+            provider_network_asn_org: None,
+            provider_network_ptr: None,
+            consumer_network_asn_org: None,
+            consumer_network_ptr: None,
         };
 
         let payload =
             String::from_utf8(claims.signing_payload().expect("payload should serialize"))
                 .expect("payload should be utf8");
         assert!(payload.contains("expires_at"));
+    }
+
+    #[test]
+    fn introduction_claims_carry_network_names_and_old_claims_parse_as_unknown() {
+        // 4.107: a named pair round-trips through JSON, and claims
+        // minted by an old server (no network fields) parse with all
+        // four names explicitly absent — never invented.
+        let claims = PeerShareIntroductionClaims {
+            consumer_device_public_key: "consumer".to_owned(),
+            provider_device_public_key: "provider".to_owned(),
+            provider_instance_nonce: "nonce-1".to_owned(),
+            provider_endpoint: "192.168.1.20:54443".to_owned(),
+            listener_transport: "quic".to_owned(),
+            listener_cert_fingerprint: "sha256:abcd".to_owned(),
+            expires_at: 12345,
+            direction: "forward".to_owned(),
+            consumer_endpoints: Vec::new(),
+            provider_network_asn_org: Some("GOOGLE - Google LLC".to_owned()),
+            provider_network_ptr: Some("dns.google".to_owned()),
+            consumer_network_asn_org: Some("CLOUDFLARENET - Cloudflare, Inc.".to_owned()),
+            consumer_network_ptr: None,
+        };
+        let parsed: PeerShareIntroductionClaims = serde_json::from_str(
+            &serde_json::to_string(&claims).expect("claims should serialize"),
+        )
+        .expect("claims should parse");
+        assert_eq!(parsed, claims);
+        assert_eq!(
+            parsed.provider_network_asn_org.as_deref(),
+            Some("GOOGLE - Google LLC")
+        );
+        assert_eq!(parsed.provider_network_ptr.as_deref(), Some("dns.google"));
+        assert_eq!(
+            parsed.consumer_network_asn_org.as_deref(),
+            Some("CLOUDFLARENET - Cloudflare, Inc.")
+        );
+        assert_eq!(parsed.consumer_network_ptr, None);
+
+        let old: PeerShareIntroductionClaims = serde_json::from_str(
+            r#"{"consumer_device_public_key":"consumer","provider_device_public_key":"provider","provider_instance_nonce":"nonce-1","provider_endpoint":"192.168.1.20:54443","listener_transport":"quic","listener_cert_fingerprint":"sha256:abcd","expires_at":12345}"#,
+        )
+        .expect("old claims should parse");
+        assert_eq!(old.provider_network_asn_org, None);
+        assert_eq!(old.provider_network_ptr, None);
+        assert_eq!(old.consumer_network_asn_org, None);
+        assert_eq!(old.consumer_network_ptr, None);
     }
 
     #[test]
@@ -502,6 +579,10 @@ mod tests {
             expires_at: 12345,
             direction: "reverse".to_owned(),
             consumer_endpoints: vec!["192.168.43.10:54443".to_owned()],
+            provider_network_asn_org: None,
+            provider_network_ptr: None,
+            consumer_network_asn_org: None,
+            consumer_network_ptr: None,
         };
         assert!(claims.is_reverse());
         let parsed: PeerShareIntroductionClaims = serde_json::from_str(
@@ -618,6 +699,10 @@ mod tests {
                     expires_at: 12345,
                     direction: "forward".to_owned(),
                     consumer_endpoints: Vec::new(),
+                    provider_network_asn_org: None,
+                    provider_network_ptr: None,
+                    consumer_network_asn_org: None,
+                    consumer_network_ptr: None,
                 },
                 server_signature: "sig".to_owned(),
             },
@@ -650,6 +735,10 @@ mod tests {
                     expires_at: 12345,
                     direction: "reverse".to_owned(),
                     consumer_endpoints: vec!["192.168.43.10:54443".to_owned()],
+                    provider_network_asn_org: None,
+                    provider_network_ptr: None,
+                    consumer_network_asn_org: None,
+                    consumer_network_ptr: None,
                 },
                 server_signature: "sig".to_owned(),
             },

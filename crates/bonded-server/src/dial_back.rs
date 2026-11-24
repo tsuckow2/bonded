@@ -132,6 +132,14 @@ impl DialBackPush {
         }
     }
 
+    /// Last-seen transport source IP for a live session (4.107):
+    /// the address introduction minting resolves that device's
+    /// network name from. `None` when the device has no live
+    /// session — the introduction then carries no network name.
+    pub fn session_source_ip(&self, device_public_key: &str) -> Option<std::net::IpAddr> {
+        self.sessions.source_ip_for(device_public_key)
+    }
+
     /// Push a dial-back notification to the provider's live session.
     /// A provider with no live session drops the notification
     /// without consuming rate-limit budget; a pair that already
@@ -227,6 +235,10 @@ mod tests {
                     expires_at: now_plus(300),
                     direction: "reverse".to_owned(),
                     consumer_endpoints: vec!["192.168.43.10:54443".to_owned()],
+                    provider_network_asn_org: None,
+                    provider_network_ptr: None,
+                    consumer_network_asn_org: None,
+                    consumer_network_ptr: None,
                 },
                 server_signature: "sig".to_owned(),
             },

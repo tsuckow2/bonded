@@ -750,6 +750,10 @@ mod tests {
             expires_at: now_plus(300),
             direction: "forward".to_owned(),
             consumer_endpoints: Vec::new(),
+            provider_network_asn_org: None,
+            provider_network_ptr: None,
+            consumer_network_asn_org: None,
+            consumer_network_ptr: None,
         };
         let introduction = sign_introduction(&server, claims.clone());
         let listener = PeerListenerIdentity {
@@ -805,6 +809,10 @@ mod tests {
             expires_at: now_plus(0).saturating_sub(1),
             direction: "forward".to_owned(),
             consumer_endpoints: Vec::new(),
+            provider_network_asn_org: None,
+            provider_network_ptr: None,
+            consumer_network_asn_org: None,
+            consumer_network_ptr: None,
         };
         let introduction = sign_introduction(&server, claims.clone());
         let listener = PeerListenerIdentity {
@@ -833,6 +841,10 @@ mod tests {
             expires_at: now_plus(300),
             direction: "forward".to_owned(),
             consumer_endpoints: Vec::new(),
+            provider_network_asn_org: None,
+            provider_network_ptr: None,
+            consumer_network_asn_org: None,
+            consumer_network_ptr: None,
         };
         let introduction = sign_introduction(&server, claims);
 
@@ -864,6 +876,10 @@ mod tests {
                 expires_at: now_plus(300),
                 direction: "reverse".to_owned(),
                 consumer_endpoints: vec!["192.168.43.10:54443".to_owned()],
+                provider_network_asn_org: None,
+                provider_network_ptr: None,
+                consumer_network_asn_org: None,
+                consumer_network_ptr: None,
             },
         )
     }
@@ -945,6 +961,10 @@ mod tests {
                 expires_at: now_plus(300),
                 direction: "forward".to_owned(),
                 consumer_endpoints: Vec::new(),
+                provider_network_asn_org: None,
+                provider_network_ptr: None,
+                consumer_network_asn_org: None,
+                consumer_network_ptr: None,
             },
         );
 
@@ -997,6 +1017,10 @@ mod tests {
                 expires_at: now_plus(300),
                 direction: "reverse".to_owned(),
                 consumer_endpoints: Vec::new(),
+                provider_network_asn_org: None,
+                provider_network_ptr: None,
+                consumer_network_asn_org: None,
+                consumer_network_ptr: None,
             },
         );
 
@@ -1044,6 +1068,10 @@ mod tests {
             expires_at: now_plus(300),
             direction: "forward".to_owned(),
             consumer_endpoints: Vec::new(),
+            provider_network_asn_org: None,
+            provider_network_ptr: None,
+            consumer_network_asn_org: None,
+            consumer_network_ptr: None,
         };
         let introduction = sign_introduction(&server_identity, claims);
 
@@ -1166,6 +1194,10 @@ mod tests {
             expires_at: now_plus(300),
             direction: "forward".to_owned(),
             consumer_endpoints: Vec::new(),
+            provider_network_asn_org: None,
+            provider_network_ptr: None,
+            consumer_network_asn_org: None,
+            consumer_network_ptr: None,
         };
         let introduction = sign_introduction(&server_identity, claims);
 
@@ -1259,6 +1291,10 @@ mod tests {
             expires_at: now_plus(300),
             direction: "reverse".to_owned(),
             consumer_endpoints: vec![listen_addr.to_string()],
+            provider_network_asn_org: None,
+            provider_network_ptr: None,
+            consumer_network_asn_org: None,
+            consumer_network_ptr: None,
         };
         let introduction = sign_introduction(&server_identity, claims);
 
@@ -1359,6 +1395,10 @@ mod tests {
             expires_at: now_plus(300),
             direction: "forward".to_owned(),
             consumer_endpoints: Vec::new(),
+            provider_network_asn_org: None,
+            provider_network_ptr: None,
+            consumer_network_asn_org: None,
+            consumer_network_ptr: None,
         };
         let introduction = sign_introduction(&server, claims);
         let result = connect_peer_relay_reversed(
@@ -1443,6 +1483,10 @@ mod tests {
                 expires_at: now_plus(300),
                 direction: "forward".to_owned(),
                 consumer_endpoints: Vec::new(),
+                provider_network_asn_org: None,
+                provider_network_ptr: None,
+                consumer_network_asn_org: None,
+                consumer_network_ptr: None,
             },
         );
 
@@ -1734,6 +1778,10 @@ mod tests {
                 expires_at: now_plus(300),
                 direction: "forward".to_owned(),
                 consumer_endpoints: Vec::new(),
+                provider_network_asn_org: None,
+                provider_network_ptr: None,
+                consumer_network_asn_org: None,
+                consumer_network_ptr: None,
             },
             server_signature: "sig".to_owned(),
         };

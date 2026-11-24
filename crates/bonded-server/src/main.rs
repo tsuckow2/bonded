@@ -9,6 +9,7 @@ mod dial_back;
 mod dns_proxy;
 mod health;
 mod invite_tokens;
+mod network_names;
 mod network_runtime;
 mod pairing_qr;
 mod peer_relay;
@@ -55,8 +56,8 @@ use authorized_keys::{AuthorizedKeysStore, AuthorizedKeysWatcher};
 use anyhow::Context as _;
 use bonded_core::config::{load_server_config, ServerConfig, DEFAULT_SERVER_CONFIG_PATH};
 use bonded_core::session::{
-    encode_observed_address, is_answerable_ping, parse_session_epoch, SessionFrame,
-    SessionHeader, FLAG_PING, FLAG_PONG,
+    is_answerable_ping, parse_session_epoch, SessionFrame, SessionHeader, FLAG_NETWORK_NAME,
+    FLAG_PING, FLAG_PONG,
 };
 use bonded_core::transport::{NaiveTcpTransport, Transport};
 use clap::Parser;
@@ -285,6 +286,63 @@ async fn main() -> anyhow::Result<()> {
         .await;
     }
 
+    // Network names (4.107): ASN tables + PTR cache for extended
+    // PONGs and peer-share introduction claims. Loading a missing
+    // or broken ASN file only disables ASN lookup (PTR still
+    // works); it never fails startup — see from_config.
+    let network_names = network_names::NetworkNameResolver::from_config(&cfg.server);
+    if cfg.server.asn_db_auto_refresh {
+        match network_names.db_path() {
+            None => {
+                warn!("asn_db_auto_refresh is on but no asn_db_path is configured; ASN auto-refresh disabled");
+            }
+            Some(path) if !path.exists() => {
+                // Fresh server with no database yet: fetch FIRST,
+                // so it does not run without names until the first
+                // interval elapses. A failed first fetch only logs
+                // — the loop below retries at the next interval.
+                match network_names.refresh().await {
+                    Ok(report) => {
+                        info!(
+                            path = %path.display(),
+                            ranges = report.new_range_count,
+                            "ASN database downloaded at startup"
+                        );
+                    }
+                    Err(err) => {
+                        warn!(
+                            path = %path.display(),
+                            error = %err,
+                            "initial ASN database download failed; starting without ASN names"
+                        );
+                    }
+                }
+            }
+            Some(_) => {}
+        }
+        let refresh_names = network_names.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(refresh_names.refresh_interval()).await;
+                match refresh_names.refresh().await {
+                    Ok(report) => {
+                        info!(
+                            old_ranges = report.old_range_count,
+                            new_ranges = report.new_range_count,
+                            "ASN database auto-refresh succeeded"
+                        );
+                    }
+                    Err(err) => {
+                        warn!(
+                            error = %err,
+                            "ASN database auto-refresh failed; keeping old data"
+                        );
+                    }
+                }
+            }
+        });
+    }
+
     let bootstrap_ctx = Arc::new(bootstrap::BootstrapContext {
         dns_server,
         server_identity: server_identity.clone(),
@@ -299,6 +357,7 @@ async fn main() -> anyhow::Result<()> {
             sessions.clone(),
             forwarders.clone(),
         ))),
+        network_names: Some(network_names.clone()),
         diagnostics_dir: std::path::Path::new(&cfg.server.authorized_keys_file)
             .parent()
             .map(|parent| parent.join("diagnostics"))
@@ -394,6 +453,7 @@ async fn main() -> anyhow::Result<()> {
                 tun_bridge,
                 tunnel_pcap,
                 dns_server,
+                bootstrap_ctx.network_names.clone(),
             ) => result,
             signal_result = signal::ctrl_c() => {
                 match signal_result {
@@ -585,6 +645,7 @@ async fn run_server(
     tun_bridge: Option<TunBridge>,
     tunnel_pcap: Option<Arc<TunnelPcapLogger>>,
     dns_server: std::net::SocketAddr,
+    network_names: Option<Arc<crate::network_names::NetworkNameResolver>>,
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind(bind).await?;
     info!(bind = %bind, "naive tcp listener bound");
@@ -599,6 +660,7 @@ async fn run_server(
         };
 
         let authorized_keys = authorized_keys.clone();
+        let network_names = network_names.clone();
         let sessions = sessions.clone();
         let forwarders = forwarders.clone();
         let tun_bridge = tun_bridge.clone();
@@ -630,6 +692,18 @@ async fn run_server(
                     };
 
                     let handle = sessions.register_client(binding.client_public_key.clone());
+                    // Last-seen source IP (4.107): under the
+                    // authenticated key on a relayed bind (the
+                    // transport peer is the provider), else under
+                    // the session key — see bootstrap.rs.
+                    sessions.note_source_ip(
+                        if binding.relayed_via_provider {
+                            &public_key
+                        } else {
+                            &binding.client_public_key
+                        },
+                        peer,
+                    );
                     info!(
                         peer = %peer,
                         public_key = %binding.client_public_key,
@@ -770,8 +844,15 @@ async fn run_server(
                                     // peer presents from, so the client can
                                     // show its per-path public (egress)
                                     // address. Older clients ignore PONG
-                                    // payloads: backward compatible.
-                                    payload: encode_observed_address(peer),
+                                    // payloads: backward compatible. A PING
+                                    // carrying FLAG_NETWORK_NAME (4.107) gets
+                                    // the extended payload with the network
+                                    // name.
+                                    payload: crate::network_names::observed_pong_payload(
+                                        network_names.as_ref(),
+                                        peer,
+                                        frame.header.flags & FLAG_NETWORK_NAME != 0,
+                                    ),
                                 };
                                 if let Err(err) = transport.send(pong).await {
                                     warn!(
@@ -898,8 +979,15 @@ async fn run_server(
                                                     flags: FLAG_PONG,
                                                 },
                                                 // Observed-address stamp:
-                                                // see the initial pong above.
-                                                payload: encode_observed_address(peer),
+                                                // see the initial pong above
+                                                // (4.107: extended format when
+                                                // the PING asked for a network
+                                                // name).
+                                                payload: crate::network_names::observed_pong_payload(
+                                                    network_names.as_ref(),
+                                                    peer,
+                                                    frame.header.flags & FLAG_NETWORK_NAME != 0,
+                                                ),
                                             };
                                             if let Err(err) = transport.send(pong).await {
                                                 warn!(
