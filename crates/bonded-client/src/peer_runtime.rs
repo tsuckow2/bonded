@@ -954,117 +954,171 @@ async fn run_dial_back_handler(
             continue;
         }
         let consumer_key = notification.consumer_device_public_key.clone();
-        let plan = {
-            let mut claims = path_claims
-                .lock()
-                .expect("relay path claims lock poisoned");
-            let path_indexes: Vec<usize> = path_source
-                .snapshot()
-                .iter()
-                .map(|(index, _)| *index)
-                .collect();
-            plan_dial_back(
+        // One leg per provider path (4.111): dial legs with the
+        // same introduction until no free path remains or a dial
+        // fails, mirroring the forward dial loop. A consumer that
+        // can only be reached by dial-back (it never discovers the
+        // provider, e.g. the 7a/8 Pro pair) otherwise only ever
+        // holds the lowest-index leg — the provider's other paths
+        // (the 8 Pro's AT&T path) are never used for it.
+        let mut legs_dialed = 0usize;
+        loop {
+            // Re-check dozing each leg: a device that starts
+            // dozing mid-loop stops dialing further legs.
+            if dozing.load(Ordering::Relaxed) {
+                warn!(
+                    consumer = %consumer_key,
+                    legs = legs_dialed,
+                    "dial-back loop stopped: device dozing"
+                );
+                break;
+            }
+            let plan = {
+                let mut claims = path_claims
+                    .lock()
+                    .expect("relay path claims lock poisoned");
+                let path_indexes: Vec<usize> = path_source
+                    .snapshot()
+                    .iter()
+                    .map(|(index, _)| *index)
+                    .collect();
+                plan_dial_back(
+                    &server_key,
+                    &own_device_public_key,
+                    &notification,
+                    &mut claims,
+                    &path_indexes,
+                )
+            };
+            let plan = match plan {
+                Ok(plan) => plan,
+                Err(err) => {
+                    if legs_dialed == 0 {
+                        warn!(consumer = %consumer_key, error = %err, "dial-back dropped");
+                        emit_peer_share_event(
+                            logger.as_ref(),
+                            format!("dial-back dropped for consumer={consumer_key}: {err}"),
+                        );
+                    } else {
+                        // Every provider path already holds a leg
+                        // for this consumer: the loop's normal stop.
+                        info!(
+                            consumer = %consumer_key,
+                            legs = legs_dialed,
+                            error = %err,
+                            "dial-back loop done: no free provider path"
+                        );
+                    }
+                    break;
+                }
+            };
+            let claimed_path = plan.claimed_path;
+            let expires_at = plan.expires_at;
+            info!(
+                consumer = %plan.consumer_key,
+                endpoints = %plan.endpoints.iter().map(SocketAddr::to_string).collect::<Vec<_>>().join(","),
+                claimed_path = claimed_path,
+                "dialing back consumer"
+            );
+            emit_peer_share_event(
+                logger.as_ref(),
+                format!(
+                    "dialing back consumer={} path={}",
+                    plan.consumer_key, claimed_path
+                ),
+            );
+            match connect_peer_relay_reversed(
                 &server_key,
                 &own_device_public_key,
-                &notification,
-                &mut claims,
-                &path_indexes,
+                &plan.introduction,
+                socket_protect.as_ref(),
+                bind_ip,
+                &plan.endpoints,
             )
-        };
-        let plan = match plan {
-            Ok(plan) => plan,
-            Err(err) => {
-                warn!(consumer = %consumer_key, error = %err, "dial-back dropped");
-                emit_peer_share_event(
-                    logger.as_ref(),
-                    format!("dial-back dropped for consumer={consumer_key}: {err}"),
-                );
-                continue;
-            }
-        };
-        let claimed_path = plan.claimed_path;
-        let expires_at = plan.expires_at;
-        info!(
-            consumer = %plan.consumer_key,
-            endpoints = %plan.endpoints.iter().map(SocketAddr::to_string).collect::<Vec<_>>().join(","),
-            claimed_path = claimed_path,
-            "dialing back consumer"
-        );
-        emit_peer_share_event(
-            logger.as_ref(),
-            format!(
-                "dialing back consumer={} path={}",
-                plan.consumer_key, claimed_path
-            ),
-        );
-        match connect_peer_relay_reversed(
-            &server_key,
-            &own_device_public_key,
-            &plan.introduction,
-            socket_protect.as_ref(),
-            bind_ip,
-            &plan.endpoints,
-        )
-        .await
-        {
-            Ok(PeerRelayDial::Accepted(transport)) => {
-                info!(
-                    consumer = %plan.consumer_key,
-                    claimed_path = claimed_path,
-                    "dial-back relay accepted"
-                );
-                emit_peer_share_event(
-                    logger.as_ref(),
-                    format!(
-                        "dial-back relay accepted for consumer={} path={}",
-                        plan.consumer_key, claimed_path
-                    ),
-                );
-                tokio::spawn(run_relay_task(
-                    transport,
-                    plan.introduction,
-                    plan.consumer_key,
-                    claimed_path,
-                    config.clone(),
-                    path_source.clone(),
-                    path_claims.clone(),
-                    active_relays.clone(),
-                    relay_stats.clone(),
-                    relay_sticky.clone(),
-                    bandwidth_kbps,
-                    logger.clone(),
-                ));
-            }
-            Ok(PeerRelayDial::NoPath) => {
-                // The consumer refused with no_path: it already
-                // holds a leg for this peer (consumer-side dedup).
-                // Release the claim so the path stays available.
-                path_claims
-                    .lock()
-                    .expect("relay path claims lock poisoned")
-                    .release(&plan.consumer_key, claimed_path, expires_at);
-                warn!(
-                    consumer = %plan.consumer_key,
-                    "dial-back refused: consumer reports no free path (duplicate leg)"
-                );
-                emit_peer_share_event(
-                    logger.as_ref(),
-                    format!(
-                        "dial-back refused for consumer={}: no free path",
-                        plan.consumer_key
-                    ),
-                );
-            }
-            Err(err) => {
-                path_claims
-                    .lock()
-                    .expect("relay path claims lock poisoned")
-                    .release(&plan.consumer_key, claimed_path, expires_at);
-                warn!(consumer = %plan.consumer_key, error = %err, "dial-back dial failed");
-                emit_peer_share_event(
-                    logger.as_ref(),
-                    format!("dial-back dial failed for consumer={}: {err}", plan.consumer_key),
-                );
+            .await
+            {
+                Ok(PeerRelayDial::Accepted(transport)) => {
+                    info!(
+                        consumer = %plan.consumer_key,
+                        claimed_path = claimed_path,
+                        "dial-back relay accepted"
+                    );
+                    emit_peer_share_event(
+                        logger.as_ref(),
+                        format!(
+                            "dial-back relay accepted for consumer={} path={}",
+                            plan.consumer_key, claimed_path
+                        ),
+                    );
+                    tokio::spawn(run_relay_task(
+                        transport,
+                        plan.introduction,
+                        plan.consumer_key,
+                        claimed_path,
+                        config.clone(),
+                        path_source.clone(),
+                        path_claims.clone(),
+                        active_relays.clone(),
+                        relay_stats.clone(),
+                        relay_sticky.clone(),
+                        bandwidth_kbps,
+                        logger.clone(),
+                    ));
+                    legs_dialed += 1;
+                    // Loop: claim the next free path for another
+                    // leg with the same introduction.
+                }
+                Ok(PeerRelayDial::NoPath) => {
+                    // The consumer refused with no_path: it already
+                    // holds a leg for this peer (consumer-side dedup).
+                    // Release the claim so the path stays available.
+                    path_claims
+                        .lock()
+                        .expect("relay path claims lock poisoned")
+                        .release(&plan.consumer_key, claimed_path, expires_at);
+                    if legs_dialed == 0 {
+                        warn!(
+                            consumer = %consumer_key,
+                            "dial-back refused: consumer reports no free path (duplicate leg)"
+                        );
+                        emit_peer_share_event(
+                            logger.as_ref(),
+                            format!(
+                                "dial-back refused for consumer={consumer_key}: no free path"
+                            ),
+                        );
+                    } else {
+                        info!(
+                            consumer = %consumer_key,
+                            legs = legs_dialed,
+                            "dial-back loop done: consumer reports no free path"
+                        );
+                    }
+                    break;
+                }
+                Err(err) => {
+                    path_claims
+                        .lock()
+                        .expect("relay path claims lock poisoned")
+                        .release(&plan.consumer_key, claimed_path, expires_at);
+                    if legs_dialed == 0 {
+                        warn!(consumer = %plan.consumer_key, error = %err, "dial-back dial failed");
+                        emit_peer_share_event(
+                            logger.as_ref(),
+                            format!("dial-back dial failed for consumer={}: {err}", plan.consumer_key),
+                        );
+                    } else {
+                        // A failed later leg keeps the legs already
+                        // won (mirrors the forward dial loop).
+                        warn!(
+                            consumer = %plan.consumer_key,
+                            error = %err,
+                            legs = legs_dialed,
+                            "dial-back additional leg dial failed; keeping legs won"
+                        );
+                    }
+                    break;
+                }
             }
         }
     }
@@ -4245,6 +4299,58 @@ mod tests {
         )
         .expect("reversed plan should claim the free path");
         assert_eq!(plan.claimed_path, 1);
+    }
+
+    #[test]
+    fn dial_back_plan_claims_one_leg_per_free_path_from_one_notification() {
+        // 4.111: one dial-back notification yields one leg per
+        // free provider path. A consumer that can only be reached
+        // by dial-back (it never discovers the provider) otherwise
+        // only ever holds the lowest-index leg — the provider's
+        // other paths are never used for it. The dial-back
+        // handler loops `plan_dial_back` with the same
+        // notification until no free path remains; successive
+        // plans claim successive paths, then the loop stops.
+        let server = DeviceKeypair::generate();
+        let provider = DeviceKeypair::generate();
+        let consumer = DeviceKeypair::generate();
+        let expires_at = now_plus(300);
+        let notification = dial_back_notification(
+            &server,
+            &consumer.public_key_b64,
+            &provider.public_key_b64,
+            expires_at,
+        );
+        let mut claims = RelayPathClaims::default();
+        let first = plan_dial_back(
+            &server.public_key_b64,
+            &provider.public_key_b64,
+            &notification,
+            &mut claims,
+            &[0, 1],
+        )
+        .expect("first dial-back plan should claim a path");
+        assert_eq!(first.claimed_path, 0);
+        assert_eq!(first.expires_at, expires_at);
+        let second = plan_dial_back(
+            &server.public_key_b64,
+            &provider.public_key_b64,
+            &notification,
+            &mut claims,
+            &[0, 1],
+        )
+        .expect("second dial-back plan should claim the other path");
+        assert_eq!(second.claimed_path, 1);
+        assert_eq!(second.expires_at, expires_at);
+        let error = plan_dial_back(
+            &server.public_key_b64,
+            &provider.public_key_b64,
+            &notification,
+            &mut claims,
+            &[0, 1],
+        )
+        .expect_err("third plan should fail: every path holds a leg");
+        assert!(error.to_string().contains("no free provider path"));
     }
 
     #[test]
