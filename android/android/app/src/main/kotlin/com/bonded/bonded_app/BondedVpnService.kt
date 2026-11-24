@@ -110,6 +110,13 @@ data class SessionPathStat(
         val lastRttMs: Long,
         /** "IP:port" source address the server sees for this path, or null. */
         val serverSeenAddress: String?,
+        /** ASN org name the server resolved for this path's public
+         * egress address (4.107), e.g. "GOOGLE - Google LLC", or
+         * null when the server holds no name for the address. */
+        val networkAsnOrg: String? = null,
+        /** PTR hostname the server resolved for this path's public
+         * egress address (4.107), or null when there is none. */
+        val networkPtr: String? = null,
         /** Provider device key for peer-relay transports; null for direct transports. */
         val peerId: String? = null,
         /** QUIC PING frames sent on this path's connection (quinn
@@ -161,6 +168,12 @@ internal fun parseSessionPaths(array: JSONArray?): List<SessionPathStat> {
                         serverSeenAddress =
                                 if (item.isNull("serverSeenAddress")) null
                                 else item.optString("serverSeenAddress").takeIf { it.isNotEmpty() },
+                        networkAsnOrg =
+                                if (item.isNull("networkAsnOrg")) null
+                                else item.optString("networkAsnOrg").takeIf { it.isNotEmpty() },
+                        networkPtr =
+                                if (item.isNull("networkPtr")) null
+                                else item.optString("networkPtr").takeIf { it.isNotEmpty() },
                         peerId =
                                 if (item.isNull("peerId")) null
                                 else item.optString("peerId").takeIf { it.isNotEmpty() },
@@ -218,6 +231,8 @@ internal fun sessionPathStatToMap(path: SessionPathStat): Map<String, Any?> =
                 "wireRxBytes" to path.wireRxBytes,
                 "lastRttMs" to path.lastRttMs,
                 "serverSeenAddress" to path.serverSeenAddress,
+                "networkAsnOrg" to path.networkAsnOrg,
+                "networkPtr" to path.networkPtr,
                 "peerId" to path.peerId,
                 "quicPingFrames" to path.quicPingFrames,
                 "quicLostPackets" to path.quicLostPackets,

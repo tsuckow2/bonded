@@ -1108,9 +1108,12 @@ class _PathRow extends StatelessWidget {
                   ].join(' · '),
                   style: TextStyle(fontSize: 12, color: Colors.grey[700]),
                 ),
-                if (path.publicIp != null)
+                // 4.107: the network name for this leg's egress —
+                // ASN org first, PTR second when it differs, else
+                // the public IP when neither resolved.
+                for (final line in path.networkNameLines)
                   Text(
-                    'Public IP ${path.publicIp}',
+                    line,
                     style: TextStyle(fontSize: 12, color: Colors.grey[700]),
                   ),
               ],
@@ -1324,9 +1327,12 @@ class _PeerRow extends StatelessWidget {
                     ].join(' · '),
                     style: TextStyle(fontSize: 12, color: Colors.grey[700]),
                   ),
-                  if (path.publicIp != null)
+                  // 4.107: the network name for this leg's egress —
+                  // ASN org first, PTR second when it differs, else
+                  // the public IP when neither resolved.
+                  for (final line in path.networkNameLines)
                     Text(
-                      'Public IP ${path.publicIp}',
+                      line,
                       style: TextStyle(fontSize: 12, color: Colors.grey[700]),
                     ),
                 ],

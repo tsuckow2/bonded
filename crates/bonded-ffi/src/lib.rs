@@ -14,8 +14,8 @@ use bonded_core::config::SocketNetworkBindFn;
 use bonded_core::config::SocketProtectFn;
 use bonded_core::session::SessionFrame;
 use bonded_core::session::{
-    decode_observed_address, SessionHeader, SessionState, FLAG_MULTIPATH_RECV, FLAG_PATH_RETIRE,
-    FLAG_PING, FLAG_PONG, FLAG_REDUNDANT, FLAG_SESSION_EPOCH,
+    decode_observed_network, SessionHeader, SessionState, FLAG_MULTIPATH_RECV, FLAG_NETWORK_NAME,
+    FLAG_PATH_RETIRE, FLAG_PING, FLAG_PONG, FLAG_REDUNDANT, FLAG_SESSION_EPOCH,
 };
 use bytes::Bytes;
 use std::collections::VecDeque;
@@ -701,6 +701,20 @@ struct AndroidPathStat {
     /// the path's public egress address. `None` until a stamped pong
     /// arrives — servers older than the pong stamp never send one.
     server_seen_address: Option<String>,
+    /// Network name the server resolved for this path's public
+    /// egress address (4.107): the ASN org name, e.g. `"GOOGLE -
+    /// Google LLC"`. `None` until a stamped extended pong arrives,
+    /// or when the server holds no ASN name for the address.
+    /// Peer-relay legs are seeded from the introduction's provider
+    /// name at publish time (see `publish_path_stats`) so the row
+    /// shows before the first pong; the pong wins on any
+    /// disagreement (see the pong handler).
+    network_asn_org: Option<String>,
+    /// PTR hostname the server resolved for this path's public
+    /// egress address (4.107), same source and same absent rule as
+    /// `network_asn_org`. Shown as the secondary detail when it
+    /// differs from the ASN org.
+    network_ptr_hostname: Option<String>,
     /// Provider device key for peer-relay transports; `None` for
     /// direct transports. The peer-connections list groups legs by
     /// this id (several legs share one peer id when the provider has
@@ -858,6 +872,16 @@ fn snapshot_json(snapshot: &AndroidSessionSnapshot) -> String {
                 .as_ref()
                 .map(|addr| format!("\"{}\"", escape_json(addr)))
                 .unwrap_or_else(|| "null".to_owned());
+            let network_asn_org = stat
+                .network_asn_org
+                .as_ref()
+                .map(|name| format!("\"{}\"", escape_json(name)))
+                .unwrap_or_else(|| "null".to_owned());
+            let network_ptr = stat
+                .network_ptr_hostname
+                .as_ref()
+                .map(|name| format!("\"{}\"", escape_json(name)))
+                .unwrap_or_else(|| "null".to_owned());
             let peer_id = stat
                 .peer_id
                 .as_ref()
@@ -888,7 +912,7 @@ fn snapshot_json(snapshot: &AndroidSessionSnapshot) -> String {
                 .map(|packets| packets.to_string())
                 .unwrap_or_else(|| "null".to_owned());
             format!(
-                "{{\"pathIndex\":{},\"kind\":\"{}\",\"active\":{},\"paused\":{},\"outboundBytes\":{},\"inboundBytes\":{},\"wireTxBytes\":{},\"wireRxBytes\":{},\"quicPingFrames\":{},\"quicLostPackets\":{},\"quicLostBytes\":{},\"quicSentPackets\":{},\"lastRttMs\":{},\"serverSeenAddress\":{},\"peerId\":{}}}",
+                "{{\"pathIndex\":{},\"kind\":\"{}\",\"active\":{},\"paused\":{},\"outboundBytes\":{},\"inboundBytes\":{},\"wireTxBytes\":{},\"wireRxBytes\":{},\"quicPingFrames\":{},\"quicLostPackets\":{},\"quicLostBytes\":{},\"quicSentPackets\":{},\"lastRttMs\":{},\"serverSeenAddress\":{},\"networkAsnOrg\":{},\"networkPtr\":{},\"peerId\":{}}}",
                 path_index,
                 escape_json(&stat.kind),
                 stat.active,
@@ -903,6 +927,8 @@ fn snapshot_json(snapshot: &AndroidSessionSnapshot) -> String {
                 quic_sent_packets,
                 stat.last_rtt_ms,
                 server_seen,
+                network_asn_org,
+                network_ptr,
                 peer_id,
             )
         })
@@ -1495,6 +1521,28 @@ fn publish_path_stats(
                     None => previous.get(index),
                 };
                 let wire = transport.wire_stats();
+                // Network names (4.107): a pong-derived name
+                // survives republishes — the pong is the live
+                // per-leg value and wins over the introduction.
+                // A peer leg with no pong yet seeds from the
+                // introduction's provider name, so its row shows
+                // before the first pong arrives. Direct paths
+                // carry only pong-derived names.
+                let prior_network_asn_org =
+                    prior.and_then(|stat| stat.network_asn_org.clone());
+                let prior_network_ptr =
+                    prior.and_then(|stat| stat.network_ptr_hostname.clone());
+                let (claim_asn_org, claim_ptr) = match transport {
+                    ClientTransport::PeerRelay {
+                        peer_network_asn_org,
+                        peer_network_ptr,
+                        ..
+                    } => (
+                        peer_network_asn_org.clone(),
+                        peer_network_ptr.clone(),
+                    ),
+                    _ => (None, None),
+                };
                 AndroidPathStat {
                     path_index,
                     kind: client_transport_kind(transport).to_owned(),
@@ -1518,6 +1566,8 @@ fn publish_path_stats(
                     last_rtt_ms: prior.map(|stat| stat.last_rtt_ms).unwrap_or(0),
                     server_seen_address: prior
                         .and_then(|stat| stat.server_seen_address.clone()),
+                    network_asn_org: prior_network_asn_org.or(claim_asn_org),
+                    network_ptr_hostname: prior_network_ptr.or(claim_ptr),
                     peer_id: match transport {
                         ClientTransport::PeerRelay { peer_id, .. } => {
                             Some(peer_id.clone())
@@ -3225,9 +3275,23 @@ fn start_android_session(
                                         // they see for this path's
                                         // connection: record it as the
                                         // path's public egress address.
-                                        if let Some(observed) =
-                                            decode_observed_address(&frame.payload)
-                                        {
+                                        // The extended format (4.107)
+                                        // also carries the network name
+                                        // for that address (ASN org +
+                                        // PTR hostname); the extended
+                                        // decoder accepts plain
+                                        // address-only payloads too, so
+                                        // old servers behave exactly as
+                                        // before. A name the pong
+                                        // carries overwrites the
+                                        // introduction-seeded one on a
+                                        // peer leg (the pong is the live
+                                        // per-leg value); a pong that
+                                        // carries no name leaves the
+                                        // seeded one alone.
+                                        let (observed, asn_org, ptr_hostname) =
+                                            decode_observed_network(&frame.payload);
+                                        if let Some(observed) = observed {
                                             let observed = observed.to_string();
                                             update_snapshot(
                                                 &worker_snapshot,
@@ -3241,6 +3305,23 @@ fn start_android_session(
                                                         {
                                                             stat.server_seen_address =
                                                                 Some(observed);
+                                                        }
+                                                        if let Some(asn_org) = &asn_org {
+                                                            if stat.network_asn_org.as_deref()
+                                                                != Some(asn_org.as_str())
+                                                            {
+                                                                stat.network_asn_org =
+                                                                    Some(asn_org.clone());
+                                                            }
+                                                        }
+                                                        if let Some(ptr_hostname) = &ptr_hostname
+                                                        {
+                                                            if stat.network_ptr_hostname.as_deref()
+                                                                != Some(ptr_hostname.as_str())
+                                                            {
+                                                                stat.network_ptr_hostname =
+                                                                    Some(ptr_hostname.clone());
+                                                            }
                                                         }
                                                     }
                                                 },
@@ -3544,7 +3625,15 @@ fn start_android_session(
                             header: bonded_core::session::SessionHeader {
                                 connection_id: 0,
                                 sequence: ping_sequence,
-                                flags: FLAG_PING | FLAG_MULTIPATH_RECV,
+                                // FLAG_NETWORK_NAME (4.107): ask the
+                                // server for the extended PONG
+                                // carrying this path's network name
+                                // (ASN org + PTR) alongside the
+                                // observed address. Old servers ignore
+                                // the unknown bit and answer plain.
+                                flags: FLAG_PING
+                                    | FLAG_MULTIPATH_RECV
+                                    | FLAG_NETWORK_NAME,
                             },
                             payload: Bytes::new(),
                         };
@@ -4610,6 +4699,8 @@ mod tests {
                     quic_sent_packets: Some(100),
                     last_rtt_ms: 12,
                     server_seen_address: None,
+                    network_asn_org: None,
+                    network_ptr_hostname: None,
                     peer_id: None,
                 },
                 AndroidPathStat {
@@ -4627,6 +4718,8 @@ mod tests {
                     quic_sent_packets: None,
                     last_rtt_ms: 0,
                     server_seen_address: None,
+                    network_asn_org: None,
+                    network_ptr_hostname: None,
                     peer_id: None,
                 },
             ],
@@ -4676,6 +4769,98 @@ mod tests {
         assert!(
             json.contains("\"quicSentPackets\":null"),
             "unmeasured QUIC sent packets should be null: {json}"
+        );
+    }
+
+    #[test]
+    fn snapshot_json_carries_network_names_and_null_when_unknown() {
+        use super::AndroidPathStat;
+        use super::AndroidSessionSnapshot;
+        use super::PeerShareRelayStats;
+        use super::SessionWakeupStats;
+        use std::sync::Arc;
+
+        // 4.107: a path with a pong-derived network name serializes
+        // both name fields; a path with no name yet serializes
+        // explicit nulls, never an invented name.
+        let snapshot = AndroidSessionSnapshot {
+            state: "connected".to_owned(),
+            server_address: "example.test:443".to_owned(),
+            active_transport: "QUIC".to_owned(),
+            transport_count: 2,
+            peer_relay_count: 0,
+            accepted_peer_relay_count: 0,
+            outbound_packets: 10,
+            inbound_packets: 9,
+            outbound_bytes: 100,
+            inbound_bytes: 90,
+            relay_stats: Arc::new(PeerShareRelayStats::default()),
+            wakeup_stats: Arc::new(SessionWakeupStats::default()),
+            connected_at_ms: 1_700_000_000_000,
+            last_error: None,
+            peer_share_error: None,
+            path_stats: vec![
+                AndroidPathStat {
+                    path_index: Some(0),
+                    kind: "QUIC".to_owned(),
+                    active: true,
+                    paused: false,
+                    outbound_bytes: 100,
+                    inbound_bytes: 90,
+                    wire_tx_bytes: None,
+                    wire_rx_bytes: None,
+                    quic_ping_frames: None,
+                    quic_lost_packets: None,
+                    quic_lost_bytes: None,
+                    quic_sent_packets: None,
+                    last_rtt_ms: 12,
+                    server_seen_address: Some("75.164.76.151:54321".to_owned()),
+                    network_asn_org: Some("GOOGLE - Google LLC".to_owned()),
+                    network_ptr_hostname: Some("c-75-164-76-151.hsd1.example.net".to_owned()),
+                    peer_id: None,
+                },
+                AndroidPathStat {
+                    path_index: Some(1),
+                    kind: "WebSocketTls".to_owned(),
+                    active: false,
+                    paused: false,
+                    outbound_bytes: 0,
+                    inbound_bytes: 0,
+                    wire_tx_bytes: None,
+                    wire_rx_bytes: None,
+                    quic_ping_frames: None,
+                    quic_lost_packets: None,
+                    quic_lost_bytes: None,
+                    quic_sent_packets: None,
+                    last_rtt_ms: 0,
+                    server_seen_address: None,
+                    network_asn_org: None,
+                    network_ptr_hostname: None,
+                    peer_id: None,
+                },
+            ],
+            interception: None,
+        };
+        let json = super::snapshot_json(&snapshot);
+        assert!(
+            json.contains("\"networkAsnOrg\":\"GOOGLE - Google LLC\""),
+            "path should carry its ASN org name: {json}"
+        );
+        assert!(
+            json.contains("\"networkPtr\":\"c-75-164-76-151.hsd1.example.net\""),
+            "path should carry its PTR hostname: {json}"
+        );
+        assert!(
+            json.contains("\"networkAsnOrg\":null"),
+            "unnamed path should carry an explicit null ASN org: {json}"
+        );
+        assert!(
+            json.contains("\"networkPtr\":null"),
+            "unnamed path should carry an explicit null PTR: {json}"
+        );
+        assert!(
+            json.contains("\"serverSeenAddress\":\"75.164.76.151:54321\""),
+            "path should still carry its server-seen address: {json}"
         );
     }
 
@@ -4741,6 +4926,8 @@ mod tests {
                     quic_sent_packets: Some(100),
                     last_rtt_ms: 12,
                     server_seen_address: None,
+                    network_asn_org: None,
+                    network_ptr_hostname: None,
                     peer_id: None,
                 },
                 AndroidPathStat {
@@ -4758,6 +4945,8 @@ mod tests {
                     quic_sent_packets: None,
                     last_rtt_ms: 0,
                     server_seen_address: None,
+                    network_asn_org: None,
+                    network_ptr_hostname: None,
                     peer_id: None,
                 },
             ],

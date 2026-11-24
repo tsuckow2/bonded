@@ -139,4 +139,72 @@ void main() {
     });
     expect(legacy.relayedPeers, isEmpty);
   });
+
+  test('PathStat reads network names and orders the display lines', () {
+    PathStat pathWith(Map<String, dynamic> pathMap) {
+      return SessionStatus.fromMap(<String, dynamic>{
+        'state': 'connected',
+        'paths': <Map<String, dynamic>>[pathMap],
+      }).paths[0];
+    }
+
+    // ASN org first, PTR second when it differs.
+    final named = pathWith(<String, dynamic>{
+      'pathIndex': 0,
+      'kind': 'QUIC',
+      'active': true,
+      'serverSeenAddress': '75.164.76.151:54321',
+      'networkAsnOrg': 'GOOGLE - Google LLC',
+      'networkPtr': 'c-75-164-76-151.hsd1.example.net',
+    });
+    expect(named.networkAsnOrg, 'GOOGLE - Google LLC');
+    expect(named.networkPtr, 'c-75-164-76-151.hsd1.example.net');
+    expect(named.networkNameLines, [
+      'GOOGLE - Google LLC',
+      'c-75-164-76-151.hsd1.example.net',
+    ]);
+
+    // A PTR identical to the ASN org shows once, not twice.
+    final sameName = pathWith(<String, dynamic>{
+      'pathIndex': 0,
+      'kind': 'QUIC',
+      'active': true,
+      'networkAsnOrg': 'EXAMPLE',
+      'networkPtr': 'EXAMPLE',
+    });
+    expect(sameName.networkNameLines, ['EXAMPLE']);
+
+    // A PTR with no ASN org still shows as the network name.
+    final ptrOnly = pathWith(<String, dynamic>{
+      'pathIndex': 0,
+      'kind': 'QUIC',
+      'active': true,
+      'serverSeenAddress': '75.164.76.151:54321',
+      'networkPtr': 'c-75-164-76-151.hsd1.example.net',
+    });
+    expect(ptrOnly.networkNameLines, ['c-75-164-76-151.hsd1.example.net']);
+
+    // Neither name: fall back to the public IP, as before.
+    final unnamed = pathWith(<String, dynamic>{
+      'pathIndex': 0,
+      'kind': 'QUIC',
+      'active': true,
+      'serverSeenAddress': '75.164.76.151:54321',
+    });
+    expect(unnamed.networkAsnOrg, isNull);
+    expect(unnamed.networkPtr, isNull);
+    expect(unnamed.networkNameLines, ['Public IP 75.164.76.151']);
+
+    // Nothing known at all: no lines, and blank strings parse as null.
+    final blank = pathWith(<String, dynamic>{
+      'pathIndex': 0,
+      'kind': 'QUIC',
+      'active': true,
+      'networkAsnOrg': '  ',
+      'networkPtr': '',
+    });
+    expect(blank.networkAsnOrg, isNull);
+    expect(blank.networkPtr, isNull);
+    expect(blank.networkNameLines, isEmpty);
+  });
 }

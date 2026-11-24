@@ -69,6 +69,17 @@ pub enum ClientTransport {
     PeerRelay {
         transport: Box<QuicTransport>,
         peer_id: String,
+        /// Network name of the provider's egress (4.107), from the
+        /// server-signed introduction claims
+        /// (`provider_network_asn_org` / `provider_network_ptr`):
+        /// the ASN org name and PTR hostname the server resolved
+        /// for the provider's live session source IP. `None` when
+        /// the server holds no name — the UI falls back to the
+        /// public IP. The heartbeat PONG later refreshes/confirms
+        /// these per leg (see bonded-ffi); the pong wins on any
+        /// disagreement, since it is the live per-leg value.
+        peer_network_asn_org: Option<String>,
+        peer_network_ptr: Option<String>,
         close_notifier: Option<tokio::sync::mpsc::UnboundedSender<String>>,
         expires_at: u64,
     },
@@ -79,12 +90,16 @@ impl ClientTransport {
     pub fn peer_relay(
         transport: QuicTransport,
         peer_id: String,
+        peer_network_asn_org: Option<String>,
+        peer_network_ptr: Option<String>,
         close_notifier: tokio::sync::mpsc::UnboundedSender<String>,
         expires_at: u64,
     ) -> Self {
         Self::PeerRelay {
             transport: Box::new(transport),
             peer_id,
+            peer_network_asn_org,
+            peer_network_ptr,
             close_notifier: Some(close_notifier),
             expires_at,
         }

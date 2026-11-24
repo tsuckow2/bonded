@@ -42,6 +42,17 @@ class PathStat {
   /// (older servers never report one).
   final String? serverSeenAddress;
 
+  /// ASN org name the server resolved for this path's public egress
+  /// address (4.107), e.g. "GOOGLE - Google LLC"; null when the
+  /// server holds no ASN name for the address, or until the first
+  /// extended pong arrives (peer-relay legs are seeded from the
+  /// introduction's provider name instead).
+  final String? networkAsnOrg;
+
+  /// PTR hostname the server resolved for this path's public egress
+  /// address (4.107); null when there is none.
+  final String? networkPtr;
+
   /// Provider device key for peer-relay transports; null for direct
   /// transports. Several legs share one peer id when the provider has
   /// several paths.
@@ -58,6 +69,8 @@ class PathStat {
     this.wireRxBytes,
     required this.lastRttMs,
     required this.serverSeenAddress,
+    this.networkAsnOrg,
+    this.networkPtr,
     this.peerId,
     this.quicPingFrames,
     this.quicLostPackets,
@@ -83,6 +96,13 @@ class PathStat {
       serverSeenAddress:
           (map['serverSeenAddress'] as String?)?.trim().isNotEmpty == true
           ? map['serverSeenAddress'] as String
+          : null,
+      networkAsnOrg:
+          (map['networkAsnOrg'] as String?)?.trim().isNotEmpty == true
+          ? map['networkAsnOrg'] as String
+          : null,
+      networkPtr: (map['networkPtr'] as String?)?.trim().isNotEmpty == true
+          ? map['networkPtr'] as String
           : null,
       peerId: (map['peerId'] as String?)?.trim().isNotEmpty == true
           ? map['peerId'] as String
@@ -132,6 +152,24 @@ class PathStat {
     }
     final split = address.lastIndexOf(':');
     return split > 0 ? address.substring(0, split) : address;
+  }
+
+  /// Detail lines naming this path's egress network (4.107), in
+  /// display order: the ASN org name first, the PTR hostname second
+  /// when it differs from the ASN org (both are surfaced, never
+  /// collapsed into one field), else the public IP when neither name
+  /// resolved. Empty when nothing is known yet.
+  List<String> get networkNameLines {
+    final asnOrg = networkAsnOrg;
+    final ptr = networkPtr;
+    if (asnOrg != null) {
+      if (ptr != null && ptr != asnOrg) return [asnOrg, ptr];
+      return [asnOrg];
+    }
+    if (ptr != null) return [ptr];
+    final ip = publicIp;
+    if (ip != null) return ['Public IP $ip'];
+    return const [];
   }
 }
 

@@ -562,10 +562,15 @@ impl ConnectedPeers {
 /// the browse loop so all leg bookkeeping (tracker, renewal, close
 /// re-drive) stays in one place. The peer id is the provider's
 /// device key + instance nonce from the reversed introduction, i.e.
-/// the same key the browse loop tracks forward legs under.
+/// the same key the browse loop tracks forward legs under. The
+/// provider's network name (4.107) rides along from the same
+/// introduction, so the browse loop can book the session transport
+/// with the name the UI shows instead of only the public IP.
 struct ReversedLeg {
     transport: QuicTransport,
     peer_id: String,
+    peer_network_asn_org: Option<String>,
+    peer_network_ptr: Option<String>,
     expires_at: u64,
 }
 
@@ -1175,6 +1180,15 @@ async fn run_peer_accept_loop(
                 .send(ReversedLeg {
                     transport: peer,
                     peer_id,
+                    // The peer is the provider device here, so its
+                    // network name is the introduction's provider
+                    // name (4.107); `None` when the server holds
+                    // none, and the UI falls back to the public IP.
+                    peer_network_asn_org: introduction
+                        .introduction
+                        .provider_network_asn_org
+                        .clone(),
+                    peer_network_ptr: introduction.introduction.provider_network_ptr.clone(),
                     expires_at,
                 })
                 .is_err()
@@ -1862,6 +1876,8 @@ pub async fn start_peer_share_runtime(
                             .send(ClientTransport::peer_relay(
                                 leg.transport,
                                 peer_id.clone(),
+                                leg.peer_network_asn_org.clone(),
+                                leg.peer_network_ptr.clone(),
                                 closed_peer_tx.clone(),
                                 leg.expires_at,
                             ))
@@ -2110,6 +2126,20 @@ pub async fn start_peer_share_runtime(
                             .send(ClientTransport::peer_relay(
                                 transport,
                                 peer_id.clone(),
+                                // The peer is the provider device, so
+                                // its network name is the
+                                // introduction's provider name
+                                // (4.107); `None` falls back to the
+                                // public IP in the UI until the first
+                                // heartbeat PONG refreshes it.
+                                introduction
+                                    .introduction
+                                    .provider_network_asn_org
+                                    .clone(),
+                                introduction
+                                    .introduction
+                                    .provider_network_ptr
+                                    .clone(),
                                 closed_peer_tx.clone(),
                                 relay_expires_at,
                             ))

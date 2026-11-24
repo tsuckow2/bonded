@@ -131,6 +131,79 @@ class SessionSnapshotTest {
     }
 
     @Test
+    fun parseSessionPaths_readsNetworkNames() {
+        val paths =
+                parseSessionPaths(
+                        JSONArray(
+                                """[
+                                    {"pathIndex": 0, "kind": "QUIC", "active": true,
+                                     "outboundBytes": 100, "inboundBytes": 90,
+                                     "lastRttMs": 12,
+                                     "serverSeenAddress": "75.164.76.151:54321",
+                                     "networkAsnOrg": "GOOGLE - Google LLC",
+                                     "networkPtr": "c-75-164-76-151.hsd1.example.net"},
+                                    {"pathIndex": 1, "kind": "WebSocketTls", "active": false,
+                                     "outboundBytes": 0, "inboundBytes": 0,
+                                     "lastRttMs": 0,
+                                     "networkAsnOrg": null, "networkPtr": null}
+                                ]"""
+                        )
+                )
+        assertEquals(2, paths.size)
+        assertEquals("GOOGLE - Google LLC", paths[0].networkAsnOrg)
+        assertEquals("c-75-164-76-151.hsd1.example.net", paths[0].networkPtr)
+        assertNull(paths[1].networkAsnOrg)
+        assertNull(paths[1].networkPtr)
+    }
+
+    @Test
+    fun parseSessionPaths_networkNames_missingKeys_readNull() {
+        val paths = parseSessionPaths(JSONArray("""[{"kind": "QUIC"}]"""))
+        assertEquals(1, paths.size)
+        assertNull(paths[0].networkAsnOrg)
+        assertNull(paths[0].networkPtr)
+    }
+
+    @Test
+    fun sessionPathStatToMap_forwardsNetworkNames() {
+        val map =
+                sessionPathStatToMap(
+                        SessionPathStat(
+                                pathIndex = 0,
+                                kind = "QUIC",
+                                active = true,
+                                outboundBytes = 100,
+                                inboundBytes = 90,
+                                lastRttMs = 12,
+                                serverSeenAddress = "75.164.76.151:54321",
+                                networkAsnOrg = "GOOGLE - Google LLC",
+                                networkPtr = "c-75-164-76-151.hsd1.example.net",
+                        )
+                )
+        assertEquals("GOOGLE - Google LLC", map["networkAsnOrg"])
+        assertEquals("c-75-164-76-151.hsd1.example.net", map["networkPtr"])
+        assertEquals("75.164.76.151:54321", map["serverSeenAddress"])
+    }
+
+    @Test
+    fun sessionPathStatToMap_nullNetworkNames_forwardNull() {
+        val map =
+                sessionPathStatToMap(
+                        SessionPathStat(
+                                pathIndex = null,
+                                kind = "WebSocketTls",
+                                active = false,
+                                outboundBytes = 0,
+                                inboundBytes = 0,
+                                lastRttMs = 0,
+                                serverSeenAddress = null,
+                        )
+                )
+        assertNull(map["networkAsnOrg"])
+        assertNull(map["networkPtr"])
+    }
+
+    @Test
     fun parseRelayedPeers_readsEntries() {
         val peers =
                 parseRelayedPeers(
