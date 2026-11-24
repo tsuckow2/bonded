@@ -159,7 +159,7 @@ void main() {
     });
     expect(named.networkAsnOrg, 'GOOGLE - Google LLC');
     expect(named.networkPtr, 'c-75-164-76-151.hsd1.example.net');
-    expect(named.networkNameLines, [
+    expect(named.networkNameLines(showPtr: true), [
       'GOOGLE - Google LLC',
       'c-75-164-76-151.hsd1.example.net',
     ]);
@@ -172,7 +172,7 @@ void main() {
       'networkAsnOrg': 'EXAMPLE',
       'networkPtr': 'EXAMPLE',
     });
-    expect(sameName.networkNameLines, ['EXAMPLE']);
+    expect(sameName.networkNameLines(showPtr: true), ['EXAMPLE']);
 
     // A PTR with no ASN org still shows as the network name.
     final ptrOnly = pathWith(<String, dynamic>{
@@ -182,7 +182,7 @@ void main() {
       'serverSeenAddress': '75.164.76.151:54321',
       'networkPtr': 'c-75-164-76-151.hsd1.example.net',
     });
-    expect(ptrOnly.networkNameLines, ['c-75-164-76-151.hsd1.example.net']);
+    expect(ptrOnly.networkNameLines(showPtr: true), ['c-75-164-76-151.hsd1.example.net']);
 
     // Neither name: fall back to the public IP, as before.
     final unnamed = pathWith(<String, dynamic>{
@@ -193,7 +193,7 @@ void main() {
     });
     expect(unnamed.networkAsnOrg, isNull);
     expect(unnamed.networkPtr, isNull);
-    expect(unnamed.networkNameLines, ['Public IP 75.164.76.151']);
+    expect(unnamed.networkNameLines(), ['Public IP 75.164.76.151']);
 
     // Nothing known at all: no lines, and blank strings parse as null.
     final blank = pathWith(<String, dynamic>{
@@ -205,6 +205,17 @@ void main() {
     });
     expect(blank.networkAsnOrg, isNull);
     expect(blank.networkPtr, isNull);
-    expect(blank.networkNameLines, isEmpty);
+    expect(blank.networkNameLines(), isEmpty);
+
+    // 4.107 item 2: the PTR line is hidden by default (showPtr
+    // defaults to false) and shown only when the setting is on.
+    // The ASN org still shows either way; a PTR-only leg falls
+    // back to the public IP when the PTR is hidden.
+    expect(named.networkNameLines(), ['GOOGLE - Google LLC']);
+    expect(named.networkNameLines(showPtr: false), ['GOOGLE - Google LLC']);
+    expect(ptrOnly.networkNameLines(), ['Public IP 75.164.76.151']);
+    expect(ptrOnly.networkNameLines(showPtr: false), [
+      'Public IP 75.164.76.151',
+    ]);
   });
 }

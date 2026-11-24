@@ -1494,6 +1494,42 @@ fn reevaluate_auto_paused(
     }
 }
 
+/// Pick the network-name pair for a republished path (4.109):
+/// the prior pair and the introduction claim are each a pair
+/// resolved for one IP, so they are taken as a unit — never mix
+/// the prior's ASN with the claim's PTR (or vice versa), which
+/// would show two names for different addresses on one row.
+fn pick_network_names(
+    prior_asn_org: Option<String>,
+    prior_ptr: Option<String>,
+    claim_asn_org: Option<String>,
+    claim_ptr: Option<String>,
+) -> (Option<String>, Option<String>) {
+    if prior_asn_org.is_some() || prior_ptr.is_some() {
+        (prior_asn_org, prior_ptr)
+    } else {
+        (claim_asn_org, claim_ptr)
+    }
+}
+
+/// Whether a named pong's observed IP differs from the IP the
+/// stored network names were resolved for (4.109): the stored
+/// names belong to the stored observed address, so when the
+/// pong's observed IP differs, the stored pair is stale and must
+/// be cleared before the pong's names are applied. No stored
+/// address (first pong) or an unparseable one counts as changed.
+/// A plain pong (no names) never reaches this — it leaves the
+/// seeded names alone.
+fn observed_ip_changed(
+    stored_seen_address: Option<&str>,
+    observed_ip: std::net::IpAddr,
+) -> bool {
+    stored_seen_address
+        .and_then(|s| s.parse::<std::net::SocketAddr>().ok())
+        .map(|old| old.ip() != observed_ip)
+        .unwrap_or(true)
+}
+
 /// Refresh the snapshot's per-path structure (which transports exist,
 /// their path indexes and kinds, which is active) after a transport-set
 /// change. Counters survive the refresh: direct paths are matched by
@@ -1543,6 +1579,19 @@ fn publish_path_stats(
                     ),
                     _ => (None, None),
                 };
+                // Network names (4.109): the pair is taken as a
+                // unit — a prior pair (both fields from the same
+                // pong or the same introduction) is never filled
+                // out with the other half from the introduction,
+                // which was resolved for the mint IP and may
+                // describe a different address than the live leg.
+                let (network_asn_org, network_ptr_hostname) =
+                    pick_network_names(
+                        prior_network_asn_org,
+                        prior_network_ptr,
+                        claim_asn_org,
+                        claim_ptr,
+                    );
                 AndroidPathStat {
                     path_index,
                     kind: client_transport_kind(transport).to_owned(),
@@ -1566,8 +1615,8 @@ fn publish_path_stats(
                     last_rtt_ms: prior.map(|stat| stat.last_rtt_ms).unwrap_or(0),
                     server_seen_address: prior
                         .and_then(|stat| stat.server_seen_address.clone()),
-                    network_asn_org: prior_network_asn_org.or(claim_asn_org),
-                    network_ptr_hostname: prior_network_ptr.or(claim_ptr),
+                    network_asn_org,
+                    network_ptr_hostname,
                     peer_id: match transport {
                         ClientTransport::PeerRelay { peer_id, .. } => {
                             Some(peer_id.clone())
@@ -3292,6 +3341,7 @@ fn start_android_session(
                                         let (observed, asn_org, ptr_hostname) =
                                             decode_observed_network(&frame.payload);
                                         if let Some(observed) = observed {
+                                            let observed_ip = observed.ip();
                                             let observed = observed.to_string();
                                             update_snapshot(
                                                 &worker_snapshot,
@@ -3300,6 +3350,38 @@ fn start_android_session(
                                                         .path_stats
                                                         .get_mut(index)
                                                     {
+                                                        // Network names (4.109): the ASN
+                                                        // org and PTR hostname on a row
+                                                        // must describe the SAME IP. A
+                                                        // named pong (carrying an ASN
+                                                        // and/or a PTR) is the live pair
+                                                        // for its observed address: when
+                                                        // the observed IP changed since
+                                                        // the names were set, the old
+                                                        // names belong to the old IP, so
+                                                        // clear both before applying the
+                                                        // pong's names. Without the
+                                                        // clear, a pong carrying only an
+                                                        // ASN (PTR cache miss on the new
+                                                        // IP) leaves a stale PTR from the
+                                                        // old IP next to the new ASN —
+                                                        // the mismatch Tom saw. A pong
+                                                        // carrying no name at all (plain
+                                                        // pong, old server) leaves the
+                                                        // seeded names alone.
+                                                        if asn_org.is_some()
+                                                            || ptr_hostname.is_some()
+                                                        {
+                                                            if observed_ip_changed(
+                                                                stat.server_seen_address
+                                                                    .as_deref(),
+                                                                observed_ip,
+                                                            ) {
+                                                                stat.network_asn_org = None;
+                                                                stat.network_ptr_hostname =
+                                                                    None;
+                                                            }
+                                                        }
                                                         if stat.server_seen_address.as_deref()
                                                             != Some(observed.as_str())
                                                         {
@@ -4861,6 +4943,69 @@ mod tests {
         assert!(
             json.contains("\"serverSeenAddress\":\"75.164.76.151:54321\""),
             "path should still carry its server-seen address: {json}"
+        );
+    }
+
+    #[test]
+    fn network_names_are_picked_as_a_pair_not_mixed() {
+        // 4.109: the prior pair and the introduction claim are each
+        // a pair for one IP. A prior ASN-only pair (a pong carried
+        // the ASN for the new IP but no PTR yet) must NOT be filled
+        // out with the claim's PTR, which was resolved for the mint
+        // IP — mixing them shows two names for different addresses
+        // on one row, the mismatch Tom saw.
+        use super::pick_network_names;
+        let (asn, ptr) = pick_network_names(
+            Some("AT&T Enterprises, LLC".to_owned()),
+            None,
+            Some("AT&T Enterprises, LLC".to_owned()),
+            Some("old-ptr.example.net".to_owned()),
+        );
+        assert_eq!(asn.as_deref(), Some("AT&T Enterprises, LLC"));
+        assert_eq!(ptr, None, "claim PTR must not fill a prior ASN-only pair");
+        // No prior at all: the claim pair seeds the row.
+        let (asn, ptr) = pick_network_names(
+            None,
+            None,
+            Some("Google LLC".to_owned()),
+            Some("c-1-2-3-4.example.net".to_owned()),
+        );
+        assert_eq!(asn.as_deref(), Some("Google LLC"));
+        assert_eq!(ptr.as_deref(), Some("c-1-2-3-4.example.net"));
+        // A prior PTR-only pair likewise keeps its own (absent) ASN.
+        let (asn, ptr) = pick_network_names(
+            None,
+            Some("c-1-2-3-4.example.net".to_owned()),
+            Some("Google LLC".to_owned()),
+            Some("other.example.net".to_owned()),
+        );
+        assert_eq!(asn, None, "claim ASN must not fill a prior PTR-only pair");
+        assert_eq!(ptr.as_deref(), Some("c-1-2-3-4.example.net"));
+    }
+
+    #[test]
+    fn observed_ip_change_marks_stored_names_stale() {
+        // 4.109: the stored names belong to the stored observed
+        // address. A new observed IP means they are stale; the same
+        // IP (even a new source port after a re-dial) means they
+        // still describe this leg.
+        use super::observed_ip_changed;
+        let new_ip: std::net::IpAddr = "107.77.214.66".parse().unwrap();
+        assert!(
+            observed_ip_changed(Some("172.56.200.102:34958"), new_ip),
+            "different IP must mark the stored names stale"
+        );
+        assert!(
+            !observed_ip_changed(Some("107.77.214.66:27525"), new_ip),
+            "same IP must keep the stored names (port change is a re-dial)"
+        );
+        assert!(
+            observed_ip_changed(None, new_ip),
+            "no stored address (first pong) counts as changed"
+        );
+        assert!(
+            observed_ip_changed(Some("not-an-address"), new_ip),
+            "an unparseable stored address counts as changed"
         );
     }
 

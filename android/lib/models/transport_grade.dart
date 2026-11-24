@@ -354,6 +354,10 @@ class TransportGradeTracker {
     final dtMs = prevAt == null
         ? 0
         : now.difference(prevAt).inMilliseconds;
+    // Keys are computed once per sample so a peer's legs share one
+    // numbering with the display (4.108): the ordinal is part of the
+    // key, so two legs to the same peer accumulate separately.
+    final keys = gradeKeysForPaths(status.paths);
     if (prevAt == null || dtMs <= 0 || dtMs > maxIntervalMs) {
       // First sample, clock oddity, or a gap the stream did not
       // observe (backgrounded): re-baseline every path present,
@@ -364,19 +368,20 @@ class TransportGradeTracker {
       for (final state in _paths.values) {
         state.hasBaseline = false;
       }
-      for (final path in status.paths) {
+      for (var i = 0; i < status.paths.length; i++) {
         final state = _paths.putIfAbsent(
-          path.gradeKey,
+          keys[i],
           () => _PathGradeState(),
         );
-        _rebaseline(state, path);
+        _rebaseline(state, status.paths[i]);
       }
       return;
     }
 
-    for (final path in status.paths) {
+    for (var i = 0; i < status.paths.length; i++) {
+      final path = status.paths[i];
       final state = _paths.putIfAbsent(
-        path.gradeKey,
+        keys[i],
         () => _PathGradeState(),
       );
       if (!state.hasBaseline) {

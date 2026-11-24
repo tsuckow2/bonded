@@ -728,6 +728,10 @@ class MainActivity : FlutterActivity() {
                                                     AppSettingsStore.batterySaver(
                                                             this@MainActivity
                                                     ),
+                                            "showPtrHostname" to
+                                                    AppSettingsStore.showPtrHostname(
+                                                            this@MainActivity
+                                                    ),
                                             "excludedAppPackages" to
                                                     AppSettingsStore.excludedAppPackages(
                                                             this@MainActivity
@@ -759,6 +763,9 @@ class MainActivity : FlutterActivity() {
                             }
                             (args?.get("batterySaver") as? Boolean)?.let {
                                 AppSettingsStore.setBatterySaver(this@MainActivity, it)
+                            }
+                            (args?.get("showPtrHostname") as? Boolean)?.let {
+                                AppSettingsStore.setShowPtrHostname(this@MainActivity, it)
                             }
                             (args?.get("excludedAppPackages") as? List<*>)?.let { raw ->
                                 AppSettingsStore.setExcludedAppPackages(

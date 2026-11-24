@@ -19,6 +19,7 @@ object AppSettingsStore {
     private const val KEY_EXCLUDED_APP_PACKAGES = "excluded_app_packages"
     private const val KEY_BATTERY_SAVER = "battery_saver"
     private const val KEY_TRAFFIC_RULES_JSON = "traffic_rules_json"
+    private const val KEY_SHOW_PTR_HOSTNAME = "show_ptr_hostname"
 
     private fun prefs(context: Context) =
             context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -93,6 +94,19 @@ object AppSettingsStore {
 
     fun setTrafficRulesJson(context: Context, value: String) {
         prefs(context).edit().putString(KEY_TRAFFIC_RULES_JSON, value).apply()
+    }
+
+    /**
+     * Show the PTR hostname as a second network-name line on Paths
+     * rows (4.107 item 2). Default OFF: the PTR is usually an ugly
+     * raw hostname, and the ASN org name already identifies the
+     * network. Display-only — the server keeps sending the PTR.
+     */
+    fun showPtrHostname(context: Context): Boolean =
+            prefs(context).getBoolean(KEY_SHOW_PTR_HOSTNAME, false)
+
+    fun setShowPtrHostname(context: Context, value: Boolean) {
+        prefs(context).edit().putBoolean(KEY_SHOW_PTR_HOSTNAME, value).apply()
     }
 
     /** The record the main screen's dropdown has selected, falling back to

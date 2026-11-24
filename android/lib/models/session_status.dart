@@ -132,9 +132,14 @@ class PathStat {
 
   /// Stable key for one transport across snapshots, shared with
   /// the per-transport grader: direct paths by supervisor index,
-  /// peer-relay legs by peer id + kind.
-  String get gradeKey =>
-      isDirect ? 'd$pathIndex' : 'r${peerId ?? '?'}:$kind';
+  /// peer-relay legs by peer id + kind + leg number within the
+  /// peer. The leg number matters (4.108): a peer with several legs
+  /// would otherwise share one key and one grade state, so legs
+  /// with different latencies would show identical scores. [peerLeg]
+  /// is the 1-based leg number the Peer connections card shows
+  /// (leg 1, leg 2, ...); it defaults to 1 for a single leg.
+  String gradeKey({int peerLeg = 1}) =>
+      isDirect ? 'd$pathIndex' : 'r${peerId ?? '?'}:$kind:$peerLeg';
 
   /// True for peer-relay transports. Relays are full transports for
   /// spreading and failover; they are only listed separately in the
@@ -156,12 +161,13 @@ class PathStat {
 
   /// Detail lines naming this path's egress network (4.107), in
   /// display order: the ASN org name first, the PTR hostname second
-  /// when it differs from the ASN org (both are surfaced, never
-  /// collapsed into one field), else the public IP when neither name
-  /// resolved. Empty when nothing is known yet.
-  List<String> get networkNameLines {
+  /// when it differs from the ASN org and [showPtr] is true (the
+  /// PTR is hidden by default — see the showPtrHostname setting),
+  /// else the public IP when neither name resolved. Empty when
+  /// nothing is known yet.
+  List<String> networkNameLines({bool showPtr = false}) {
     final asnOrg = networkAsnOrg;
-    final ptr = networkPtr;
+    final ptr = showPtr ? networkPtr : null;
     if (asnOrg != null) {
       if (ptr != null && ptr != asnOrg) return [asnOrg, ptr];
       return [asnOrg];
@@ -171,6 +177,22 @@ class PathStat {
     if (ip != null) return ['Public IP $ip'];
     return const [];
   }
+}
+
+/// Grade keys for a snapshot's paths, in order: the same key the
+/// tracker records under and the display looks up, so a leg's grade
+/// state follows it across ticks. Peer legs are numbered per peer in
+/// snapshot order, matching the leg numbers the Peer connections
+/// card shows (leg 1, leg 2, ...); direct paths use their supervisor
+/// index and are unaffected by position.
+List<String> gradeKeysForPaths(List<PathStat> paths) {
+  final legNumber = <String, int>{};
+  return paths.map((path) {
+    if (path.isDirect) return path.gradeKey();
+    final peer = path.peerId ?? '';
+    final leg = legNumber[peer] = (legNumber[peer] ?? 0) + 1;
+    return path.gradeKey(peerLeg: leg);
+  }).toList();
 }
 
 /// A server-identity verification failure (possible interception),

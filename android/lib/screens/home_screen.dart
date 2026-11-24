@@ -197,10 +197,13 @@ class _HomeScreenState extends State<HomeScreen> {
     // failed push leaves the previous grades in place and best
     // transport ranks on RTT/loss until the next tick. The list is in
     // snapshot paths order, so the Rust side indexes it by transport.
+    // Keys come from gradeKeysForPaths so peer legs are looked up
+    // under the same ordinal-aware key the tracker records under.
+    final gradeKeys = gradeKeysForPaths(status.paths);
     unawaited(
       PathGradesService.pushLive(
-        status.paths
-            .map((path) => _transportGradeTracker.gradeFor(path.gradeKey)?.total)
+        gradeKeys
+            .map((key) => _transportGradeTracker.gradeFor(key)?.total)
             .toList(),
       ),
     );
@@ -786,7 +789,8 @@ class _HomeScreenState extends State<HomeScreen> {
               _PathRow(
                 status: _status,
                 path: path,
-                grade: _transportGradeTracker.gradeFor(path.gradeKey),
+                grade: _transportGradeTracker.gradeFor(path.gradeKey()),
+                showPtrHostname: _settings.showPtrHostname,
               ),
           ],
         ),
@@ -915,13 +919,22 @@ class _HomeScreenState extends State<HomeScreen> {
               style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
             ),
             const SizedBox(height: 8),
-            for (final path in peers)
-              _PeerRow(
+            ...peers.map((path) {
+              // Leg number within this peer, in snapshot order — the
+              // same ordinal the grader keys the leg under (4.108),
+              // so the row shows this leg's own grade, not its
+              // sibling's.
+              final leg = legNumber[path.peerId ?? ''] =
+                  (legNumber[path.peerId ?? ''] ?? 0) + 1;
+              return _PeerRow(
                 path: path,
-                leg: (legNumber[path.peerId ?? ''] =
-                    (legNumber[path.peerId ?? ''] ?? 0) + 1),
-                grade: _transportGradeTracker.gradeFor(path.gradeKey),
-              ),
+                leg: leg,
+                grade: _transportGradeTracker.gradeFor(
+                  path.gradeKey(peerLeg: leg),
+                ),
+                showPtrHostname: _settings.showPtrHostname,
+              );
+            }),
           ],
         ),
       ),
@@ -1043,7 +1056,16 @@ class _PathRow extends StatelessWidget {
   /// This path's grade (4.50), null until it has data. No chip
   /// and no detail tap while null.
   final TransportGrade? grade;
-  const _PathRow({required this.status, required this.path, this.grade});
+
+  /// Whether the PTR hostname shows as a second network-name line
+  /// (4.107 item 2, the showPtrHostname setting, default off).
+  final bool showPtrHostname;
+  const _PathRow({
+    required this.status,
+    required this.path,
+    this.grade,
+    this.showPtrHostname = false,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -1111,7 +1133,7 @@ class _PathRow extends StatelessWidget {
                 // 4.107: the network name for this leg's egress —
                 // ASN org first, PTR second when it differs, else
                 // the public IP when neither resolved.
-                for (final line in path.networkNameLines)
+                for (final line in path.networkNameLines(showPtr: showPtrHostname))
                   Text(
                     line,
                     style: TextStyle(fontSize: 12, color: Colors.grey[700]),
@@ -1274,7 +1296,16 @@ class _PeerRow extends StatelessWidget {
   /// This leg's grade (4.50), null until it has data. No chip
   /// and no detail tap while null.
   final TransportGrade? grade;
-  const _PeerRow({required this.path, required this.leg, this.grade});
+
+  /// Whether the PTR hostname shows as a second network-name line
+  /// (4.107 item 2, the showPtrHostname setting, default off).
+  final bool showPtrHostname;
+  const _PeerRow({
+    required this.path,
+    required this.leg,
+    this.grade,
+    this.showPtrHostname = false,
+  });
 
   static String _shortId(String? peerId) {
     if (peerId == null || peerId.isEmpty) return 'Unknown peer';
@@ -1330,7 +1361,7 @@ class _PeerRow extends StatelessWidget {
                   // 4.107: the network name for this leg's egress —
                   // ASN org first, PTR second when it differs, else
                   // the public IP when neither resolved.
-                  for (final line in path.networkNameLines)
+                  for (final line in path.networkNameLines(showPtr: showPtrHostname))
                     Text(
                       line,
                       style: TextStyle(fontSize: 12, color: Colors.grey[700]),

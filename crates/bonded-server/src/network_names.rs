@@ -28,7 +28,7 @@
 //! - Refresh ([`NetworkNameResolver::refresh`]) downloads to a temp
 //!   file in the same directory, verifies before swapping (it
 //!   parses, has a sane range count, and passes the known-IP sanity
-//!   check 8.8.8.8 → AS15169 / "GOOGLE - Google LLC"), atomically
+//!   check 8.8.8.8 → AS15169 / "Google LLC"), atomically
 //!   renames over the live path, and swaps the in-memory table
 //!   without a restart. On ANY failure the old data is kept.
 
@@ -63,7 +63,9 @@ pub const ASN_MIN_SANE_RANGES: usize = 100_000;
 /// an invented name.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NetworkName {
-    /// ASN org description, e.g. `"GOOGLE - Google LLC"`.
+    /// ASN org name, e.g. `"Google LLC"` — the "<ASN-NAME> - "
+    /// prefix of the feed's AS_description is stripped at parse
+    /// time (see `strip_asn_prefix`).
     pub asn_org: Option<String>,
     /// PTR hostname, e.g. `"dns.google"` (trailing dot stripped).
     pub ptr_hostname: Option<String>,
@@ -187,6 +189,12 @@ impl AsnTables {
             if asn == 0 || org == "Not routed" {
                 continue;
             }
+            // The AS_description is "<ASN-NAME> - <ORG>" (e.g.
+            // "T-MOBILE-AS21928 - T-Mobile USA, Inc."); the display
+            // name is just the org — strip the "<ASN-NAME> - "
+            // prefix at parse time so the raw description exists
+            // nowhere downstream (PONGs, introductions, display).
+            let org = strip_asn_prefix(org);
             if org.is_empty() {
                 continue;
             }
@@ -250,11 +258,23 @@ impl AsnTables {
             }
         }
         match self.lookup(ASN_SANITY_IP) {
-            Some(org) if org.starts_with("GOOGLE") => Ok(()),
+            Some(org) if org == "Google LLC" => Ok(()),
             other => anyhow::bail!(
-                "ASN database sanity check failed: 8.8.8.8 org is {other:?}, expected a GOOGLE org"
+                "ASN database sanity check failed: 8.8.8.8 org is {other:?}, expected the Google LLC org"
             ),
         }
+    }
+}
+
+/// The iptoasn AS_description is "<ASN-NAME> - <ORG>" (e.g.
+/// "T-MOBILE-AS21928 - T-Mobile USA, Inc.", "GOOGLE - Google
+/// LLC"). The display name is just the org: strip everything up
+/// to and including the first " - ". Descriptions with no " - "
+/// separator are returned as-is.
+pub fn strip_asn_prefix(desc: &str) -> &str {
+    match desc.split_once(" - ") {
+        Some((_, org)) => org,
+        None => desc,
     }
 }
 
@@ -703,7 +723,7 @@ mod tests {
         assert_eq!(tables.range_count(), 3);
         assert_eq!(
             tables.lookup("8.8.8.8".parse().unwrap()),
-            Some("GOOGLE - Google LLC")
+            Some("Google LLC")
         );
         assert_eq!(tables.lookup_asn("8.8.8.8".parse().unwrap()), Some(15_169));
         // 1.1.1.1 is NOT in the synthetic table's 1.0.0.0/24 row,
@@ -712,7 +732,7 @@ mod tests {
         assert_eq!(tables.lookup("1.1.1.1".parse().unwrap()), None);
         assert_eq!(
             tables.lookup("1.0.0.1".parse().unwrap()),
-            Some("CLOUDFLARENET - Cloudflare, Inc.")
+            Some("Cloudflare, Inc.")
         );
         // AS-0 "Not routed" rows carry no name.
         assert_eq!(tables.lookup("1.0.1.0".parse().unwrap()), None);
@@ -720,16 +740,16 @@ mod tests {
         // IPv6 range resolves to the same org.
         assert_eq!(
             tables.lookup("2001:4860:4860::8888".parse().unwrap()),
-            Some("GOOGLE - Google LLC")
+            Some("Google LLC")
         );
         // Range boundaries are inclusive; outside is unrouted.
         assert_eq!(
             tables.lookup("8.8.8.0".parse().unwrap()),
-            Some("GOOGLE - Google LLC")
+            Some("Google LLC")
         );
         assert_eq!(
             tables.lookup("8.8.8.255".parse().unwrap()),
-            Some("GOOGLE - Google LLC")
+            Some("Google LLC")
         );
         assert_eq!(tables.lookup("8.8.9.0".parse().unwrap()), None);
         assert_eq!(tables.lookup("9.9.9.9".parse().unwrap()), None);
@@ -750,7 +770,7 @@ mod tests {
         assert_eq!(tables.range_count(), 3);
         assert_eq!(
             tables.lookup("8.8.8.8".parse().unwrap()),
-            Some("GOOGLE - Google LLC")
+            Some("Google LLC")
         );
     }
 
@@ -774,13 +794,37 @@ mod tests {
     }
 
     #[test]
+    fn strip_asn_prefix_keeps_only_the_org() {
+        // The three examples from the live table, plus a
+        // description with no separator (returned as-is).
+        assert_eq!(
+            strip_asn_prefix("T-MOBILE-AS21928 - T-Mobile USA, Inc."),
+            "T-Mobile USA, Inc."
+        );
+        assert_eq!(strip_asn_prefix("GOOGLE - Google LLC"), "Google LLC");
+        assert_eq!(
+            strip_asn_prefix(
+                "CENTURYLINK-US-LEGACY-QWEST - CenturyLink Communications, LLC"
+            ),
+            "CenturyLink Communications, LLC"
+        );
+        assert_eq!(strip_asn_prefix("NoSeparatorHere"), "NoSeparatorHere");
+        // Only the FIRST " - " is stripped; an org containing
+        // " - " keeps the rest.
+        assert_eq!(
+            strip_asn_prefix("FOO - Bar - Baz"),
+            "Bar - Baz"
+        );
+    }
+
+    #[test]
     fn resolver_returns_asn_name_and_no_ptr_without_a_runtime() {
         // In a sync test there is no tokio runtime, so no background
         // PTR spawn happens: resolve is a pure cache/table read and
         // the PTR half stays absent.
         let resolver = NetworkNameResolver::with_tables(synthetic_tables(), true, None);
         let name = resolver.resolve("8.8.8.8".parse().unwrap());
-        assert_eq!(name.asn_org.as_deref(), Some("GOOGLE - Google LLC"));
+        assert_eq!(name.asn_org.as_deref(), Some("Google LLC"));
         assert_eq!(name.ptr_hostname, None);
         let unrouted = resolver.resolve("1.0.1.0".parse().unwrap());
         assert_eq!(unrouted.asn_org, None);
@@ -793,7 +837,7 @@ mod tests {
         let ip: IpAddr = "8.8.8.8".parse().unwrap();
         resolver.cache_ptr(ip, Some("dns.google".to_owned()));
         let name = resolver.resolve(ip);
-        assert_eq!(name.asn_org.as_deref(), Some("GOOGLE - Google LLC"));
+        assert_eq!(name.asn_org.as_deref(), Some("Google LLC"));
         assert_eq!(name.ptr_hostname.as_deref(), Some("dns.google"));
         // A cached miss (PTR looked up, nothing there) is also
         // returned, not re-looked-up.
@@ -834,18 +878,18 @@ mod tests {
         assert_eq!(resolver.range_count(), 100_006);
         assert_eq!(
             resolver.asn_org("10.0.5.5".parse().unwrap()).as_deref(),
-            Some("TEST-ORG - Test Org")
+            Some("Test Org")
         );
         assert_eq!(
             resolver.asn_org("8.8.8.8".parse().unwrap()).as_deref(),
-            Some("GOOGLE - Google LLC")
+            Some("Google LLC")
         );
         // A bad file keeps the (new) old table untouched.
         assert!(resolver.swap_from_file(&bad_path).is_err());
         assert_eq!(resolver.range_count(), 100_006);
         assert_eq!(
             resolver.asn_org("10.0.5.5".parse().unwrap()).as_deref(),
-            Some("TEST-ORG - Test Org")
+            Some("Test Org")
         );
         // A too-small file (passes parsing, fails the sanity floor)
         // also keeps the old table.
@@ -927,11 +971,11 @@ mod tests {
         assert!(path.exists());
         assert_eq!(
             resolver.asn_org("8.8.8.8".parse().unwrap()).as_deref(),
-            Some("GOOGLE - Google LLC")
+            Some("Google LLC")
         );
         assert_eq!(
             resolver.asn_org("10.0.5.5".parse().unwrap()).as_deref(),
-            Some("TEST-ORG - Test Org")
+            Some("Test Org")
         );
         // A second refresh over the existing file succeeds and
         // keeps the same data.
@@ -974,7 +1018,7 @@ mod tests {
         assert!(path.exists());
         assert_eq!(
             resolver.asn_org("8.8.8.8".parse().unwrap()).as_deref(),
-            Some("GOOGLE - Google LLC")
+            Some("Google LLC")
         );
         // A second refresh over the existing file succeeds and
         // keeps the same data.
@@ -1006,16 +1050,16 @@ mod tests {
         tables.verify_sanity().expect("real feed should pass sanity");
         assert_eq!(
             tables.lookup("8.8.8.8".parse().unwrap()),
-            Some("GOOGLE - Google LLC")
+            Some("Google LLC")
         );
         assert_eq!(
             tables.lookup("1.1.1.1".parse().unwrap()),
-            Some("CLOUDFLARENET - Cloudflare, Inc.")
+            Some("Cloudflare, Inc.")
         );
         assert_eq!(tables.lookup("1.0.1.0".parse().unwrap()), None);
         assert_eq!(
             tables.lookup("2001:4860:4860::8888".parse().unwrap()),
-            Some("GOOGLE - Google LLC")
+            Some("Google LLC")
         );
     }
 }

@@ -2602,12 +2602,12 @@ mod tests {
             serde_json::from_str(&body).expect("response should parse");
         assert_eq!(
             response.introduction.provider_network_asn_org.as_deref(),
-            Some("CLOUDFLARENET - Cloudflare, Inc.")
+            Some("Cloudflare, Inc.")
         );
         assert_eq!(response.introduction.provider_network_ptr, None);
         assert_eq!(
             response.introduction.consumer_network_asn_org.as_deref(),
-            Some("GOOGLE - Google LLC")
+            Some("Google LLC")
         );
         assert_eq!(response.introduction.consumer_network_ptr, None);
 
@@ -2640,11 +2640,11 @@ mod tests {
         let claims = &mutual.introduction.introduction;
         assert_eq!(
             claims.provider_network_asn_org.as_deref(),
-            Some("GOOGLE - Google LLC")
+            Some("Google LLC")
         );
         assert_eq!(
             claims.consumer_network_asn_org.as_deref(),
-            Some("CLOUDFLARENET - Cloudflare, Inc.")
+            Some("Cloudflare, Inc.")
         );
 
         // No live sessions: the same mint carries no names at all.

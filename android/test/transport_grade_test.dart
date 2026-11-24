@@ -58,15 +58,30 @@ SessionStatus tstatusWith({
 void main() {
   group('gradeKey', () {
     test('direct paths key by supervisor index', () {
-      expect(tpath(index: 0).gradeKey, 'd0');
-      expect(tpath(index: 3).gradeKey, 'd3');
+      expect(tpath(index: 0).gradeKey(), 'd0');
+      expect(tpath(index: 3).gradeKey(), 'd3');
     });
 
-    test('peer-relay legs key by peer id + kind', () {
+    test('peer-relay legs key by peer id + kind + leg number', () {
       expect(
-        tpath(index: null, peerId: 'abcdef12', kind: 'h3').gradeKey,
-        'rabcdef12:h3',
+        tpath(index: null, peerId: 'abcdef12', kind: 'h3').gradeKey(),
+        'rabcdef12:h3:1',
       );
+      expect(
+        tpath(index: null, peerId: 'abcdef12', kind: 'h3')
+            .gradeKey(peerLeg: 2),
+        'rabcdef12:h3:2',
+      );
+    });
+
+    test('two legs to one peer get different keys (4.108)', () {
+      // The bug: both legs keyed r<peer>:<kind>, so they shared one
+      // grade state and showed identical scores despite different
+      // latencies. The leg ordinal is part of the key now.
+      final leg1 = tpath(index: null, peerId: 'abcdef12', kind: 'PeerRelay');
+      final leg2 = tpath(index: null, peerId: 'abcdef12', kind: 'PeerRelay');
+      final keys = gradeKeysForPaths([leg1, leg2]);
+      expect(keys, ['rabcdef12:PeerRelay:1', 'rabcdef12:PeerRelay:2']);
     });
   });
 
@@ -317,6 +332,33 @@ void main() {
       expect(tracker.grades.length, 2);
     });
 
+    test('two peer legs to one peer are graded independently (4.108)', () {
+      // Regression: both legs keyed r<peer>:<kind>, so they shared
+      // one grade state and showed identical scores despite
+      // different latencies (the 6a's two YeZMPfbc legs, 310 ms vs
+      // 458 ms, both A·99 in the v360 bench). The leg ordinal is
+      // part of the key now, so each leg accumulates its own RTTs.
+      final tracker = TransportGradeTracker();
+      for (var i = 0; i < 12; i++) {
+        tracker.record(
+          tstatusWith(
+            paths: [
+              tpath(index: null, peerId: 'abcdef12', kind: 'PeerRelay', rtt: 40),
+              tpath(index: null, peerId: 'abcdef12', kind: 'PeerRelay', rtt: 400),
+            ],
+          ),
+          t0.add(Duration(seconds: i)),
+        );
+      }
+      expect(tracker.gradeFor('rabcdef12:PeerRelay:1')!.latencyScore, 100);
+      // Median in the ≤500 bucket (midpoint 425 ms) → ≈ 16.7.
+      expect(
+        tracker.gradeFor('rabcdef12:PeerRelay:2')!.latencyScore,
+        closeTo(16.7, 0.1),
+      );
+      expect(tracker.grades.length, 2);
+    });
+
     test('gaps over 35 s are skipped as unknown time', () {
       final tracker = TransportGradeTracker();
       tracker.record(
@@ -382,7 +424,7 @@ void main() {
           t0.add(Duration(seconds: i)),
         );
       }
-      final grade = tracker.gradeFor('rabcdef12:h3')!;
+      final grade = tracker.gradeFor('rabcdef12:h3:1')!;
       // RTT 300 ms alone would score ~50 (D) and the leg would
       // never win traffic — the feedback loop. The prior is 99.
       expect(grade.latencyScore, 50);

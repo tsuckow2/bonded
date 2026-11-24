@@ -16,6 +16,12 @@ class AppSettings {
   final List<String> excludedAppPackages;
   final bool batterySaver;
 
+  /// Show the PTR hostname as a second network-name line on Paths
+  /// rows (4.107 item 2). Default OFF — the PTR is usually an ugly
+  /// raw hostname, and the ASN org name already identifies the
+  /// network. Display-only: the server keeps sending the PTR.
+  final bool showPtrHostname;
+
   /// Traffic-mode rule table (4.51): default mode + per-domain/IP
   /// overrides. Serialized as one JSON blob in the same
   /// SharedPreferences store as the other settings — no second store.
@@ -28,6 +34,7 @@ class AppSettings {
     this.allowLocalTraffic = false,
     this.excludedAppPackages = const [],
     this.batterySaver = false,
+    this.showPtrHostname = false,
     this.trafficModeSettings = const TrafficModeSettings(),
   });
 
@@ -39,6 +46,7 @@ class AppSettings {
     bool? allowLocalTraffic,
     List<String>? excludedAppPackages,
     bool? batterySaver,
+    bool? showPtrHostname,
     TrafficModeSettings? trafficModeSettings,
   }) {
     return AppSettings(
@@ -50,6 +58,7 @@ class AppSettings {
       allowLocalTraffic: allowLocalTraffic ?? this.allowLocalTraffic,
       excludedAppPackages: excludedAppPackages ?? this.excludedAppPackages,
       batterySaver: batterySaver ?? this.batterySaver,
+      showPtrHostname: showPtrHostname ?? this.showPtrHostname,
       trafficModeSettings: trafficModeSettings ?? this.trafficModeSettings,
     );
   }
@@ -76,6 +85,7 @@ class AppSettingsService {
                 .toList() ??
             const [],
         batterySaver: map?['batterySaver'] == true,
+        showPtrHostname: map?['showPtrHostname'] == true,
         trafficModeSettings: _parseTrafficModeSettings(
           map?['trafficRulesJson'] as String?,
         ),
@@ -94,6 +104,7 @@ class AppSettingsService {
         'allowLocalTraffic': settings.allowLocalTraffic,
         'excludedAppPackages': settings.excludedAppPackages,
         'batterySaver': settings.batterySaver,
+        'showPtrHostname': settings.showPtrHostname,
         'trafficRulesJson': jsonEncode(settings.trafficModeSettings.toJson()),
       });
     } catch (_) {

@@ -167,6 +167,26 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 : null,
           ),
           const Divider(),
+          const ListTile(
+            title: Text(
+              'Display',
+              style: TextStyle(fontWeight: FontWeight.w700),
+            ),
+          ),
+          SwitchListTile(
+            title: const Text('Show PTR hostname on Paths rows'),
+            subtitle: const Text(
+              'Also show the reverse-DNS hostname under each path\'s '
+              'network name when one resolved. The PTR is usually a '
+              'raw hostname, so this stays off unless you want it.',
+            ),
+            value: _settings.showPtrHostname,
+            onChanged: _settingsLoaded
+                ? (value) =>
+                      _save(_settings.copyWith(showPtrHostname: value))
+                : null,
+          ),
+          const Divider(),
           ListTile(
             title: const Text('About Bonded'),
             subtitle: Text(
