@@ -1019,6 +1019,18 @@ fn client_transport_kind(transport: &ClientTransport) -> &'static str {
     }
 }
 
+/// Whether an existing peer-relay leg is superseded by a newly arrived
+/// leg for the same peer (4.110): same peer, and the existing leg's
+/// introduction expires strictly before the new leg's. The provider's
+/// RelayPathClaims lets a newer introduction take over a path, so the
+/// consumer must replace the old leg, not add alongside it. Same-expiry
+/// legs (the forward + reversed pair from one mutual introduction,
+/// which share expires_at server-side) are NOT superseded — the
+/// complementary direction is kept.
+fn peer_relay_superseded(old_peer: &str, old_expires: u64, new_peer: &str, new_expires: u64) -> bool {
+    old_peer == new_peer && old_expires < new_expires
+}
+
 /// Diff a path-set change against the worker's desired-path map
 /// (`path_index -> bind address`). Returns `(removed, added)`:
 /// indexes whose address vanished, and `(index, address)` pairs for
@@ -2821,6 +2833,62 @@ fn start_android_session(
                     peer_transport = peer_transport_rx.recv() => {
                         if let Some(transport) = peer_transport {
                             let kind = client_transport_kind(&transport);
+                            // 4.110: a newer leg for the same peer
+                            // supersedes older legs on the same
+                            // provider path — the provider's
+                            // RelayPathClaims lets a newer
+                            // introduction take over a path, so the
+                            // consumer must REPLACE the old leg, not
+                            // add alongside it. Retire any existing
+                            // peer-relay transport for this peer whose
+                            // introduction expires strictly before the
+                            // new leg's. Same-expiry legs (the
+                            // forward + reversed pair from one mutual
+                            // introduction, which share expires_at
+                            // server-side) are kept. The active
+                            // transport is never retired here, same
+                            // rule as the expiry retire check — it is
+                            // picked up once it stops being active.
+                            if let Some((new_peer, new_expires)) =
+                                transport.peer_relay_key().map(|(p, e)| (p.to_owned(), e))
+                            {
+                                let mut idx = transports.len();
+                                let mut retired = 0usize;
+                                while idx > 0 {
+                                    idx -= 1;
+                                    if idx == active_index {
+                                        continue;
+                                    }
+                                    if let Some((old_peer, old_expires)) =
+                                        transports[idx].peer_relay_key()
+                                    {
+                                        if peer_relay_superseded(
+                                            old_peer,
+                                            old_expires,
+                                            &new_peer,
+                                            new_expires,
+                                        ) {
+                                            let mut old = transports.remove(idx);
+                                            if idx < active_index {
+                                                active_index -= 1;
+                                            }
+                                            let _ = tokio::time::timeout(
+                                                ANDROID_TRANSPORT_CLOSE_TIMEOUT,
+                                                old.close(),
+                                            )
+                                            .await;
+                                            retired += 1;
+                                        }
+                                    }
+                                }
+                                if retired > 0 {
+                                    alog_info!(
+                                        "Worker: retired {} superseded peer-relay transport(s) for peer={}",
+                                        retired,
+                                        new_peer
+                                    );
+                                }
+                            }
                             transports.push(transport);
                             sync_transport_snapshot(&worker_snapshot, &transports, active_index);
                             publish_path_stats(
@@ -4722,6 +4790,22 @@ mod tests {
     use super::diff_path_addresses;
     use super::prefer_wireguard_first;
     use super::redundant_fan_out_targets;
+    use super::peer_relay_superseded;
+
+    #[test]
+    fn peer_relay_superseded_replaces_older_leg_same_peer_only() {
+        // A newer introduction for the same peer supersedes the
+        // older leg (the provider's claim let the newer generation
+        // take over the path): the consumer replaces, not adds.
+        assert!(peer_relay_superseded("peer-a", 1_000, "peer-a", 1_300));
+        // Same expiry = the forward + reversed pair from one mutual
+        // introduction: complementary, NOT superseded.
+        assert!(!peer_relay_superseded("peer-a", 1_000, "peer-a", 1_000));
+        // A new leg never supersedes a newer old leg.
+        assert!(!peer_relay_superseded("peer-a", 1_300, "peer-a", 1_000));
+        // A different peer's leg is never superseded.
+        assert!(!peer_relay_superseded("peer-a", 1_000, "peer-b", 1_300));
+    }
 
     #[test]
     fn snapshot_json_carries_wakeup_counters() {

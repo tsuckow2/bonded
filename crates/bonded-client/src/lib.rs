@@ -130,6 +130,21 @@ impl ClientTransport {
         }
     }
 
+    /// (peer_id, introduction expires_at) for a peer-relay transport,
+    /// else None. Used by the FFI worker to retire a superseded leg
+    /// when a newer leg for the same peer arrives: the provider's
+    /// RelayPathClaims lets a newer introduction take over a path,
+    /// so the consumer must replace the old leg, not add alongside
+    /// it (4.110).
+    pub fn peer_relay_key(&self) -> Option<(&str, u64)> {
+        match self {
+            ClientTransport::PeerRelay {
+                peer_id, expires_at, ..
+            } => Some((peer_id, *expires_at)),
+            _ => None,
+        }
+    }
+
     pub async fn send(&mut self, frame: bonded_core::session::SessionFrame) -> anyhow::Result<()> {
         match self {
             ClientTransport::NaiveTcp(inner) => inner.send(frame).await,
