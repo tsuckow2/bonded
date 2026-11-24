@@ -31,15 +31,22 @@ struct SessionRegistryInner {
     /// every transport bind, cleared with the session on
     /// unregister.
     source_ip_by_client: HashMap<String, std::net::IpAddr>,
-    /// When each client key last bound a transport (4.112): the
-    /// wall-clock-independent instant of the most recent
-    /// `note_source_ip` call for that key. A session restart
-    /// re-binds every transport, so the instant advances past any
-    /// dial-back push made before the restart — the dial-back
-    /// limiter reads it to tell a genuine post-restart push
-    /// (target re-bound after the pair's last push) from a flap
-    /// (target stable, consumer re-requesting). Updated on every
-    /// transport bind alongside the source IP, cleared with the
+    /// When each client key last bound a transport DIRECTLY
+    /// (4.112): the wall-clock-independent instant of the most
+    /// recent direct `note_source_ip` call for that key. A session
+    /// restart re-binds every direct transport, so the instant
+    /// advances past any dial-back push made before the restart —
+    /// the dial-back limiter reads it to tell a genuine
+    /// post-restart push (target re-bound after the pair's last
+    /// push) from a flap (target stable, consumer re-requesting).
+    /// RELAYED binds deliberately do NOT advance it: a relayed
+    /// bind notes the provider's egress under the authenticated
+    /// key, so routine relay traffic through the target would
+    /// advance it on every relayed auth — and the 2026-11-11
+    /// flap (118 relay events) would exempt every push and
+    /// re-open the churn loop the limiter exists to stop. Only
+    /// the target (re)establishing its OWN transports counts.
+    /// Updated on every direct transport bind, cleared with the
     /// session on unregister.
     last_bind_at_by_client: HashMap<String, std::time::Instant>,
 }
@@ -78,7 +85,19 @@ impl SessionRegistry {
     /// to `register_client`, so the last bind wins. The address is
     /// what introduction minting resolves the peer's network name
     /// from.
-    pub fn note_source_ip(&self, client_key: &str, peer: std::net::SocketAddr) {
+    ///
+    /// `relayed` marks a bind carrying another device's session
+    /// through this one (the transport peer is the provider): the
+    /// source IP is still noted (under the authenticated key, per
+    /// 4.107), but the direct-bind instant (4.112) is NOT
+    /// advanced — only the target (re)establishing its OWN
+    /// transports counts as a re-bind for the dial-back limiter.
+    pub fn note_source_ip(
+        &self,
+        client_key: &str,
+        peer: std::net::SocketAddr,
+        relayed: bool,
+    ) {
         let mut guard = self
             .inner
             .write()
@@ -86,13 +105,15 @@ impl SessionRegistry {
         guard
             .source_ip_by_client
             .insert(client_key.to_owned(), peer.ip());
-        // (4.112) The bind instant advances with every transport
-        // bind, so a session restart — which re-binds every
-        // transport — moves it past any dial-back push made before
-        // the restart.
-        guard
-            .last_bind_at_by_client
-            .insert(client_key.to_owned(), std::time::Instant::now());
+        // (4.112) A direct bind advances the instant; a relayed
+        // bind must not — routine relay traffic through the target
+        // would otherwise exempt every push and re-open the
+        // 2026-11-11 churn loop.
+        if !relayed {
+            guard
+                .last_bind_at_by_client
+                .insert(client_key.to_owned(), std::time::Instant::now());
+        }
     }
 
     /// When this client key last bound a transport, if any (4.112).
@@ -209,12 +230,12 @@ mod tests {
         let registry = SessionRegistry::default();
         assert_eq!(registry.source_ip_for("pub-a"), None);
         let _ = registry.register_client("pub-a".to_owned());
-        registry.note_source_ip("pub-a", "75.164.76.151:54321".parse().unwrap());
+        registry.note_source_ip("pub-a", "75.164.76.151:54321".parse().unwrap(), false);
         assert_eq!(
             registry.source_ip_for("pub-a"),
             Some("75.164.76.151".parse().unwrap())
         );
-        registry.note_source_ip("pub-a", "1.1.1.1:443".parse().unwrap());
+        registry.note_source_ip("pub-a", "1.1.1.1:443".parse().unwrap(), false);
         assert_eq!(
             registry.source_ip_for("pub-a"),
             Some("1.1.1.1".parse().unwrap())
@@ -224,20 +245,35 @@ mod tests {
     }
 
     #[test]
-    fn last_bind_at_advances_on_bind_and_clears_on_unregister() {
+    fn last_bind_at_advances_on_direct_bind_only_and_clears_on_unregister() {
         // 4.112: the registry remembers when each client last
-        // bound a transport; a re-bind advances it and unregister
-        // clears it, so the dial-back limiter can tell a
-        // post-restart push from a flap.
+        // bound a transport DIRECTLY; a re-bind advances it and
+        // unregister clears it, so the dial-back limiter can tell
+        // a post-restart push from a flap. A RELAYED bind must
+        // NOT advance it: relayed binds note the provider's
+        // egress under the authenticated key, so routine relay
+        // traffic through the target would otherwise exempt every
+        // push and re-open the 2026-11-11 churn loop.
         let registry = SessionRegistry::default();
         assert_eq!(registry.last_bind_at_for("pub-a"), None);
         let _ = registry.register_client("pub-a".to_owned());
         assert_eq!(registry.last_bind_at_for("pub-a"), None);
-        registry.note_source_ip("pub-a", "75.164.76.151:54321".parse().unwrap());
+        // A relayed bind notes the source IP but leaves the
+        // direct-bind instant untouched.
+        registry.note_source_ip("pub-a", "75.164.76.151:54321".parse().unwrap(), true);
+        assert_eq!(registry.last_bind_at_for("pub-a"), None);
+        assert_eq!(
+            registry.source_ip_for("pub-a"),
+            Some("75.164.76.151".parse().unwrap())
+        );
+        registry.note_source_ip("pub-a", "75.164.76.151:54321".parse().unwrap(), false);
         let first = registry
             .last_bind_at_for("pub-a")
-            .expect("bind should record an instant");
-        registry.note_source_ip("pub-a", "1.1.1.1:443".parse().unwrap());
+            .expect("direct bind should record an instant");
+        // A later relayed bind does not move the instant.
+        registry.note_source_ip("pub-a", "1.1.1.1:443".parse().unwrap(), true);
+        assert_eq!(registry.last_bind_at_for("pub-a"), Some(first));
+        registry.note_source_ip("pub-a", "1.1.1.1:443".parse().unwrap(), false);
         let second = registry
             .last_bind_at_for("pub-a")
             .expect("re-bind should record an instant");

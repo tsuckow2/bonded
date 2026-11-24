@@ -1310,6 +1310,7 @@ async fn handle_transport_session<T: Transport>(
             &binding.client_public_key
         },
         peer,
+        binding.relayed_via_provider,
     );
     info!(
         peer = %peer,
@@ -2535,7 +2536,7 @@ mod tests {
         // and forwarding contexts so the mutual push can deliver.
         let sessions = SessionRegistry::default();
         let provider_handle = sessions.register_client(provider.public_key_b64.clone());
-        sessions.note_source_ip(&provider.public_key_b64, "1.0.0.1:443".parse().unwrap());
+        sessions.note_source_ip(&provider.public_key_b64, "1.0.0.1:443".parse().unwrap(), false);
         let (provider_router, provider_fwd_tx) = SessionOutboundRouter::new();
         let (provider_transport_tx, mut provider_rx) =
             mpsc::unbounded_channel::<SessionFrame>();
@@ -2547,7 +2548,7 @@ mod tests {
             std::net::SocketAddr::from(([192, 0, 2, 53], 53)),
         ));
         let consumer_handle = sessions.register_client(consumer.public_key_b64.clone());
-        sessions.note_source_ip(&consumer.public_key_b64, "8.8.8.8:54321".parse().unwrap());
+        sessions.note_source_ip(&consumer.public_key_b64, "8.8.8.8:54321".parse().unwrap(), false);
         let (consumer_router, consumer_fwd_tx) = SessionOutboundRouter::new();
         let (consumer_transport_tx, mut consumer_rx) =
             mpsc::unbounded_channel::<SessionFrame>();

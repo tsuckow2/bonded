@@ -95,15 +95,19 @@ pub enum DialBackPushOutcome {
 /// window — a flapping pair cannot grow it.
 ///
 /// Re-bind exemption (4.112): a push is also allowed when the push
-/// TARGET re-bound a transport after the pair's last push. A
-/// session restart re-binds every transport, so the legs the last
-/// push created are gone with the old session incarnation — the
-/// next push is a fresh need, not a flap. The 2026-11-11
-/// churn-loop case is unaffected: there the target (6a) was stable
-/// and never re-bound, so its pushes still collapse to one per
+/// TARGET re-bound a DIRECT transport after the pair's last push. A
+/// session restart re-binds every direct transport, so the legs the
+/// last push created are gone with the old session incarnation —
+/// the next push is a fresh need, not a flap. Relayed binds do NOT
+/// count (the registry only records direct binds): routine relay
+/// traffic through the target would otherwise exempt every push
+/// and re-open the 2026-11-11 churn loop. The 2026-11-11 case is
+/// unaffected: there the target (6a) was stable and never re-bound
+/// a direct transport, so its pushes still collapse to one per
 /// window; only a target that itself restarted gets a fresh push.
 /// `target_last_bind` is `None` when the target has no recorded
-/// bind (no live session yet) — the plain per-pair window applies.
+/// direct bind (no live session yet) — the plain per-pair window
+/// applies.
 #[derive(Default)]
 struct DialBackPushLimiter {
     last_push: HashMap<(String, String), Instant>,
@@ -185,12 +189,15 @@ impl DialBackPush {
         else {
             return DialBackPushOutcome::NoLiveSession;
         };
-        // (4.112) The target's last transport bind: a target that
-        // re-bound after the pair's last push restarted its session
-        // since then, so the push is a re-establishment, not a flap
-        // — the limiter allows it inside the window. A stable
-        // target keeps the plain per-pair window (the 2026-11-11
-        // churn-loop case).
+        // (4.112) The target's last DIRECT transport bind: a
+        // target that re-bound after the pair's last push restarted
+        // its session since then, so the push is a
+        // re-establishment, not a flap — the limiter allows it
+        // inside the window. A stable target keeps the plain
+        // per-pair window (the 2026-11-11 churn-loop case).
+        // Relayed binds do not count (the registry records direct
+        // binds only), so routine relay traffic through the target
+        // cannot exempt pushes.
         let target_last_bind = self.sessions.last_bind_at_for(provider_device_public_key);
         let allowed = self
             .limiter
@@ -535,7 +542,7 @@ mod tests {
         );
         // The provider restarts and re-binds a transport: the next
         // push is a re-establishment, not a flap.
-        sessions.note_source_ip("provider", "192.168.1.20:54443".parse().unwrap());
+        sessions.note_source_ip("provider", "192.168.1.20:54443".parse().unwrap(), false);
         assert_eq!(push.push("provider", &notification()), DialBackPushOutcome::Pushed);
 
         // Exactly two frames arrive: the first push and the

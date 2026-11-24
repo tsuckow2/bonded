@@ -306,6 +306,7 @@ async fn handle_quic_connection(
             &binding.client_public_key
         },
         peer,
+        binding.relayed_via_provider,
     );
     info!(
         peer = %peer,

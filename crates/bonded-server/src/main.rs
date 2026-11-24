@@ -703,6 +703,7 @@ async fn run_server(
                             &binding.client_public_key
                         },
                         peer,
+                        binding.relayed_via_provider,
                     );
                     info!(
                         peer = %peer,
