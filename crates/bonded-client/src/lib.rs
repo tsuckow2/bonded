@@ -69,6 +69,17 @@ pub enum ClientTransport {
     PeerRelay {
         transport: Box<QuicTransport>,
         peer_id: String,
+        // Stable per-leg identity (4.114): a fresh id for every
+        // PeerRelay transport, assigned in `peer_relay()` from a
+        // process-wide counter. A renewed leg gets a NEW id, so
+        // `publish_path_stats` (bonded-ffi) can tell a renewed
+        // leg from the same leg republished — the name prior is
+        // matched by this id, not by vec position, so a renewal
+        // can no longer hand a Wi-Fi leg the cellular leg's
+        // PONG-derived name (the v371 bench finding: both OnePlus
+        // legs read T-Mobile because the vec-position prior
+        // matched the renewed Wi-Fi leg to the old cellular leg).
+        leg_id: u64,
         // No introduction-seeded network name (4.113): the
         // server-signed introduction carries ONE provider name,
         // resolved from the provider's last-seen IP, and for a
@@ -90,6 +101,15 @@ pub enum ClientTransport {
 }
 
 impl ClientTransport {
+    /// Next stable peer-leg id (4.114). One fresh id per
+    /// `peer_relay()` call; a renewed leg gets a new id, so the
+    /// FFI name prior can distinguish it from the leg it replaces.
+    fn next_peer_leg_id() -> u64 {
+        static NEXT_PEER_LEG_ID: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(1);
+        NEXT_PEER_LEG_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn peer_relay(
         transport: QuicTransport,
         peer_id: String,
@@ -99,8 +119,18 @@ impl ClientTransport {
         Self::PeerRelay {
             transport: Box::new(transport),
             peer_id,
+            leg_id: Self::next_peer_leg_id(),
             close_notifier: Some(close_notifier),
             expires_at,
+        }
+    }
+
+    /// Stable per-leg identity for a peer relay (4.114); `None`
+    /// for direct transports, which are matched by path index.
+    pub fn peer_leg_id(&self) -> Option<u64> {
+        match self {
+            ClientTransport::PeerRelay { leg_id, .. } => Some(*leg_id),
+            _ => None,
         }
     }
 

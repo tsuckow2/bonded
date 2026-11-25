@@ -722,6 +722,15 @@ struct AndroidPathStat {
     /// this id (several legs share one peer id when the provider has
     /// several paths).
     peer_id: Option<String>,
+    /// Stable per-leg identity for a peer relay (4.114), from
+    /// `ClientTransport::peer_leg_id`; `None` for direct transports.
+    /// Internal to Rust only — NOT included in the Dart snapshot
+    /// JSON. `publish_path_stats` matches the NAME prior (network
+    /// names + server_seen_address) by this id, so a renewed leg
+    /// (new id) starts nameless instead of inheriting the other
+    /// leg's PONG-derived name from the vec position it happens
+    /// to land on.
+    leg_id: Option<u64>,
 }
 
 static ANDROID_SESSION: OnceLock<Mutex<Option<AndroidSessionHandle>>> = OnceLock::new();
@@ -1545,6 +1554,29 @@ fn observed_ip_changed(
         .unwrap_or(true)
 }
 
+/// Select the prior stat a leg's network names (and
+/// `server_seen_address`) are carried from (4.114). Peer legs are
+/// matched by their stable `leg_id` — never by vec position, which
+/// is what handed a renewed Wi-Fi leg the old cellular leg's
+/// T-Mobile name on the v371 bench run. Direct legs are matched by
+/// path index (stable). The `(None, None)` fallback is only for a
+/// stat shape that carries neither, which no current transport
+/// produces.
+fn name_prior<'a>(
+    previous: &'a [AndroidPathStat],
+    path_index: Option<usize>,
+    leg_id: Option<u64>,
+    index: usize,
+) -> Option<&'a AndroidPathStat> {
+    match (path_index, leg_id) {
+        (_, Some(leg_id)) => previous.iter().find(|stat| stat.leg_id == Some(leg_id)),
+        (Some(path_index), None) => previous
+            .iter()
+            .find(|stat| stat.path_index == Some(path_index)),
+        (None, None) => previous.get(index),
+    }
+}
+
 /// Refresh the snapshot's per-path structure (which transports exist,
 /// their path indexes and kinds, which is active) after a transport-set
 /// change. Counters survive the refresh: direct paths are matched by
@@ -1565,12 +1597,35 @@ fn publish_path_stats(
             .enumerate()
             .map(|(index, transport)| {
                 let path_index = path_index_of.get(index).copied().flatten();
+                let leg_id = transport.peer_leg_id();
+                // Counters keep the existing matching (direct legs
+                // by path index, peer relays by vec position): a
+                // re-dialed path keeps its totals.
                 let prior = match path_index {
                     Some(path_index) => previous
                         .iter()
                         .find(|stat| stat.path_index == Some(path_index)),
                     None => previous.get(index),
                 };
+                // Network names (4.114): the NAME prior is matched
+                // by leg identity, NOT by vec position. A peer leg
+                // matched by vec position inherits the prior stat
+                // of whatever leg previously held that position —
+                // on a renewal the new Wi-Fi leg can land on the
+                // old cellular leg's position and inherit its
+                // PONG-derived T-Mobile name (and its
+                // server_seen_address), and the name then sticks:
+                // the Wi-Fi leg's PONGs carry no name, and the
+                // PONG handler's 4.109 clear only fires on a NAMED
+                // pong, so a nameless pong leaves the inherited
+                // name alone. Matching by leg_id, a renewed leg
+                // (new id) has no prior and starts nameless, and
+                // the same leg republished keeps its PONG-derived
+                // name. Direct legs have no leg_id and keep the
+                // path-index match (stable). The server_seen_address
+                // travels with the name — it is the address the
+                // name was resolved for.
+                let name_prior = name_prior(&previous, path_index, leg_id, index);
                 let wire = transport.wire_stats();
                 // Network names (4.107): a pong-derived name
                 // survives republishes — the pong is the live
@@ -1589,9 +1644,9 @@ fn publish_path_stats(
                 // falls back to the public IP. Direct paths
                 // carry only pong-derived names.
                 let prior_network_asn_org =
-                    prior.and_then(|stat| stat.network_asn_org.clone());
+                    name_prior.and_then(|stat| stat.network_asn_org.clone());
                 let prior_network_ptr =
-                    prior.and_then(|stat| stat.network_ptr_hostname.clone());
+                    name_prior.and_then(|stat| stat.network_ptr_hostname.clone());
                 // Network names (4.109): the pair is taken as a
                 // unit — a prior pair (both fields from the same
                 // pong) is never filled out with the other half
@@ -1627,7 +1682,7 @@ fn publish_path_stats(
                     quic_lost_bytes: wire.and_then(|stats| stats.quic_lost_bytes),
                     quic_sent_packets: wire.and_then(|stats| stats.quic_sent_packets),
                     last_rtt_ms: prior.map(|stat| stat.last_rtt_ms).unwrap_or(0),
-                    server_seen_address: prior
+                    server_seen_address: name_prior
                         .and_then(|stat| stat.server_seen_address.clone()),
                     network_asn_org,
                     network_ptr_hostname,
@@ -1637,6 +1692,7 @@ fn publish_path_stats(
                         }
                         _ => None,
                     },
+                    leg_id,
                 }
             })
             .collect();
@@ -4873,6 +4929,7 @@ mod tests {
                     network_asn_org: None,
                     network_ptr_hostname: None,
                     peer_id: None,
+                    leg_id: None,
                 },
                 AndroidPathStat {
                     path_index: Some(1),
@@ -4892,6 +4949,7 @@ mod tests {
                     network_asn_org: None,
                     network_ptr_hostname: None,
                     peer_id: None,
+                    leg_id: None,
                 },
             ],
             interception: None,
@@ -4989,6 +5047,7 @@ mod tests {
                     network_asn_org: Some("GOOGLE - Google LLC".to_owned()),
                     network_ptr_hostname: Some("c-75-164-76-151.hsd1.example.net".to_owned()),
                     peer_id: None,
+                    leg_id: None,
                 },
                 AndroidPathStat {
                     path_index: Some(1),
@@ -5008,6 +5067,7 @@ mod tests {
                     network_asn_org: None,
                     network_ptr_hostname: None,
                     peer_id: None,
+                    leg_id: None,
                 },
             ],
             interception: None,
@@ -5049,6 +5109,71 @@ mod tests {
         let (asn, ptr) = pick_network_names(None, None, None, None);
         assert_eq!(asn, None, "no prior and no seed must show no ASN org");
         assert_eq!(ptr, None, "no prior and no seed must show no PTR");
+    }
+
+    #[test]
+    fn renewed_peer_leg_does_not_inherit_the_other_legs_name() {
+        // 4.114 (the v371 bench finding): the 6a's peer legs via
+        // the OnePlus BOTH read "T-Mobile USA, Inc." while the
+        // server log shows the 6a relayed via the OnePlus from
+        // BOTH 192.168.1.1 (Wi-Fi) and 172.56.203.23 (cellular) —
+        // so one leg is a Wi-Fi leg showing the cellular leg's
+        // name. The mechanism: publish_path_stats matched the
+        // name prior by vec position, so a renewed Wi-Fi leg
+        // landing on the old cellular leg's position inherited
+        // its PONG-derived T-Mobile name, and the Wi-Fi leg's
+        // nameless PONGs never cleared it. The name prior is
+        // now matched by leg_id: a renewed leg (new id) has no
+        // prior and starts nameless, even when it lands on the
+        // position the named leg used to hold.
+        use super::{name_prior, AndroidPathStat};
+        let previous = vec![
+            AndroidPathStat {
+                leg_id: Some(1),
+                peer_id: Some("YeZMPfbc".to_owned()),
+                network_asn_org: None,
+                network_ptr_hostname: None,
+                server_seen_address: Some("192.168.1.1:43450".to_owned()),
+                ..Default::default()
+            },
+            AndroidPathStat {
+                leg_id: Some(2),
+                peer_id: Some("YeZMPfbc".to_owned()),
+                network_asn_org: Some("T-Mobile USA, Inc.".to_owned()),
+                network_ptr_hostname: None,
+                server_seen_address: Some("172.56.203.23:34950".to_owned()),
+                ..Default::default()
+            },
+        ];
+        // A renewed Wi-Fi leg (new leg_id 3) landing on vec
+        // position 1 — the old cellular leg's position — must
+        // NOT inherit the T-Mobile name from that position.
+        let prior = name_prior(&previous, None, Some(3), 1);
+        assert!(
+            prior.is_none(),
+            "a renewed leg (new leg_id) must have no name prior, not the old leg's T-Mobile"
+        );
+        // The same cellular leg republished (same leg_id 2)
+        // keeps its PONG-derived name.
+        let prior = name_prior(&previous, None, Some(2), 1);
+        assert_eq!(
+            prior.and_then(|stat| stat.network_asn_org.as_deref()),
+            Some("T-Mobile USA, Inc."),
+            "the same leg republished must keep its PONG-derived name"
+        );
+        // A direct leg (no leg_id) is still matched by path
+        // index, even when it is not at that vec position.
+        let direct = vec![AndroidPathStat {
+            path_index: Some(0),
+            network_asn_org: Some("T-Mobile USA, Inc.".to_owned()),
+            ..Default::default()
+        }];
+        let prior = name_prior(&direct, Some(0), None, 5);
+        assert_eq!(
+            prior.and_then(|stat| stat.network_asn_org.as_deref()),
+            Some("T-Mobile USA, Inc."),
+            "a direct leg must be matched by path index"
+        );
     }
 
     #[test]
@@ -5184,6 +5309,7 @@ mod tests {
                     network_asn_org: None,
                     network_ptr_hostname: None,
                     peer_id: None,
+                    leg_id: None,
                 },
                 AndroidPathStat {
                     path_index: Some(1),
@@ -5203,6 +5329,7 @@ mod tests {
                     network_asn_org: None,
                     network_ptr_hostname: None,
                     peer_id: None,
+                    leg_id: None,
                 },
             ],
             interception: None,
