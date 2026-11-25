@@ -705,10 +705,12 @@ struct AndroidPathStat {
     /// egress address (4.107): the ASN org name, e.g. `"GOOGLE -
     /// Google LLC"`. `None` until a stamped extended pong arrives,
     /// or when the server holds no ASN name for the address.
-    /// Peer-relay legs are seeded from the introduction's provider
-    /// name at publish time (see `publish_path_stats`) so the row
-    /// shows before the first pong; the pong wins on any
-    /// disagreement (see the pong handler).
+    /// Peer-relay legs are NOT seeded from the introduction
+    /// (4.113): the introduction's provider name is not a
+    /// per-leg value (and is the acceptor's own name on a mutual
+    /// leg), so a peer leg's name comes only from a pong on
+    /// that leg; until then it is `None` and the UI falls back
+    /// to the public IP.
     network_asn_org: Option<String>,
     /// PTR hostname the server resolved for this path's public
     /// egress address (4.107), same source and same absent rule as
@@ -1531,7 +1533,8 @@ fn pick_network_names(
 /// be cleared before the pong's names are applied. No stored
 /// address (first pong) or an unparseable one counts as changed.
 /// A plain pong (no names) never reaches this — it leaves the
-/// seeded names alone.
+/// stored pong-derived names alone (there is no introduction
+/// seed since 4.113).
 fn observed_ip_changed(
     stored_seen_address: Option<&str>,
     observed_ip: std::net::IpAddr,
@@ -1571,38 +1574,37 @@ fn publish_path_stats(
                 let wire = transport.wire_stats();
                 // Network names (4.107): a pong-derived name
                 // survives republishes — the pong is the live
-                // per-leg value and wins over the introduction.
-                // A peer leg with no pong yet seeds from the
-                // introduction's provider name, so its row shows
-                // before the first pong arrives. Direct paths
+                // per-leg value. A peer leg has NO introduction
+                // seed (4.113): the introduction carries ONE
+                // provider name for both legs, resolved from the
+                // provider's last-seen IP, and on a mutual
+                // (reversed) leg that name is the acceptor's OWN
+                // name (roles swap, 4.93) — so the seed is not a
+                // per-leg value and must never be displayed (it
+                // put T-Mobile, the acceptor's own cellular, on
+                // both of the 7a's peer legs, and the provider's
+                // cellular carrier on a Wi-Fi peer leg whose
+                // PONGs carry no name to correct it). A leg with
+                // no pong-derived name yet shows none; the UI
+                // falls back to the public IP. Direct paths
                 // carry only pong-derived names.
                 let prior_network_asn_org =
                     prior.and_then(|stat| stat.network_asn_org.clone());
                 let prior_network_ptr =
                     prior.and_then(|stat| stat.network_ptr_hostname.clone());
-                let (claim_asn_org, claim_ptr) = match transport {
-                    ClientTransport::PeerRelay {
-                        peer_network_asn_org,
-                        peer_network_ptr,
-                        ..
-                    } => (
-                        peer_network_asn_org.clone(),
-                        peer_network_ptr.clone(),
-                    ),
-                    _ => (None, None),
-                };
                 // Network names (4.109): the pair is taken as a
                 // unit — a prior pair (both fields from the same
-                // pong or the same introduction) is never filled
-                // out with the other half from the introduction,
-                // which was resolved for the mint IP and may
-                // describe a different address than the live leg.
+                // pong) is never filled out with the other half
+                // from the introduction, which was resolved for
+                // the mint IP and may describe a different
+                // address than the live leg. The claim is always
+                // None now (4.113: no introduction seed).
                 let (network_asn_org, network_ptr_hostname) =
                     pick_network_names(
                         prior_network_asn_org,
                         prior_network_ptr,
-                        claim_asn_org,
-                        claim_ptr,
+                        None,
+                        None,
                     );
                 AndroidPathStat {
                     path_index,
@@ -3400,12 +3402,13 @@ fn start_android_session(
                                         // address-only payloads too, so
                                         // old servers behave exactly as
                                         // before. A name the pong
-                                        // carries overwrites the
-                                        // introduction-seeded one on a
-                                        // peer leg (the pong is the live
-                                        // per-leg value); a pong that
+                                        // carries overwrites the stored
+                                        // one on a peer leg (the pong
+                                        // is the live per-leg value —
+                                        // there is no introduction seed
+                                        // since 4.113); a pong that
                                         // carries no name leaves the
-                                        // seeded one alone.
+                                        // stored one alone.
                                         let (observed, asn_org, ptr_hostname) =
                                             decode_observed_network(&frame.payload);
                                         if let Some(observed) = observed {
@@ -3436,7 +3439,9 @@ fn start_android_session(
                                                         // the mismatch Tom saw. A pong
                                                         // carrying no name at all (plain
                                                         // pong, old server) leaves the
-                                                        // seeded names alone.
+                                                        // stored names alone (there is
+                                                        // no introduction seed since
+                                                        // 4.113).
                                                         if asn_org.is_some()
                                                             || ptr_hostname.is_some()
                                                         {
@@ -5031,6 +5036,22 @@ mod tests {
     }
 
     #[test]
+    fn peer_leg_with_no_pong_shows_no_name() {
+        // 4.113: publish_path_stats always passes None as the
+        // claim for a peer leg (the introduction seed is gone —
+        // it is not a per-leg value, and on a mutual leg it is
+        // the acceptor's own name). So a peer leg with no
+        // PONG-derived prior name displays NO name — it must
+        // never show the introduction's provider name. The UI
+        // falls back to the public IP until the leg's first
+        // named PONG arrives.
+        use super::pick_network_names;
+        let (asn, ptr) = pick_network_names(None, None, None, None);
+        assert_eq!(asn, None, "no prior and no seed must show no ASN org");
+        assert_eq!(ptr, None, "no prior and no seed must show no PTR");
+    }
+
+    #[test]
     fn network_names_are_picked_as_a_pair_not_mixed() {
         // 4.109: the prior pair and the introduction claim are each
         // a pair for one IP. A prior ASN-only pair (a pong carried
@@ -5038,6 +5059,11 @@ mod tests {
         // out with the claim's PTR, which was resolved for the mint
         // IP — mixing them shows two names for different addresses
         // on one row, the mismatch Tom saw.
+        // NOTE (4.113): publish_path_stats no longer passes a claim
+        // for peer legs (the introduction seed is gone), so the
+        // claim branch below is the pair-assembly rule for the
+        // helper, not a live seed path — a peer leg with no prior
+        // shows no name (see peer_leg_with_no_pong_shows_no_name).
         use super::pick_network_names;
         let (asn, ptr) = pick_network_names(
             Some("AT&T Enterprises, LLC".to_owned()),

@@ -569,8 +569,11 @@ impl ConnectedPeers {
 struct ReversedLeg {
     transport: QuicTransport,
     peer_id: String,
-    peer_network_asn_org: Option<String>,
-    peer_network_ptr: Option<String>,
+    // No introduction-seeded network name (4.113): the
+    // mutual introduction's provider name is the acceptor's
+    // OWN name (roles swap, 4.93), so it must never seed
+    // the leg's display name. The leg's name comes only
+    // from a PONG on that leg (see bonded-ffi).
     expires_at: u64,
 }
 
@@ -1234,15 +1237,6 @@ async fn run_peer_accept_loop(
                 .send(ReversedLeg {
                     transport: peer,
                     peer_id,
-                    // The peer is the provider device here, so its
-                    // network name is the introduction's provider
-                    // name (4.107); `None` when the server holds
-                    // none, and the UI falls back to the public IP.
-                    peer_network_asn_org: introduction
-                        .introduction
-                        .provider_network_asn_org
-                        .clone(),
-                    peer_network_ptr: introduction.introduction.provider_network_ptr.clone(),
                     expires_at,
                 })
                 .is_err()
@@ -1930,8 +1924,6 @@ pub async fn start_peer_share_runtime(
                             .send(ClientTransport::peer_relay(
                                 leg.transport,
                                 peer_id.clone(),
-                                leg.peer_network_asn_org.clone(),
-                                leg.peer_network_ptr.clone(),
                                 closed_peer_tx.clone(),
                                 leg.expires_at,
                             ))
@@ -2180,20 +2172,15 @@ pub async fn start_peer_share_runtime(
                             .send(ClientTransport::peer_relay(
                                 transport,
                                 peer_id.clone(),
-                                // The peer is the provider device, so
-                                // its network name is the
-                                // introduction's provider name
-                                // (4.107); `None` falls back to the
-                                // public IP in the UI until the first
-                                // heartbeat PONG refreshes it.
-                                introduction
-                                    .introduction
-                                    .provider_network_asn_org
-                                    .clone(),
-                                introduction
-                                    .introduction
-                                    .provider_network_ptr
-                                    .clone(),
+                                // No introduction-seeded network name
+                                // (4.113): the introduction carries
+                                // ONE provider name for both legs and
+                                // it is not per-leg, so it must never
+                                // seed the display name. The leg's
+                                // name comes only from a PONG on that
+                                // leg (see bonded-ffi); until its
+                                // first named PONG the UI falls back
+                                // to the public IP.
                                 closed_peer_tx.clone(),
                                 relay_expires_at,
                             ))

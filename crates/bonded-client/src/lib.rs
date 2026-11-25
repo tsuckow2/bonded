@@ -69,17 +69,20 @@ pub enum ClientTransport {
     PeerRelay {
         transport: Box<QuicTransport>,
         peer_id: String,
-        /// Network name of the provider's egress (4.107), from the
-        /// server-signed introduction claims
-        /// (`provider_network_asn_org` / `provider_network_ptr`):
-        /// the ASN org name and PTR hostname the server resolved
-        /// for the provider's live session source IP. `None` when
-        /// the server holds no name — the UI falls back to the
-        /// public IP. The heartbeat PONG later refreshes/confirms
-        /// these per leg (see bonded-ffi); the pong wins on any
-        /// disagreement, since it is the live per-leg value.
-        peer_network_asn_org: Option<String>,
-        peer_network_ptr: Option<String>,
+        // No introduction-seeded network name (4.113): the
+        // server-signed introduction carries ONE provider name,
+        // resolved from the provider's last-seen IP, and for a
+        // mutual (reversed) leg that name is the acceptor's OWN
+        // name (the roles swap, 4.93) — so seeding a peer leg
+        // from it shows the wrong network on the leg (the 7a's
+        // peer legs both read T-Mobile, its own cellular; a
+        // Wi-Fi peer leg reads the provider's cellular carrier,
+        // because its PONGs carry no name to correct it — the
+        // Wi-Fi egress is hairpinned to 192.168.1.1). A peer
+        // leg's name comes only from a PONG on that leg (the
+        // live per-leg value, see bonded-ffi); until its first
+        // named PONG the leg shows no name and the UI falls
+        // back to the public IP.
         close_notifier: Option<tokio::sync::mpsc::UnboundedSender<String>>,
         expires_at: u64,
     },
@@ -90,16 +93,12 @@ impl ClientTransport {
     pub fn peer_relay(
         transport: QuicTransport,
         peer_id: String,
-        peer_network_asn_org: Option<String>,
-        peer_network_ptr: Option<String>,
         close_notifier: tokio::sync::mpsc::UnboundedSender<String>,
         expires_at: u64,
     ) -> Self {
         Self::PeerRelay {
             transport: Box::new(transport),
             peer_id,
-            peer_network_asn_org,
-            peer_network_ptr,
             close_notifier: Some(close_notifier),
             expires_at,
         }
