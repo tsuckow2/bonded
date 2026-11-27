@@ -524,6 +524,33 @@ pub extern "C" fn bonded_path_reset(path_index: u32) -> c_int {
     }
 }
 
+/// Hand the live worker a fresh pre-resolved server address
+/// ("ip:port", 4.116): the platform layer re-resolved the server
+/// hostname outside a dead tunnel. The worker validates it
+/// (malformed or unchanged values are ignored), swaps its own
+/// config copy, and forwards it to the path supervisor for an
+/// immediate re-dial. Returns `BONDED_OK` or
+/// `BONDED_ERR_NO_SESSION` (no live session — the caller has
+/// already persisted the fresh address, so the next session
+/// (re)start picks it up anyway). A null pointer returns
+/// `BONDED_ERR_INVALID_ARG`.
+#[unsafe(no_mangle)]
+pub extern "C" fn bonded_refresh_server_address(
+    resolved_server_address: *const c_char,
+) -> c_int {
+    let address = match cstr_to_str(resolved_server_address) {
+        Ok(value) => value,
+        Err(code) => return code,
+    };
+    if super::send_path_control(super::PathControl::RefreshServerAddress {
+        address: address.to_owned(),
+    }) {
+        BONDED_OK
+    } else {
+        BONDED_ERR_NO_SESSION
+    }
+}
+
 /// Hand the live worker a new bind-address list (an interface
 /// appeared or vanished) without restarting the session. Both
 /// arguments are JSON arrays of address strings. Returns

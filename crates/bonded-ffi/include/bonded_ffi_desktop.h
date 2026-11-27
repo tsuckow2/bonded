@@ -171,6 +171,16 @@ int bonded_path_pause(uint32_t path_index, int paused);
  * BONDED_ERR_NO_SESSION. */
 int bonded_path_reset(uint32_t path_index);
 
+/* Hand the live worker a fresh pre-resolved server address
+ * ("ip:port", 4.116): the platform layer re-resolved the server
+ * hostname outside a dead tunnel. The worker validates it
+ * (malformed or unchanged values are ignored), swaps its own
+ * config copy, and forwards it to the path supervisor for an
+ * immediate re-dial. Returns BONDED_OK or
+ * BONDED_ERR_NO_SESSION. A null pointer returns
+ * BONDED_ERR_INVALID_ARG. */
+int bonded_refresh_server_address(const char *resolved_server_address);
+
 /* Hand the live worker a new bind-address list (an interface
  * appeared or vanished) without restarting the session. Both
  * arguments are JSON arrays of address strings. Returns

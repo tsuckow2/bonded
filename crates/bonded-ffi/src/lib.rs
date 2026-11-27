@@ -1102,6 +1102,16 @@ enum PathControl {
     /// session there is no supervisor, so emptying the transport set
     /// errors the session and the platform layer restarts it.
     Reset { path_index: usize },
+    /// A fresh pre-resolved server address (4.116): the DNS record
+    /// moved under a dead tunnel and the platform layer re-resolved
+    /// it outside the tunnel. The worker swaps its own config copy
+    /// and forwards the address to the path supervisor (which holds
+    /// a second config clone) so the next re-dial targets the new
+    /// IP. An address identical to the live one, or one that does
+    /// not parse as an "ip:port" socket address, is ignored — a bad
+    /// value here would break every dial, and the platform layer
+    /// already dedupes; the worker check is defense in depth.
+    RefreshServerAddress { address: String },
     /// A network path-set change (an interface appeared or
     /// vanished): surgically add/remove direct paths WITHOUT
     /// restarting the session, so surviving transports (e.g. the
@@ -1147,6 +1157,25 @@ fn send_path_control(control: PathControl) -> bool {
         .as_ref()
         .map(|handle| handle.path_control_tx.send(control).is_ok())
         .unwrap_or(false)
+}
+
+/// Validate a refreshed server address (4.116) against the live
+/// session's current one. Returns the address to apply when it is a
+/// well-formed "ip:port" socket address (IPv4 or bracketed IPv6)
+/// that differs from the current dial target; `None` when it is
+/// malformed (a bad value would break every dial — the session keeps
+/// the frozen address instead) or identical to the current one (no
+/// churn: the supervisor's backoff state is evidence about the live
+/// target, not about a target that never changed). Pure, so the
+/// platform layer's equality rule and the worker's defense-in-depth
+/// check share one definition and one test.
+fn validate_refresh_address(address: &str, current: &str) -> Option<String> {
+    let trimmed = address.trim();
+    if trimmed.is_empty() || trimmed == current.trim() {
+        return None;
+    }
+    trimmed.parse::<std::net::SocketAddr>().ok()?;
+    Some(trimmed.to_owned())
 }
 
 /// Demote paused paths to the end of an already mode-ordered
@@ -1513,6 +1542,7 @@ fn reevaluate_auto_paused(
             removed: Vec::new(),
             parked,
             unparked,
+            server_resolved_address: None,
         });
     }
 }
@@ -2621,6 +2651,56 @@ fn start_android_session(
                                     );
                                 }
                             }
+                            Some(PathControl::RefreshServerAddress { address }) => {
+                                // DNS refresh (4.116): the platform
+                                // layer re-resolved the server
+                                // hostname outside the dead tunnel.
+                                // Swap this worker's dial target and
+                                // forward the address to the path
+                                // supervisor, which holds a second
+                                // config clone and makes every
+                                // missing path due at once — the next
+                                // re-dial targets the new IP. A
+                                // malformed or unchanged address is
+                                // ignored (see
+                                // validate_refresh_address). With no
+                                // supervisor (single-path session)
+                                // there is nothing to forward to: the
+                                // worker config still updates, and
+                                // the platform layer has already
+                                // persisted the fresh address, so the
+                                // next session (re)start dials it.
+                                match validate_refresh_address(
+                                    &address,
+                                    &config.client.server_resolved_address,
+                                ) {
+                                    Some(fresh) => {
+                                        alog_info!(
+                                            "Worker: server address refreshed {} -> {}",
+                                            config.client.server_resolved_address,
+                                            fresh
+                                        );
+                                        config.client.server_resolved_address =
+                                            fresh.clone();
+                                        let _ = supervisor_paths_tx.send(
+                                            PathsUpdate {
+                                                added: Vec::new(),
+                                                removed: Vec::new(),
+                                                parked: Vec::new(),
+                                                unparked: Vec::new(),
+                                                server_resolved_address: Some(fresh),
+                                            },
+                                        );
+                                    }
+                                    None => {
+                                        alog_info!(
+                                            "Worker: ignoring refresh to {:?} (malformed or unchanged; current {})",
+                                            address,
+                                            config.client.server_resolved_address
+                                        );
+                                    }
+                                }
+                            }
                             Some(PathControl::PathsChanged {
                                 bind_addresses,
                                 cellular_bind_addresses: new_cellular,
@@ -2746,6 +2826,7 @@ fn start_android_session(
                                             removed: removed.clone(),
                                             parked: Vec::new(),
                                             unparked: Vec::new(),
+                                            server_resolved_address: None,
                                         });
                                     } else if !added_indexes.is_empty() {
                                         // The session started
@@ -2802,6 +2883,7 @@ fn start_android_session(
                                                         removed: removed.clone(),
                                                         parked: Vec::new(),
                                                         unparked: Vec::new(),
+                                                        server_resolved_address: None,
                                                     },
                                                 );
                                             }
@@ -4663,6 +4745,29 @@ pub extern "system" fn Java_com_bonded_bonded_1app_BondedVpnService_nativeResetP
     }) as jni::sys::jboolean
 }
 
+/// Server-address refresh (4.116): the platform layer re-resolved
+/// the server hostname outside the dead tunnel and hands the live
+/// worker the fresh "ip:port" dial target. Feeds
+/// `PathControl::RefreshServerAddress` to the running worker, which
+/// validates it (malformed or unchanged values are ignored),
+/// swaps its own config copy, and forwards it to the path
+/// supervisor for an immediate re-dial. Returns false when no
+/// session is running — the caller has already persisted the fresh
+/// address, so the next session (re)start picks it up anyway.
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_bonded_bonded_1app_BondedVpnService_nativeRefreshServerAddress(
+    mut env: jni::JNIEnv,
+    _obj: jni::objects::JObject,
+    resolved_server_address: jni::objects::JString,
+) -> jni::sys::jboolean {
+    let address: String = match env.get_string(&resolved_server_address) {
+        Ok(value) => value.into(),
+        Err(_) => return false as jni::sys::jboolean,
+    };
+    send_path_control(PathControl::RefreshServerAddress { address }) as jni::sys::jboolean
+}
+
 /// Network path-set update (an interface appeared or vanished):
 /// hands the live worker the current bind-address list so it can
 /// add/remove paths surgically instead of restarting the session.
@@ -4852,6 +4957,58 @@ mod tests {
     use super::prefer_wireguard_first;
     use super::redundant_fan_out_targets;
     use super::peer_relay_superseded;
+    use super::validate_refresh_address;
+
+    #[test]
+    fn refresh_address_accepts_a_different_well_formed_socket_address() {
+        assert_eq!(
+            validate_refresh_address("75.164.64.252:443", "75.164.73.150:443"),
+            Some("75.164.64.252:443".to_owned())
+        );
+        // Bracketed IPv6 with a port is a valid dial target too.
+        assert_eq!(
+            validate_refresh_address("[2001:db8::1]:443", "75.164.73.150:443"),
+            Some("[2001:db8::1]:443".to_owned())
+        );
+        // Surrounding whitespace is trimmed, not rejected: the
+        // platform layer passes the string through as built.
+        assert_eq!(
+            validate_refresh_address("  75.164.64.252:443  ", "75.164.73.150:443"),
+            Some("75.164.64.252:443".to_owned())
+        );
+    }
+
+    #[test]
+    fn refresh_address_rejects_malformed_values() {
+        let current = "75.164.73.150:443";
+        // A hostname is not a dial target: the whole point of the
+        // refresh is a pre-resolved IP, and handing the worker a
+        // hostname would re-introduce the TUN DNS deadlock.
+        assert_eq!(validate_refresh_address("charter.codingwell.net:443", current), None);
+        // No port, no address, empty, and a bare IP without a port
+        // all fail the SocketAddr parse.
+        assert_eq!(validate_refresh_address("75.164.64.252", current), None);
+        assert_eq!(validate_refresh_address(":443", current), None);
+        assert_eq!(validate_refresh_address("", current), None);
+        assert_eq!(validate_refresh_address("   ", current), None);
+        // An out-of-range port and a non-numeric port fail too.
+        assert_eq!(validate_refresh_address("75.164.64.252:99999", current), None);
+        assert_eq!(validate_refresh_address("75.164.64.252:443x", current), None);
+    }
+
+    #[test]
+    fn refresh_address_is_a_no_op_when_unchanged() {
+        // Same address, with or without whitespace, changes
+        // nothing: no churn in the supervisor's backoff state.
+        assert_eq!(
+            validate_refresh_address("75.164.73.150:443", "75.164.73.150:443"),
+            None
+        );
+        assert_eq!(
+            validate_refresh_address("  75.164.73.150:443 ", "75.164.73.150:443"),
+            None
+        );
+    }
 
     #[test]
     fn peer_relay_superseded_replaces_older_leg_same_peer_only() {

@@ -107,11 +107,21 @@ pub enum RedialOutcome {
 /// (see `PathSupervisorState::note_unparked`). A park-only update
 /// (empty `added`/`removed`) is not a network change: it does not
 /// reset bind-timeout cooldowns.
+///
+/// `server_resolved_address` (4.116) is a fresh pre-resolved
+/// "ip:port" dial target for the server, replacing the frozen
+/// session-start address: the DNS record changed under a dead
+/// tunnel and the supervisor has been re-dialing the stale IP.
+/// `None` means "no address change" — the ordinary path-set
+/// update. `Some` carries the new address even when it equals the
+/// supervisor's current one (the supervisor itself no-ops on
+/// equality); the worker is the one that validates and dedupes.
 pub struct PathsUpdate {
     pub added: Vec<usize>,
     pub removed: Vec<usize>,
     pub parked: Vec<usize>,
     pub unparked: Vec<usize>,
+    pub server_resolved_address: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -271,6 +281,32 @@ impl PathSupervisorState {
             *failed_attempts = 0;
             *next_due = now;
             *cooling_down = false;
+        }
+    }
+
+    /// The server's pre-resolved dial address changed (4.116: the
+    /// DNS record moved under a dead tunnel). Every missing path
+    /// becomes due at once with its failure count reset — exactly
+    /// as `note_added` does for a newly appeared path — so the
+    /// supervisor re-dials it immediately against the new address
+    /// instead of waiting out a backoff whose evidence predates the
+    /// address change (a dial to the old IP proves nothing about
+    /// the new one). Present paths are untouched: a healthy path
+    /// needs no re-dial, and the address only matters at dial time.
+    /// Parked paths keep their suppression — `due_paths` still
+    /// skips them — and become due on unpark, as usual.
+    pub fn note_server_address_changed(&mut self, now: Instant) {
+        for status in self.paths.values_mut() {
+            if let PathStatus::Missing {
+                failed_attempts,
+                next_due,
+                cooling_down,
+            } = status
+            {
+                *failed_attempts = 0;
+                *next_due = now;
+                *cooling_down = false;
+            }
         }
     }
 
@@ -584,6 +620,10 @@ pub fn spawn_path_supervisor(
     wakeup_stats: Arc<SessionWakeupStats>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        // 4.116: the supervisor owns a clone of the session config
+        // (see the spawn site) and dials from it, so a DNS refresh
+        // must be able to rewrite its copy — hence `mut`.
+        let mut config = config;
         let mut state = PathSupervisorState::new(
             &desired_paths,
             &initially_present,
@@ -620,7 +660,13 @@ pub fn spawn_path_supervisor(
                 }
                 update = paths_update_rx.recv() => {
                     match update {
-                        Some(PathsUpdate { added, removed, parked, unparked }) => {
+                        Some(PathsUpdate {
+                            added,
+                            removed,
+                            parked,
+                            unparked,
+                            server_resolved_address,
+                        }) => {
                             let path_set_changed =
                                 !added.is_empty() || !removed.is_empty();
                             for path in removed {
@@ -639,6 +685,30 @@ pub fn spawn_path_supervisor(
                             // cooldowns (4.64).
                             if path_set_changed {
                                 state.reset_cooldowns(now);
+                            }
+                            // Server address refresh (4.116): the
+                            // DNS record moved under a dead tunnel.
+                            // Swap the dial target in this task's
+                            // config clone and make every missing
+                            // path due at once, so the next wakeup
+                            // re-dials against the new address
+                            // instead of the stale one. An address
+                            // identical to the current one is a
+                            // no-op (the worker dedupes first; this
+                            // is defense in depth). The wakeup is
+                            // recomputed below, so a newly due path
+                            // dials without waiting out a stale
+                            // sleep — the loop-back comment for
+                            // added/unparked paths applies here too.
+                            if let Some(address) = server_resolved_address {
+                                if address != config.client.server_resolved_address {
+                                    log(format!(
+                                        "supervisor: server address refreshed {} -> {}",
+                                        config.client.server_resolved_address, address
+                                    ));
+                                    config.client.server_resolved_address = address;
+                                    state.note_server_address_changed(now);
+                                }
                             }
                             // Battery-saver suppression (4.64):
                             // parked paths stop being re-dialed;
@@ -905,6 +975,63 @@ mod tests {
         assert_eq!(state.due_paths(unpark_at), vec![0]);
         let next = state.note_attempt_failed(0, unpark_at);
         assert_eq!(next, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn server_address_change_makes_backed_off_paths_due_at_once() {
+        let now = t0();
+        let mut state = PathSupervisorState::new(&[0, 1], &[0, 1], &[], now);
+        let at = now + Duration::from_secs(60);
+        // Both paths lost, then failed twice: after the second
+        // failure (20 s backoff) neither is due until at+33 s.
+        state.note_lost(0, at);
+        state.note_lost(1, at);
+        state.note_attempt_failed(0, at + FIRST_RETRY_DELAY);
+        state.note_attempt_failed(1, at + FIRST_RETRY_DELAY);
+        state.note_attempt_failed(0, at + Duration::from_secs(13));
+        state.note_attempt_failed(1, at + Duration::from_secs(13));
+        assert!(state.due_paths(at + Duration::from_secs(20)).is_empty());
+        // The DNS record moved: both missing paths become due now
+        // with their failure counts reset, so the next failure
+        // backs off from 10 s — the old-IP dials prove nothing
+        // about the new address.
+        let refresh_at = at + Duration::from_secs(20);
+        state.note_server_address_changed(refresh_at);
+        assert_eq!(state.due_paths(refresh_at), vec![0, 1]);
+        let next = state.note_attempt_failed(0, refresh_at);
+        assert_eq!(next, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn server_address_change_also_resets_bind_cooldown() {
+        let now = t0();
+        let mut state = PathSupervisorState::new(&[0], &[], &[], now);
+        let at = now + INITIAL_MISSING_DELAY;
+        state.note_bind_timeout(0, at);
+        assert!(state.due_paths(at + Duration::from_secs(60)).is_empty());
+        state.note_server_address_changed(at + Duration::from_secs(60));
+        assert_eq!(
+            state.due_paths(at + Duration::from_secs(60)),
+            vec![0]
+        );
+    }
+
+    #[test]
+    fn server_address_change_leaves_present_and_parked_paths_alone() {
+        let now = t0();
+        let mut state = PathSupervisorState::new(&[0, 1, 2], &[0], &[], now);
+        let at = now + INITIAL_MISSING_DELAY;
+        // Path 1 is missing and due; path 2 is missing, due, then parked.
+        assert_eq!(state.due_paths(at), vec![1, 2]);
+        state.note_parked(2);
+        let refresh_at = at + Duration::from_secs(30);
+        state.note_server_address_changed(refresh_at);
+        // Present path 0 is untouched (still present, no wakeup
+        // from it); missing path 1 is due now; parked path 2 stays
+        // suppressed — the address change does not unpark it.
+        assert!(state.is_present(0));
+        assert_eq!(state.due_paths(refresh_at), vec![1]);
+        assert_eq!(state.next_wakeup(), Some(refresh_at));
     }
 
     #[test]
