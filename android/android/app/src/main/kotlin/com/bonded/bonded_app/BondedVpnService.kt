@@ -10,6 +10,7 @@ import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.VpnService
 import android.net.wifi.WifiManager
 import android.os.Build
@@ -24,6 +25,7 @@ import androidx.annotation.Keep
 import androidx.core.app.NotificationCompat
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.Inet4Address
 import java.net.Inet6Address
@@ -302,7 +304,18 @@ class BondedVpnService : VpnService() {
     private var lastNetworkBindingSignature: String = ""
     // Server address with hostname pre-resolved to IP before VPN captures DNS traffic.
     // Cached across recovery attempts so native code never needs in-tunnel DNS resolution.
-    private var cachedServerAddress: String? = null
+    // @Volatile: read on the recovery thread and the session-monitor thread, written on
+    // the start thread and the DNS-refresh thread (4.116).
+    @Volatile private var cachedServerAddress: String? = null
+
+    // DNS refresh outside a dead tunnel (4.116): the resolved dial
+    // target the live session was started with. The monitor thread
+    // compares it against fresh lookups; a refresh rewrites it
+    // (and the cached + persisted copies) so the next re-dial and
+    // the next session (re)start both target the new IP.
+    private var lastResolvedServerAddr: String? = null
+    private val dnsRefreshDecider = DnsRefreshDecider()
+    @Volatile private var dnsRefreshInFlight = false
 
     @Volatile private var shutdownInProgress = false
 
@@ -1015,6 +1028,13 @@ class BondedVpnService : VpnService() {
                             // sample() degrades that sample, never this
                             // loop.
                             sampleBatteryProfile(snapshot)
+                            // DNS refresh outside a dead tunnel
+                            // (4.116): when every transport has been
+                            // down for 3 minutes the frozen dial
+                            // target is stale DNS until proven
+                            // otherwise. Runs on this existing tick;
+                            // the lookup itself is a background thread.
+                            maybeRefreshServerDns(snapshot)
                             monitorTick += 1
                             if (monitorTick % 5L == 0L) {
                                 android.util.Log.i(
@@ -1372,6 +1392,8 @@ class BondedVpnService : VpnService() {
 
     private external fun nativeResetPath(pathIndex: Int): Boolean
 
+    private external fun nativeRefreshServerAddress(resolvedServerAddress: String): Boolean
+
     private external fun nativeSetDisplayInteractive(interactive: Boolean): Boolean
     private external fun nativeSetDeviceIdleMode(idle: Boolean): Boolean
 
@@ -1487,6 +1509,291 @@ class BondedVpnService : VpnService() {
         }
     }
 
+    /** DNS refresh outside a dead tunnel (4.116). Called on the
+     * session-monitor thread's existing tick; the lookup itself
+     * runs on a background thread so this never blocks the tick.
+     *
+     * The trigger lives in [DnsRefreshDecider]: a session that
+     * previously connected, with zero transports up for 3 minutes,
+     * whose server address is a hostname. On a refresh decision the
+     * hostname is re-resolved over a `protect()`ed socket (see
+     * [lookupServerAddressOutsideTunnel]) and, when the answer
+     * differs from the frozen dial target:
+     * - the cached + persisted + in-memory dial targets are
+     *   rewritten FIRST, so any concurrent or later session
+     *   (re)start uses the fresh IP even if the live session is
+     *   already gone (the worker may have exited and Kotlin's
+     *   recovery loop may restart it at any moment);
+     * - the live worker is handed the fresh address via
+     *   [nativeRefreshServerAddress], which swaps its config and
+     *   makes the path supervisor re-dial at once (multi-path
+     *   sessions). A `false` return only means no session is
+     *   running — the persisted address covers the next start.
+     * A lookup that returns the frozen address, or fails outright,
+     * changes nothing: the client keeps dialing the frozen IP. */
+    private fun maybeRefreshServerDns(snapshot: SessionSnapshot) {
+        val decision =
+                dnsRefreshDecider.evaluate(
+                        transportCount = snapshot.transportCount,
+                        connectedAtMs = snapshot.connectedAtMs,
+                        serverAddress = snapshot.serverAddress,
+                        frozenAddress = lastResolvedServerAddr,
+                        nowMs = SystemClock.elapsedRealtime(),
+                )
+        val frozen = (decision as? DnsRefreshDecision.Refresh)?.frozenAddress ?: return
+        if (dnsRefreshInFlight) {
+            return
+        }
+        val deviceId = activeDeviceId ?: return
+        dnsRefreshInFlight = true
+        thread(name = "bonded-dns-refresh", start = true) {
+            try {
+                val fresh = lookupServerAddressOutsideTunnel(snapshot.serverAddress)
+                when {
+                    fresh == null -> {
+                        android.util.Log.w(
+                                "BondedVPN",
+                                "DNS refresh: lookup failed for ${snapshot.serverAddress}; keeping frozen $frozen",
+                        )
+                        // The decider's cooldown already covers the
+                        // next attempt; nothing else to do.
+                    }
+                    fresh == frozen -> {
+                        android.util.Log.i(
+                                "BondedVPN",
+                                "DNS refresh: address unchanged ($fresh); backing off",
+                        )
+                        dnsRefreshDecider.noteSameAddress(SystemClock.elapsedRealtime())
+                    }
+                    else -> applyRefreshedAddress(fresh, frozen, deviceId)
+                }
+            } catch (e: Exception) {
+                android.util.Log.w("BondedVPN", "DNS refresh failed: ${e.message}")
+            } finally {
+                dnsRefreshInFlight = false
+            }
+        }
+    }
+
+    /** Apply a fresh server address: rewrite the cached +
+     * persisted + in-memory dial targets FIRST (so any concurrent
+     * or later session (re)start uses the fresh IP even if the live
+     * session is already gone), then hand it to the live worker
+     * for an immediate re-dial. Shared by the monitor trigger and
+     * the diagnostic forced refresh — a forced refresh is
+     * indistinguishable downstream. */
+    private fun applyRefreshedAddress(fresh: String, frozen: String, deviceId: String) {
+        android.util.Log.i(
+                "BondedVPN",
+                "DNS refresh: server address $frozen -> $fresh",
+        )
+        cachedServerAddress = fresh
+        lastResolvedServerAddr = fresh
+        PairedServerStore.updateLastResolvedAddress(this, deviceId, fresh)
+        val pushed =
+                try {
+                    nativeRefreshServerAddress(fresh)
+                } catch (_: UnsatisfiedLinkError) {
+                    false
+                }
+        android.util.Log.i(
+                "BondedVPN",
+                "DNS refresh: nativeRefreshServerAddress($fresh) = $pushed",
+        )
+        dnsRefreshDecider.noteRefreshed(SystemClock.elapsedRealtime())
+        emitEvent(
+                "session_status",
+                "Server address refreshed to $fresh",
+        )
+    }
+
+    /** Diagnostic forced refresh (4.116, adb only — see
+     * `VpnControlReceiver.TEST_DNS_REFRESH`): run the refresh path
+     * outside the decider, so the lookup and the mutation can be
+     * exercised live without staging a dead tunnel. With [address]
+     * ("ip:port") the address is pushed straight into the live
+     * session (mutation test); without it the active server is
+     * re-resolved over the protected socket and the answer applied
+     * (lookup test). Returns false when there is no active device,
+     * no frozen address to compare against, a refresh is already
+     * in flight, or a supplied address is malformed (it is
+     * validated here because [applyRefreshedAddress] persists
+     * before the worker re-validates). */
+    private fun runTestDnsRefresh(address: String?): Boolean {
+        val deviceId = activeDeviceId ?: return false
+        val frozen = lastResolvedServerAddr ?: return false
+        if (address != null && !isValidRefreshAddress(address)) {
+            android.util.Log.w(
+                    "BondedVPN",
+                    "DNS refresh (test): rejecting malformed address $address",
+            )
+            return false
+        }
+        if (dnsRefreshInFlight) {
+            return false
+        }
+        dnsRefreshInFlight = true
+        thread(name = "bonded-dns-refresh", start = true) {
+            try {
+                val fresh: String? =
+                        if (address != null) {
+                            address
+                        } else {
+                            val server =
+                                    PairedServerStore.findById(this, deviceId)
+                            if (server == null) {
+                                android.util.Log.w(
+                                        "BondedVPN",
+                                        "DNS refresh (test): no paired server for $deviceId",
+                                )
+                                null
+                            } else {
+                                lookupServerAddressOutsideTunnel(server.publicAddress)
+                            }
+                        }
+                when {
+                    fresh == null -> {
+                        android.util.Log.w(
+                                "BondedVPN",
+                                "DNS refresh (test): lookup failed; keeping frozen $frozen",
+                        )
+                    }
+                    fresh == frozen -> {
+                        android.util.Log.i(
+                                "BondedVPN",
+                                "DNS refresh (test): address unchanged ($fresh); backing off",
+                        )
+                        dnsRefreshDecider.noteSameAddress(SystemClock.elapsedRealtime())
+                    }
+                    else -> applyRefreshedAddress(fresh, frozen, deviceId)
+                }
+            } catch (e: Exception) {
+                android.util.Log.w("BondedVPN", "DNS refresh (test) failed: ${e.message}")
+            } finally {
+                dnsRefreshInFlight = false
+            }
+        }
+        return true
+    }
+
+    /** Re-resolve a "host:port" server address to "ip:port" using
+     * DNS queries sent OUTSIDE the tunnel. Returns null on any
+     * failure (nothing to resolve, no resolver answered, malformed
+     * response) — the caller keeps the frozen address.
+     *
+     * The queries go over a `DatagramSocket` passed through
+     * `VpnService.protect()` first: after the TUN comes up Android
+     * routes DNS through it, and an unprotected query would hang
+     * in the dead tunnel. If `protect()` refuses the socket the
+     * lookup aborts outright — it never sends unprotected. Each
+     * resolver gets one attempt with a 2 s timeout, at most 3
+     * resolvers, so one lookup costs ~6 s worst case on its
+     * background thread.
+     *
+     * Resolver order: the non-VPN networks' own DNS servers first
+     * (from `ConnectivityManager` link properties — on home Wi-Fi
+     * that is the router, which knows the LAN and the ISP's view;
+     * on cellular it is the carrier's resolver), then the public
+     * fallbacks 8.8.8.8 and 1.1.1.1, which answer from any network.
+     * The VPN network itself is excluded: its link properties
+     * carry the in-tunnel DNS (10.8.0.1), which is dead by
+     * definition here. */
+    private fun lookupServerAddressOutsideTunnel(rawAddress: String): String? {
+        val lastColon = rawAddress.lastIndexOf(':')
+        if (lastColon < 0) {
+            return null
+        }
+        val host = rawAddress.substring(0, lastColon)
+        val port = rawAddress.substring(lastColon + 1)
+        if (host.isBlank() || isIpLiteralAddress(rawAddress)) {
+            return null
+        }
+        val queryId = (SystemClock.elapsedRealtimeNanos() and 0xFFFF).toInt()
+        val query = buildDnsQuery(host, queryId) ?: return null
+        for (resolver in dnsResolverAddresses()) {
+            val response = queryDnsOverProtectedUdp(query, resolver) ?: continue
+            val address = parseDnsResponse(response, queryId) ?: continue
+            val ip = address.hostAddress ?: continue
+            return "$ip:$port"
+        }
+        return null
+    }
+
+    /** Resolver addresses for the outside-tunnel lookup, in try
+     * order, capped at [DNS_REFRESH_MAX_RESOLVERS]: the
+     * non-VPN networks' DNS servers (at most 2), then 8.8.8.8 and
+     * 1.1.1.1. An IP literal never needs a lookup, so `getByName`
+     * on the fallbacks cannot do DNS itself. */
+    private fun dnsResolverAddresses(): List<InetAddress> {
+        val system =
+                try {
+                    val manager =
+                            getSystemService(Context.CONNECTIVITY_SERVICE)
+                                    as? ConnectivityManager
+                    manager?.allNetworks
+                            ?.flatMap { network ->
+                                val capabilities =
+                                        manager.getNetworkCapabilities(network)
+                                if (capabilities?.hasTransport(
+                                                NetworkCapabilities.TRANSPORT_VPN
+                                        ) == true
+                                ) {
+                                    emptyList()
+                                } else {
+                                    manager.getLinkProperties(network)
+                                            ?.dnsServers
+                                            .orEmpty()
+                                }
+                            }
+                            ?.distinct()
+                            ?.take(2)
+                } catch (_: Exception) {
+                    null
+                }
+                        .orEmpty()
+        val fallbacks =
+                listOf("8.8.8.8", "1.1.1.1").mapNotNull { literal ->
+                    runCatching { InetAddress.getByName(literal) }.getOrNull()
+                }
+        return (system + fallbacks).distinct().take(DNS_REFRESH_MAX_RESOLVERS)
+    }
+
+    /** One DNS query over a protected UDP socket: `protect()` the
+     * socket before sending (abort and return null if it refuses),
+     * send the query, wait at most [DNS_REFRESH_ATTEMPT_TIMEOUT_MS]
+     * for the reply. Returns the raw response bytes, or null on any
+     * failure (protect refused, send failed, timeout, truncated). */
+    private fun queryDnsOverProtectedUdp(
+            query: ByteArray,
+            resolver: InetAddress,
+    ): ByteArray? {
+        var socket: DatagramSocket? = null
+        return try {
+            socket = DatagramSocket()
+            socket.soTimeout = DNS_REFRESH_ATTEMPT_TIMEOUT_MS
+            if (!protect(socket)) {
+                android.util.Log.w(
+                        "BondedVPN",
+                        "DNS refresh: protect() refused the DNS socket; aborting lookup",
+                )
+                return null
+            }
+            socket.send(DatagramPacket(query, query.size, resolver, 53))
+            val buffer = ByteArray(512)
+            val reply = DatagramPacket(buffer, buffer.size)
+            socket.receive(reply)
+            reply.data.copyOf(reply.length)
+        } catch (e: Exception) {
+            android.util.Log.d(
+                    "BondedVPN",
+                    "DNS refresh: query to $resolver failed: ${e.message}",
+            )
+            null
+        } finally {
+            socket?.close()
+        }
+    }
+
     private fun startNativeSession(
             server: PairedServerRecord,
             pathCount: Int,
@@ -1518,6 +1825,10 @@ class BondedVpnService : VpnService() {
                         server.lastResolvedAddress.isNotBlank() -> server.lastResolvedAddress
                         else -> freshCachedAddress ?: server.publicAddress
                     }
+            // DNS refresh (4.116): remember the dial target this
+            // start uses, so the monitor thread can compare it
+            // against fresh lookups and spot a moved record.
+            lastResolvedServerAddr = resolvedServerAddr
             val protocolCsv = server.supportedProtocols.joinToString(",")
             val bindAddressesJson = JSONArray(bindAddresses).toString()
             android.util.Log.i(
@@ -1856,6 +2167,21 @@ class BondedVpnService : VpnService() {
             val service = activeInstance ?: return false
             return try {
                 service.nativeResetPath(pathIndex)
+            } catch (_: Exception) {
+                false
+            }
+        }
+
+        /** Diagnostic forced DNS refresh (4.116, adb only): push
+         * [address] ("ip:port") straight into the live session, or
+         * re-resolve the active server over the protected socket
+         * when null. False when no service instance or session is
+         * running, a refresh is already in flight, or a supplied
+         * address is malformed. */
+        fun testDnsRefresh(address: String?): Boolean {
+            val service = activeInstance ?: return false
+            return try {
+                service.runTestDnsRefresh(address)
             } catch (_: Exception) {
                 false
             }

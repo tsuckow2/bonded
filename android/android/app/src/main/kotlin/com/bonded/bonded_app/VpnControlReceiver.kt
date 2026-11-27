@@ -9,6 +9,8 @@ import android.content.Intent
  * Usage:
  *   adb shell am broadcast -a com.bonded.bonded_app.VPN_START com.bonded.bonded_app
  *   adb shell am broadcast -a com.bonded.bonded_app.VPN_STOP com.bonded.bonded_app
+ *   adb shell am broadcast -a com.bonded.bonded_app.TEST_DNS_REFRESH com.bonded.bonded_app
+ *   adb shell am broadcast -a com.bonded.bonded_app.TEST_DNS_REFRESH --es address 75.164.64.252:443 com.bonded.bonded_app
  */
 class VpnControlReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent?) {
@@ -45,6 +47,21 @@ class VpnControlReceiver : BroadcastReceiver() {
             "com.bonded.bonded_app.VPN_STOP" -> {
                 android.util.Log.i("VpnControlReceiver", "Stopping VPN")
                 BondedVpnService.stop(context)
+            }
+
+            // Diagnostic DNS refresh (4.116): force the refresh path
+            // outside the decider. Without --es address, the active
+            // server is re-resolved over the protected socket and the
+            // answer applied (lookup test); with one, the address is
+            // pushed straight into the live session (mutation test).
+            "com.bonded.bonded_app.TEST_DNS_REFRESH" -> {
+                val address = intent.getStringExtra("address")
+                android.util.Log.i(
+                        "VpnControlReceiver",
+                        "Forcing DNS refresh (address=$address)",
+                )
+                val ok = BondedVpnService.testDnsRefresh(address)
+                android.util.Log.i("VpnControlReceiver", "DNS refresh started: $ok")
             }
 
             else -> {
