@@ -10,7 +10,6 @@ import org.junit.Test
  * pinned here without Android. Times are arbitrary monotonic
  * milliseconds. */
 class DnsRefreshDeciderTest {
-    private val connectedAtMs = 1_000L
     private val hostname = "charter.codingwell.net:443"
     private val frozen = "75.164.73.150:443"
 
@@ -18,10 +17,10 @@ class DnsRefreshDeciderTest {
             decider: DnsRefreshDecider,
             nowMs: Long,
             transportCount: Int = 0,
-            connectedAt: Long = connectedAtMs,
+            everConnected: Boolean = true,
             serverAddress: String = hostname,
             frozenAddress: String? = frozen,
-    ) = decider.evaluate(transportCount, connectedAt, serverAddress, frozenAddress, nowMs)
+    ) = decider.evaluate(transportCount, everConnected, serverAddress, frozenAddress, nowMs)
 
     @Test
     fun deadTunnel_refreshesOnlyAfterThreeMinuteDebounce() {
@@ -95,9 +94,15 @@ class DnsRefreshDeciderTest {
     fun sessionThatNeverConnectedNeverRefreshes() {
         val decider = DnsRefreshDecider()
         // Zero transports from the start is initial establishment,
-        // not a dead tunnel — the normal path owns it.
-        assertTrue(dead(decider, 0L, connectedAt = 0L) is DnsRefreshDecision.Noop)
-        assertTrue(dead(decider, 1_000_000L, connectedAt = 0L) is DnsRefreshDecision.Noop)
+        // not a dead tunnel — the normal path owns it. The gate is
+        // the service-lifetime ever-connected latch, not the
+        // snapshot's connectedAtMs: every native session restart
+        // zeroes connectedAtMs, so the instantaneous value would
+        // block the refresh forever once the recovery loop starts
+        // restarting on a stale dial target (found live on the 6a,
+        // 2026-11-27).
+        assertTrue(dead(decider, 0L, everConnected = false) is DnsRefreshDecision.Noop)
+        assertTrue(dead(decider, 1_000_000L, everConnected = false) is DnsRefreshDecision.Noop)
     }
 
     @Test

@@ -317,6 +317,18 @@ class BondedVpnService : VpnService() {
     private val dnsRefreshDecider = DnsRefreshDecider()
     @Volatile private var dnsRefreshInFlight = false
 
+    // DNS refresh outside a dead tunnel (4.116): whether this
+    // service lifetime has EVER had a connected session. Latched
+    // from any snapshot reporting connected, cleared only on full
+    // shutdown. It must be sticky, not the snapshot's
+    // `connectedAtMs`: the error/recovery path restarts the native
+    // session every ~66 s while the tunnel is dead, and every
+    // restart zeroes the snapshot's connectedAtMs — gating the
+    // refresh on the instantaneous value blocks it forever in
+    // exactly the case it exists for (found live on the 6a,
+    // 2026-11-27).
+    private var hasEverConnected = false
+
     @Volatile private var shutdownInProgress = false
 
     // Display interactivity for native idle pacing (4.58): the
@@ -640,6 +652,7 @@ class BondedVpnService : VpnService() {
         lastRecoveryAttemptMs = 0L
         synchronized(pendingOutboundLock) { pendingOutboundPackets.clear() }
         cachedServerAddress = null
+        hasEverConnected = false
         stopPeerDiscoveryWindow()
         releaseMulticastLock()
         stopNativeSession()
@@ -1532,10 +1545,18 @@ class BondedVpnService : VpnService() {
      * A lookup that returns the frozen address, or fails outright,
      * changes nothing: the client keeps dialing the frozen IP. */
     private fun maybeRefreshServerDns(snapshot: SessionSnapshot) {
+        // Latch ever-connected here, on the monitor tick: any
+        // snapshot reporting a connected session (or a non-zero
+        // connectedAtMs from the session that reached it) arms the
+        // refresh for the rest of this service lifetime, across the
+        // native session restarts that zero connectedAtMs.
+        if (snapshot.state == "connected" || snapshot.connectedAtMs > 0L) {
+            hasEverConnected = true
+        }
         val decision =
                 dnsRefreshDecider.evaluate(
                         transportCount = snapshot.transportCount,
-                        connectedAtMs = snapshot.connectedAtMs,
+                        everConnected = hasEverConnected,
                         serverAddress = snapshot.serverAddress,
                         frozenAddress = lastResolvedServerAddr,
                         nowMs = SystemClock.elapsedRealtime(),

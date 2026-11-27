@@ -58,8 +58,22 @@ internal sealed class DnsRefreshDecision {
  * no I/O, so it is unit-tested directly.
  *
  * Fires only when ALL of these hold:
- * - the session previously connected (`connectedAtMs > 0`) — a
- *   session that never connected is initial establishment's job;
+ * - the service has EVER had a connected session (`everConnected`)
+ *   — sticky across native session restarts, by design: the
+ *   error/recovery path restarts the native session every ~66 s
+ *   while the tunnel is dead, and every restart zeroes the
+ *   snapshot's `connectedAtMs` (a fresh snapshot struct starts at
+ *   0 and only fills in when the new session connects). Gating on
+ *   the snapshot's instantaneous `connectedAtMs` therefore blocks
+ *   the refresh forever in exactly the case it exists for — a
+ *   session that WAS connected, lost every transport, and now
+ *   restarts on a stale dial target (found live on the 6a,
+ *   2026-11-27: restarts at 14:41:24 / 14:42:30 / 14:43:36 all
+ *   dialed the dead IP with connectedAtMs 0, no refresh in 5+
+ *   minutes of dead tunnel). The service latches `everConnected`
+ *   from any snapshot that reports connected, and clears it only
+ *   on full shutdown — a session that never connected at all in
+ *   this service lifetime is still initial establishment's job;
  * - no transport at all is up (`transportCount == 0`, which
  *   counts peer relays too, so a live relay suppresses the
  *   refresh: the tunnel still carries traffic);
@@ -72,9 +86,10 @@ internal sealed class DnsRefreshDecision {
  *   returned the address already being dialed.
  *
  * Times are monotonic milliseconds (the service passes
- * `SystemClock.elapsedRealtime()`); `connectedAtMs` is only ever
- * compared against zero, so the snapshot's wall-clock stamp is
- * never mixed with the monotonic clock. */
+ * `SystemClock.elapsedRealtime()`). `everConnected` is latched by
+ * the service from any snapshot reporting a connected session, so
+ * it survives the native session restarts that zero the
+ * snapshot's own `connectedAtMs`. */
 internal class DnsRefreshDecider {
     private var deadSinceMs: Long? = null
     // Null until the first attempt: a zero epoch would conflate
@@ -90,7 +105,7 @@ internal class DnsRefreshDecider {
     @Synchronized
     fun evaluate(
             transportCount: Int,
-            connectedAtMs: Long,
+            everConnected: Boolean,
             serverAddress: String,
             frozenAddress: String?,
             nowMs: Long,
@@ -102,10 +117,10 @@ internal class DnsRefreshDecider {
             deadSinceMs = null
             return DnsRefreshDecision.Noop
         }
-        // The session never connected, or a transport is up: the
-        // tunnel is not dead. Either way the dead period re-arms
-        // from scratch next time.
-        if (connectedAtMs <= 0L || transportCount > 0) {
+        // The service never had a connected session, or a transport
+        // is up: the tunnel is not dead. Either way the dead period
+        // re-arms from scratch next time.
+        if (!everConnected || transportCount > 0) {
             deadSinceMs = null
             sameAddressBackoffUntilMs = 0L
             return DnsRefreshDecision.Noop
